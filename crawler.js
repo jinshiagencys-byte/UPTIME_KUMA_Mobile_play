@@ -21,6 +21,10 @@ async function relayGet(path) {
 }
 
 async function pushStatus(pushToken, status, msg) {
+  if (!pushToken) {
+    console.error('[push] pushToken manquant, envoi ignoré pour ce monitor.');
+    return;
+  }
   const url = `${KUMA_URL}/api/push/${pushToken}?status=${status}&msg=${encodeURIComponent(msg)}&ping=`;
   try {
     const res = await fetch(url);
@@ -113,7 +117,7 @@ async function main() {
         const { status, msg } = await checkPage(browser, token.url);
         if (status === 'down') totalDown += 1;
         console.log(`[crawler]   ${token.url} -> ${status} (${msg})`);
-        await pushStatus(token.push_token, status, msg);
+        await pushStatus(token.pushToken, status, msg);
       }
     }
   } finally {
