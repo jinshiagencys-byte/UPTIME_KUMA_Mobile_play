@@ -61,8 +61,7 @@ function isDue(site) {
 // Vérifie une page : navigation OK + pas d'erreur API silencieuse en arrière-plan
 // (c'est le but même du projet : détecter un backend qui répond en erreur
 // alors que le frontend a l'air fonctionnel).
-async function checkPage(browser, url) {
-  const context = await browser.newContext();
+async function checkPage(context, url) {
   const page = await context.newPage();
 
   const apiErrors = [];
@@ -102,7 +101,7 @@ async function checkPage(browser, url) {
     status = 'down';
     msg = String(err.message || err).slice(0, 200);
   } finally {
-    await context.close();
+    await page.close();
   }
 
   return { status, msg };
@@ -143,12 +142,20 @@ async function main() {
 
       console.log(`[crawler] "${site.client_name}": ${tokens.length} page(s) à vérifier`);
 
-      for (const token of tokens) {
-        totalPages += 1;
-        const { status, msg } = await checkPage(browser, token.url);
-        if (status === 'down') totalDown += 1;
-        console.log(`[crawler]   ${token.url} -> ${status} (${msg})`);
-        await pushStatus(token.pushToken, status, msg);
+      // Un seul context Playwright pour tout le groupe : on évite de relancer
+      // un environnement de navigation par page alors qu'un groupe partage
+      // le même site (95% des cas). Une page = un onglet dans ce context.
+      const context = await browser.newContext();
+      try {
+        for (const token of tokens) {
+          totalPages += 1;
+          const { status, msg } = await checkPage(context, token.url);
+          if (status === 'down') totalDown += 1;
+          console.log(`[crawler]   ${token.url} -> ${status} (${msg})`);
+          await pushStatus(token.pushToken, status, msg);
+        }
+      } finally {
+        await context.close();
       }
 
       try {
