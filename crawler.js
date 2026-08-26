@@ -147,12 +147,21 @@ async function main() {
       // le même site (95% des cas). Une page = un onglet dans ce context.
       const context = await browser.newContext();
       try {
-        for (const token of tokens) {
+        for (let i = 0; i < tokens.length; i++) {
+          const token = tokens[i];
           totalPages += 1;
           const { status, msg } = await checkPage(context, token.url);
           if (status === 'down') totalDown += 1;
           console.log(`[crawler]   ${token.url} -> ${status} (${msg})`);
           await pushStatus(token.pushToken, status, msg);
+
+          // Petite pause entre les pages d'un même site pour éviter de
+          // déclencher un rate-limiting (HTTP 429) côté serveur du client :
+          // plusieurs pages du même domaine vérifiées trop vite peuvent
+          // ressembler à du trafic abusif pour certaines protections.
+          if (i < tokens.length - 1) {
+            await new Promise((resolve) => setTimeout(resolve, 2000));
+          }
         }
       } finally {
         await context.close();
