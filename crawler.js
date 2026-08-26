@@ -20,6 +20,18 @@ async function relayGet(path) {
   return data;
 }
 
+async function relayPost(path) {
+  const res = await fetch(`${RELAY_URL}${path}`, {
+    method: 'POST',
+    headers: { 'x-relay-secret': RELAY_SECRET },
+  });
+  const data = await res.json();
+  if (!res.ok || data?.success !== true) {
+    throw new Error(`Relay error on ${path}: ${data?.error || res.status}`);
+  }
+  return data;
+}
+
 async function pushStatus(pushToken, status, msg) {
   if (!pushToken) {
     console.error('[push] pushToken manquant, envoi ignoré pour ce monitor.');
@@ -34,6 +46,16 @@ async function pushStatus(pushToken, status, msg) {
   } catch (e) {
     console.error(`[push] erreur réseau pour token ${pushToken.slice(0, 6)}...:`, e.message);
   }
+}
+
+// Détermine si un site doit être re-vérifié à ce run, en fonction de sa
+// fréquence choisie (crawl_interval_minutes) et de la dernière vérification
+// (last_crawled_at). Si jamais crawlé, on le considère dû immédiatement.
+function isDue(site) {
+  if (!site.last_crawled_at) return true;
+  const intervalMs = (site.crawl_interval_minutes ?? 1440) * 60 * 1000;
+  const nextDue = new Date(site.last_crawled_at).getTime() + intervalMs;
+  return Date.now() >= nextDue;
 }
 
 // Vérifie une page : navigation OK + pas d'erreur API silencieuse en arrière-plan
@@ -88,16 +110,25 @@ async function checkPage(browser, url) {
 
 async function main() {
   const { sites } = await relayGet('/active-sites');
-  console.log(`[crawler] ${sites.length} site(s) actif(s) à vérifier`);
+  console.log(`[crawler] ${sites.length} site(s) actif(s) au total`);
 
   const browser = await chromium.launch();
   let totalPages = 0;
   let totalDown = 0;
+  let totalSkipped = 0;
 
   try {
     for (const site of sites) {
       if (!site.kuma_group_id) {
         console.log(`[crawler] site "${site.client_name}" sans kuma_group_id, ignoré`);
+        continue;
+      }
+
+      if (!isDue(site)) {
+        console.log(
+          `[crawler] "${site.client_name}" pas encore dû (interval ${site.crawl_interval_minutes ?? 1440}min, dernier crawl ${site.last_crawled_at}), skip`
+        );
+        totalSkipped += 1;
         continue;
       }
 
@@ -119,12 +150,20 @@ async function main() {
         console.log(`[crawler]   ${token.url} -> ${status} (${msg})`);
         await pushStatus(token.pushToken, status, msg);
       }
+
+      try {
+        await relayPost(`/sites/${site.id}/mark-crawled`);
+      } catch (e) {
+        console.error(`[crawler] échec mark-crawled pour "${site.client_name}":`, e.message);
+      }
     }
   } finally {
     await browser.close();
   }
 
-  console.log(`[crawler] terminé : ${totalPages} page(s) vérifiée(s), ${totalDown} en down.`);
+  console.log(
+    `[crawler] terminé : ${totalPages} page(s) vérifiée(s), ${totalDown} en down, ${totalSkipped} site(s) skippé(s) (pas encore dû).`
+  );
 }
 
 main().catch((err) => {
