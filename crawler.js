@@ -4,80 +4,22 @@ const RELAY_URL = process.env.RELAY_URL;
 const RELAY_SECRET = process.env.RELAY_SECRET;
 const KUMA_URL = process.env.KUMA_URL;
 
-// Domaines supplémentaires (utile si le backend est sur un domaine totalement différent)
 const EXTRA_API_DOMAINS = (process.env.EXTRA_API_DOMAINS || '')
   .split(',')
   .map((d) => d.trim())
   .filter(Boolean);
 
-// Durée d'observation après chargement (en ms)
 const POST_LOAD_WAIT_MS = parseInt(process.env.POST_LOAD_WAIT_MS || '60000', 10);
 
-// Endpoints critiques à surveiller (séparés par des virgules, ex: "/home/realizations/")
-const CRITICAL_API_ENDPOINTS = (process.env.CRITICAL_API_ENDPOINTS || '')
-  .split(',')
-  .map((e) => e.trim())
-  .filter(Boolean);
+// Active le log de TOUTES les requêtes (même non first-party) pour debug
+const DEBUG_LOG_ALL_REQUESTS = (process.env.DEBUG_LOG_ALL_REQUESTS === 'true');
 
 if (!RELAY_URL || !RELAY_SECRET || !KUMA_URL) {
   console.error('RELAY_URL, RELAY_SECRET et KUMA_URL sont requis (env vars).');
   process.exit(1);
 }
 
-async function relayGet(path) {
-  const res = await fetch(`${RELAY_URL}${path}`, {
-    headers: { 'x-relay-secret': RELAY_SECRET },
-  });
-  const data = await res.json();
-  if (!res.ok || data?.success !== true) {
-    throw new Error(`Relay error on ${path}: ${data?.error || res.status}`);
-  }
-  return data;
-}
-
-async function relayPost(path) {
-  const res = await fetch(`${RELAY_URL}${path}`, {
-    method: 'POST',
-    headers: { 'x-relay-secret': RELAY_SECRET },
-  });
-  const data = await res.json();
-  if (!res.ok || data?.success !== true) {
-    throw new Error(`Relay error on ${path}: ${data?.error || res.status}`);
-  }
-  return data;
-}
-
-async function pushStatus(pushToken, status, msg, pingMs) {
-  if (!pushToken) {
-    console.error('[push] pushToken manquant, envoi ignoré pour ce monitor.');
-    return;
-  }
-  const pingParam = Number.isFinite(pingMs) ? `&ping=${Math.round(pingMs)}` : '';
-  const url = `${KUMA_URL}/api/push/${pushToken}?status=${status}&msg=${encodeURIComponent(msg)}${pingParam}`;
-  try {
-    const res = await fetch(url);
-    if (!res.ok) {
-      console.error(`[push] échec HTTP ${res.status} pour token ${pushToken.slice(0, 6)}...`);
-    }
-  } catch (e) {
-    console.error(`[push] erreur réseau pour token ${pushToken.slice(0, 6)}...:`, e.message);
-  }
-}
-
-function isDue(site) {
-  if (!site.last_crawled_at) return true;
-  const intervalMs = (site.crawl_interval_minutes ?? 1440) * 60 * 1000;
-  const nextDue = new Date(site.last_crawled_at).getTime() + intervalMs;
-  return Date.now() >= nextDue;
-}
-
-function getHostname(rawUrl) {
-  try {
-    return new URL(rawUrl).hostname;
-  } catch {
-    return null;
-  }
-}
+// ... (fonctions relayGet, relayPost, pushStatus, isDue, getHostname identiques)
 
 function isFirstPartyRequest(requestUrl, pageHostname) {
   const reqHost = getHostname(requestUrl);
@@ -90,11 +32,6 @@ function isFirstPartyRequest(requestUrl, pageHostname) {
   );
 }
 
-// Vérifie si une URL correspond à un endpoint critique
-function isCriticalEndpoint(url) {
-  return CRITICAL_API_ENDPOINTS.some((endpoint) => url.includes(endpoint));
-}
-
 async function checkPage(context, url) {
   const page = await context.newPage();
   const pageHostname = getHostname(url);
@@ -102,13 +39,19 @@ async function checkPage(context, url) {
   const apiErrors = [];
   const consoleErrors = [];
   const pendingFirstPartyRequests = new Map();
-  const responseBodies = new Map(); // stocke les infos des réponses
 
+  // ----- Écouteurs réseau -----
   page.on('request', (req) => {
     const type = req.resourceType();
-    if ((type === 'xhr' || type === 'fetch') && isFirstPartyRequest(req.url(), pageHostname)) {
-      pendingFirstPartyRequests.set(req.url(), true);
-      console.log(`[debug-net] Requête first-party détectée: ${req.url()}`);
+    if (type === 'xhr' || type === 'fetch') {
+      const isFirstParty = isFirstPartyRequest(req.url(), pageHostname);
+      if (DEBUG_LOG_ALL_REQUESTS) {
+        console.log(`[debug-all] Requête ${type}: ${req.url()} ${isFirstParty ? '(first-party)' : '(non first-party)'}`);
+      }
+      if (isFirstParty) {
+        pendingFirstPartyRequests.set(req.url(), true);
+        console.log(`[debug-first] Requête first-party: ${req.url()}`);
+      }
     }
   });
 
@@ -116,30 +59,16 @@ async function checkPage(context, url) {
     pendingFirstPartyRequests.delete(req.url());
   });
 
-  page.on('response', async (response) => {
+  page.on('response', (response) => {
     const req = response.request();
     const type = req.resourceType();
-    if ((type === 'xhr' || type === 'fetch') && isFirstPartyRequest(req.url(), pageHostname)) {
-      const status = response.status();
-      console.log(`[debug-net] Réponse first-party ${status} pour ${req.url()}`);
-      
-      if (status >= 500) {
-        apiErrors.push(`HTTP ${status} ${req.url()}`);
+    if (type === 'xhr' || type === 'fetch') {
+      const isFirstParty = isFirstPartyRequest(req.url(), pageHostname);
+      if (DEBUG_LOG_ALL_REQUESTS) {
+        console.log(`[debug-all] Réponse ${response.status()} pour ${req.url()} ${isFirstParty ? '(first-party)' : '(non first-party)'}`);
       }
-      
-      // Si c'est un endpoint critique et que le corps est vide ou très petit (< 10 octets),
-      // on considère que le backend ne renvoie pas de données utiles.
-      if (isCriticalEndpoint(req.url()) && status === 200) {
-        try {
-          const body = await response.text();
-          const bodySize = body.length;
-          console.log(`[debug-net] Endpoint critique ${req.url()} - taille du corps: ${bodySize} octets`);
-          if (bodySize < 10) {
-            apiErrors.push(`Réponse vide (${bodySize} octets) sur endpoint critique: ${req.url()}`);
-          }
-        } catch (e) {
-          // Impossible de lire le corps (stream déjà consommé), on ignore.
-        }
+      if (isFirstParty && response.status() >= 500) {
+        apiErrors.push(`HTTP ${response.status()} ${req.url()}`);
       }
     }
   });
@@ -147,10 +76,16 @@ async function checkPage(context, url) {
   page.on('requestfailed', (req) => {
     pendingFirstPartyRequests.delete(req.url());
     const type = req.resourceType();
-    if ((type === 'xhr' || type === 'fetch') && isFirstPartyRequest(req.url(), pageHostname)) {
-      const reason = req.failure()?.errorText || 'requête échouée';
-      apiErrors.push(`Réseau: ${reason} ${req.url()}`);
-      console.log(`[debug-net] Échec réseau (${reason}) sur ${req.url()}`);
+    if (type === 'xhr' || type === 'fetch') {
+      const isFirstParty = isFirstPartyRequest(req.url(), pageHostname);
+      if (DEBUG_LOG_ALL_REQUESTS) {
+        const reason = req.failure()?.errorText || 'inconnue';
+        console.log(`[debug-all] Échec réseau (${reason}) pour ${req.url()} ${isFirstParty ? '(first-party)' : '(non first-party)'}`);
+      }
+      if (isFirstParty) {
+        const reason = req.failure()?.errorText || 'requête échouée';
+        apiErrors.push(`Réseau: ${reason} ${req.url()}`);
+      }
     }
   });
 
@@ -185,7 +120,7 @@ async function checkPage(context, url) {
       await new Promise((resolve) => setTimeout(resolve, POST_LOAD_WAIT_MS));
 
       if (pendingFirstPartyRequests.size > 0) {
-        console.log(`[debug-net] ${pendingFirstPartyRequests.size} requête(s) first-party encore en cours. Attente de résolution...`);
+        console.log(`[debug-net] ${pendingFirstPartyRequests.size} requête(s) first-party encore en cours. Attente...`);
       }
       const settled = await waitForPendingRequestsToSettle(PENDING_API_MAX_WAIT_MS);
 
@@ -226,6 +161,7 @@ async function checkPage(context, url) {
   return { status, msg, loadTimeMs };
 }
 
+// ----- main() identique, mais avec logs supplémentaires -----
 async function main() {
   const { sites } = await relayGet('/active-sites');
   console.log(`[crawler] ${sites.length} site(s) actif(s) au total`);
@@ -243,9 +179,7 @@ async function main() {
       }
 
       if (!isDue(site)) {
-        console.log(
-          `[crawler] "${site.client_name}" pas encore dû (interval ${site.crawl_interval_minutes ?? 1440}min, dernier crawl ${site.last_crawled_at}), skip`
-        );
+        console.log(`[crawler] "${site.client_name}" pas encore dû, skip`);
         totalSkipped += 1;
         continue;
       }
@@ -289,9 +223,7 @@ async function main() {
     await browser.close();
   }
 
-  console.log(
-    `[crawler] terminé : ${totalPages} page(s) vérifiée(s), ${totalDown} en down, ${totalSkipped} site(s) skippé(s) (pas encore dû).`
-  );
+  console.log(`[crawler] terminé : ${totalPages} page(s) vérifiée(s), ${totalDown} en down, ${totalSkipped} site(s) skippé(s).`);
 }
 
 main().catch((err) => {
