@@ -4,14 +4,17 @@ const RELAY_URL = process.env.RELAY_URL;
 const RELAY_SECRET = process.env.RELAY_SECRET;
 const KUMA_URL = process.env.KUMA_URL;
 
+// Domaines supplémentaires considérés comme "first-party" (backends externes).
+// Exemple: "api.autre-domaine.com,backend.example.com"
 const EXTRA_API_DOMAINS = (process.env.EXTRA_API_DOMAINS || '')
   .split(',')
   .map((d) => d.trim())
   .filter(Boolean);
 
+// Durée d'observation après le chargement de la page (en millisecondes).
 const POST_LOAD_WAIT_MS = parseInt(process.env.POST_LOAD_WAIT_MS || '60000', 10);
 
-// Active le log de TOUTES les requêtes (même non first-party) pour debug
+// Active le log de TOUTES les requêtes (même non first-party) pour debug.
 const DEBUG_LOG_ALL_REQUESTS = (process.env.DEBUG_LOG_ALL_REQUESTS === 'true');
 
 if (!RELAY_URL || !RELAY_SECRET || !KUMA_URL) {
@@ -19,8 +22,67 @@ if (!RELAY_URL || !RELAY_SECRET || !KUMA_URL) {
   process.exit(1);
 }
 
-// ... (fonctions relayGet, relayPost, pushStatus, isDue, getHostname identiques)
+// ======================== FONCTIONS UTILITAIRES ========================
 
+async function relayGet(path) {
+  const res = await fetch(`${RELAY_URL}${path}`, {
+    headers: { 'x-relay-secret': RELAY_SECRET },
+  });
+  const data = await res.json();
+  if (!res.ok || data?.success !== true) {
+    throw new Error(`Relay error on ${path}: ${data?.error || res.status}`);
+  }
+  return data;
+}
+
+async function relayPost(path) {
+  const res = await fetch(`${RELAY_URL}${path}`, {
+    method: 'POST',
+    headers: { 'x-relay-secret': RELAY_SECRET },
+  });
+  const data = await res.json();
+  if (!res.ok || data?.success !== true) {
+    throw new Error(`Relay error on ${path}: ${data?.error || res.status}`);
+  }
+  return data;
+}
+
+async function pushStatus(pushToken, status, msg, pingMs) {
+  if (!pushToken) {
+    console.error('[push] pushToken manquant, envoi ignoré pour ce monitor.');
+    return;
+  }
+  const pingParam = Number.isFinite(pingMs) ? `&ping=${Math.round(pingMs)}` : '';
+  const url = `${KUMA_URL}/api/push/${pushToken}?status=${status}&msg=${encodeURIComponent(msg)}${pingParam}`;
+  try {
+    const res = await fetch(url);
+    if (!res.ok) {
+      console.error(`[push] échec HTTP ${res.status} pour token ${pushToken.slice(0, 6)}...`);
+    }
+  } catch (e) {
+    console.error(`[push] erreur réseau pour token ${pushToken.slice(0, 6)}...:`, e.message);
+  }
+}
+
+function isDue(site) {
+  if (!site.last_crawled_at) return true;
+  const intervalMs = (site.crawl_interval_minutes ?? 1440) * 60 * 1000;
+  const nextDue = new Date(site.last_crawled_at).getTime() + intervalMs;
+  return Date.now() >= nextDue;
+}
+
+function getHostname(rawUrl) {
+  try {
+    return new URL(rawUrl).hostname;
+  } catch {
+    return null;
+  }
+}
+
+// Une requête est "first-party" si elle vise :
+// - le même hostname que la page,
+// - un sous-domaine de celui-ci,
+// - un domaine listé dans EXTRA_API_DOMAINS.
 function isFirstPartyRequest(requestUrl, pageHostname) {
   const reqHost = getHostname(requestUrl);
   if (!reqHost || !pageHostname) return false;
@@ -31,6 +93,8 @@ function isFirstPartyRequest(requestUrl, pageHostname) {
     (domain) => reqHost === domain || reqHost.endsWith(`.${domain}`)
   );
 }
+
+// ======================== VÉRIFICATION D'UNE PAGE ========================
 
 async function checkPage(context, url) {
   const page = await context.newPage();
@@ -98,7 +162,7 @@ async function checkPage(context, url) {
   let loadTimeMs = null;
   const navStart = Date.now();
 
-  const PENDING_API_MAX_WAIT_MS = 4 * 60 * 1000;
+  const PENDING_API_MAX_WAIT_MS = 4 * 60 * 1000; // 4 minutes
   const PENDING_API_POLL_INTERVAL_MS = 500;
 
   async function waitForPendingRequestsToSettle(maxWaitMs) {
@@ -140,6 +204,7 @@ async function checkPage(context, url) {
       }
     }
 
+    // Mesure du temps de chargement réel (Navigation Timing API).
     try {
       const timing = await page.evaluate(() => {
         const [nav] = performance.getEntriesByType('navigation');
@@ -161,7 +226,8 @@ async function checkPage(context, url) {
   return { status, msg, loadTimeMs };
 }
 
-// ----- main() identique, mais avec logs supplémentaires -----
+// ======================== BOUCLE PRINCIPALE ========================
+
 async function main() {
   const { sites } = await relayGet('/active-sites');
   console.log(`[crawler] ${sites.length} site(s) actif(s) au total`);
@@ -179,7 +245,7 @@ async function main() {
       }
 
       if (!isDue(site)) {
-        console.log(`[crawler] "${site.client_name}" pas encore dû, skip`);
+        console.log(`[crawler] "${site.client_name}" pas encore dû (interval ${site.crawl_interval_minutes ?? 1440}min, dernier crawl ${site.last_crawled_at}), skip`);
         totalSkipped += 1;
         continue;
       }
