@@ -156,18 +156,62 @@ async function checkPage(context, url) {
   let loadTimeMs = null;
   const navStart = Date.now();
 
+  // Délai maximum qu'on est prêt à attendre pour obtenir une réponse
+  // CONFIRMÉE (succès ou échec réseau réel) des appels API first-party
+  // encore en vol après le chargement de la page. Observé en conditions
+  // réelles : Chrome met parfois 2 à 3 minutes avant de déclarer un
+  // net::ERR définitif sur un backend qui ne répond jamais (voir DevTools:
+  // "(failed) net::E..." après 2.3-3.1 min). Un timeout plus court (ex:
+  // 20s) ne fait que SUPPOSER un down sans jamais obtenir la vraie réponse
+  // du réseau — ce n'est plus acceptable pour une détection fiable, quelle
+  // que soit la stack du site testé.
+  const PENDING_API_MAX_WAIT_MS = 4 * 60 * 1000; // 4 minutes
+  const PENDING_API_POLL_INTERVAL_MS = 500;
+
+  // Attend que toutes les requêtes first-party encore en vol se résolvent
+  // réellement (succès via 'requestfinished' ou échec via 'requestfailed'
+  // — les deux listeners existants retirent déjà l'entrée de la map), au
+  // lieu de couper court sur un timeout arbitraire. Retourne true si tout
+  // s'est résolu avant maxWaitMs, false si des appels sont encore bloqués
+  // à l'expiration du délai (cas alors honnêtement signalé comme "non
+  // confirmé" plutôt que comme un down supposé).
+  async function waitForPendingRequestsToSettle(maxWaitMs) {
+    const deadline = Date.now() + maxWaitMs;
+    while (pendingFirstPartyRequests.size > 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, PENDING_API_POLL_INTERVAL_MS));
+    }
+    return pendingFirstPartyRequests.size === 0;
+  }
+
   try {
-    const response = await page.goto(url, { waitUntil: 'networkidle', timeout: 20000 });
+    // Chargement de la page lui-même : reste volontairement rapide.
+    // 'domcontentloaded' suffit pour savoir si le document HTML arrive —
+    // les appels API first-party (xhr/fetch) sont surveillés séparément
+    // ci-dessous, avec leur propre délai, plus long et honnête.
+    const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
 
     if (!response || !response.ok()) {
       status = 'down';
       msg = `HTTP ${response ? response.status() : 'no response'}`;
-    } else if (apiErrors.length > 0) {
-      status = 'down';
-      msg = `Erreur API: ${apiErrors[0]}`;
-    } else if (consoleErrors.length > 0) {
-      status = 'down';
-      msg = `Erreur JS: ${consoleErrors[0]}`;
+    } else {
+      // Attente CONFIRMÉE (pas supposée) des appels API en cours. Si un
+      // backend met plusieurs minutes à échouer définitivement, on attend
+      // ce temps-là plutôt que de deviner après 20s.
+      const settled = await waitForPendingRequestsToSettle(PENDING_API_MAX_WAIT_MS);
+
+      if (apiErrors.length > 0) {
+        status = 'down';
+        msg = `Erreur API: ${apiErrors[0]}`;
+      } else if (consoleErrors.length > 0) {
+        status = 'down';
+        msg = `Erreur JS: ${consoleErrors[0]}`;
+      } else if (!settled) {
+        // Après 4 minutes d'attente réelle, toujours pas de réponse
+        // confirmée : on ne devine plus au hasard, on le dit tel quel.
+        status = 'down';
+        const stuckUrls = Array.from(pendingFirstPartyRequests.keys()).slice(0, 3).join(', ');
+        msg = `Non confirmé après ${Math.round(PENDING_API_MAX_WAIT_MS / 1000)}s: ${pendingFirstPartyRequests.size} appel(s) API du site toujours sans réponse (ex: ${stuckUrls})`.slice(0, 200);
+      }
     }
 
     // Temps de chargement réel mesuré par le navigateur (Navigation Timing
@@ -187,17 +231,7 @@ async function checkPage(context, url) {
     }
   } catch (err) {
     status = 'down';
-    // Si page.goto a timeout ALORS QUE des appels API first-party sont
-    // toujours en vol, on le dit explicitement plutôt que de renvoyer le
-    // message générique Playwright ("Timeout 20000ms exceeded") — c'est le
-    // cas concret observé manuellement (appels bloqués en "pending" dans le
-    // Network tab, jamais résolus).
-    if (pendingFirstPartyRequests.size > 0) {
-      const stuckUrls = Array.from(pendingFirstPartyRequests.keys()).slice(0, 3).join(', ');
-      msg = `Timeout: ${pendingFirstPartyRequests.size} appel(s) API du site sans réponse (ex: ${stuckUrls})`.slice(0, 200);
-    } else {
-      msg = String(err.message || err).slice(0, 200);
-    }
+    msg = String(err.message || err).slice(0, 200);
     loadTimeMs = Date.now() - navStart;
   } finally {
     await page.close();
