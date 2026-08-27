@@ -81,6 +81,21 @@ async function checkPage(context, url) {
     }
   });
 
+  // Cas distinct du précédent : une requête peut ne JAMAIS recevoir de
+  // réponse (connexion refusée, DNS, timeout, CORS bloqué côté navigateur,
+  // certificat invalide...). Dans ce cas 'response' ne se déclenche pas du
+  // tout — c'est le scénario "le backend n'arrive pas jusqu'au frontend" :
+  // l'appel API part et disparaît silencieusement, sans jamais faire planter
+  // le JS ni renvoyer un code d'erreur exploitable par 'response'. Kuma (et
+  // l'ancienne version de ce script) ne voyaient pas ce cas du tout.
+  page.on('requestfailed', (req) => {
+    const type = req.resourceType();
+    if (type === 'xhr' || type === 'fetch') {
+      const reason = req.failure()?.errorText || 'requête échouée';
+      apiErrors.push(`${reason} ${req.url()}`);
+    }
+  });
+
   page.on('pageerror', (err) => {
     consoleErrors.push(err.message);
   });
