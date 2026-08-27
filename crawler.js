@@ -62,21 +62,69 @@ function isDue(site) {
   return Date.now() >= nextDue;
 }
 
+// Extrait le hostname d'une URL, ou null si invalide.
+function getHostname(rawUrl) {
+  try {
+    return new URL(rawUrl).hostname;
+  } catch {
+    return null;
+  }
+}
+
+// Une requête est considérée "first-party" (le backend du site qu'on teste)
+// si elle vise le même hostname que la page, ou un sous-domaine de celui-ci
+// (ex: api.markhorusbj.com pour markhorusbj.com). Tout le reste (Google
+// Analytics, pixels pub, CDN tiers, polices, chat widgets...) est ignoré :
+// ces appels sont fréquemment avortés par le navigateur sans que ce soit un
+// signe de panne du site lui-même, et généraient des faux positifs (ex:
+// beacon google-analytics.com/g/collect avorté = pas une panne du site).
+function isFirstPartyRequest(requestUrl, pageHostname) {
+  const reqHost = getHostname(requestUrl);
+  if (!reqHost || !pageHostname) return false;
+  return reqHost === pageHostname || reqHost.endsWith(`.${pageHostname}`);
+}
+
 // Vérifie une page : navigation OK + pas d'erreur API silencieuse en arrière-plan
 // (c'est le but même du projet : détecter un backend qui répond en erreur
 // alors que le frontend a l'air fonctionnel).
 async function checkPage(context, url) {
   const page = await context.newPage();
+  const pageHostname = getHostname(url);
 
   const apiErrors = [];
   const consoleErrors = [];
+  // Requêtes first-party (xhr/fetch) encore en vol au moment où on regarde —
+  // sert uniquement à produire un message clair si page.goto timeout parce
+  // que ces appels restent bloqués en "pending" indéfiniment (le cas
+  // "réalisations qui tournent en rond" observé manuellement : le navigateur
+  // met bien plus de 20s à déclarer l'échec, donc notre propre timeout de
+  // page.goto se déclenche avant que 'requestfailed' ait la moindre chance
+  // de se déclencher).
+  const pendingFirstPartyRequests = new Map();
+
+  page.on('request', (req) => {
+    const type = req.resourceType();
+    if ((type === 'xhr' || type === 'fetch') && isFirstPartyRequest(req.url(), pageHostname)) {
+      pendingFirstPartyRequests.set(req.url(), true);
+    }
+  });
+
+  page.on('requestfinished', (req) => {
+    pendingFirstPartyRequests.delete(req.url());
+  });
 
   page.on('response', (response) => {
     const req = response.request();
     const type = req.resourceType();
-    // On ne surveille que les appels XHR/fetch (appels API), pas les assets
-    // statiques (images, css, fonts) qui peuvent 404 sans que ce soit critique.
-    if ((type === 'xhr' || type === 'fetch') && response.status() >= 500) {
+    // On ne surveille que les appels XHR/fetch (appels API) vers le domaine
+    // du site lui-même — pas les assets statiques, ni les appels vers des
+    // domaines tiers (analytics, pubs, CDN) qui peuvent échouer sans rapport
+    // avec la santé du site.
+    if (
+      (type === 'xhr' || type === 'fetch') &&
+      isFirstPartyRequest(req.url(), pageHostname) &&
+      response.status() >= 500
+    ) {
       apiErrors.push(`${response.status()} ${req.url()}`);
     }
   });
@@ -87,10 +135,13 @@ async function checkPage(context, url) {
   // tout — c'est le scénario "le backend n'arrive pas jusqu'au frontend" :
   // l'appel API part et disparaît silencieusement, sans jamais faire planter
   // le JS ni renvoyer un code d'erreur exploitable par 'response'. Kuma (et
-  // l'ancienne version de ce script) ne voyaient pas ce cas du tout.
+  // l'ancienne version de ce script) ne voyaient pas ce cas du tout. Même
+  // filtre first-party que ci-dessus : un beacon analytics avorté ne doit
+  // pas faire passer le site en "down".
   page.on('requestfailed', (req) => {
+    pendingFirstPartyRequests.delete(req.url());
     const type = req.resourceType();
-    if (type === 'xhr' || type === 'fetch') {
+    if ((type === 'xhr' || type === 'fetch') && isFirstPartyRequest(req.url(), pageHostname)) {
       const reason = req.failure()?.errorText || 'requête échouée';
       apiErrors.push(`${reason} ${req.url()}`);
     }
@@ -136,7 +187,17 @@ async function checkPage(context, url) {
     }
   } catch (err) {
     status = 'down';
-    msg = String(err.message || err).slice(0, 200);
+    // Si page.goto a timeout ALORS QUE des appels API first-party sont
+    // toujours en vol, on le dit explicitement plutôt que de renvoyer le
+    // message générique Playwright ("Timeout 20000ms exceeded") — c'est le
+    // cas concret observé manuellement (appels bloqués en "pending" dans le
+    // Network tab, jamais résolus).
+    if (pendingFirstPartyRequests.size > 0) {
+      const stuckUrls = Array.from(pendingFirstPartyRequests.keys()).slice(0, 3).join(', ');
+      msg = `Timeout: ${pendingFirstPartyRequests.size} appel(s) API du site sans réponse (ex: ${stuckUrls})`.slice(0, 200);
+    } else {
+      msg = String(err.message || err).slice(0, 200);
+    }
     loadTimeMs = Date.now() - navStart;
   } finally {
     await page.close();
