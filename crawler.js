@@ -3,6 +3,12 @@ const { chromium } = require('playwright');
 const RELAY_URL = process.env.RELAY_URL;
 const RELAY_SECRET = process.env.RELAY_SECRET;
 const KUMA_URL = process.env.KUMA_URL;
+// Domaines supplémentaires considérés comme "first-party" (backends externes).
+// Séparez plusieurs domaines par des virgules, ex: "api.monsite.com,backend.autre.com"
+const EXTRA_API_DOMAINS = (process.env.EXTRA_API_DOMAINS || '')
+  .split(',')
+  .map((d) => d.trim())
+  .filter(Boolean);
 
 if (!RELAY_URL || !RELAY_SECRET || !KUMA_URL) {
   console.error('RELAY_URL, RELAY_SECRET et KUMA_URL sont requis (env vars).');
@@ -49,6 +55,9 @@ async function pushStatus(pushToken, status, msg, pingMs) {
   }
 }
 
+// Détermine si un site doit être re-vérifié à ce run, en fonction de sa
+// fréquence choisie (crawl_interval_minutes) et de la dernière vérification
+// (last_crawled_at). Si jamais crawlé, on le considère dû immédiatement.
 function isDue(site) {
   if (!site.last_crawled_at) return true;
   const intervalMs = (site.crawl_interval_minutes ?? 1440) * 60 * 1000;
@@ -56,6 +65,7 @@ function isDue(site) {
   return Date.now() >= nextDue;
 }
 
+// Extrait le hostname d'une URL, ou null si invalide.
 function getHostname(rawUrl) {
   try {
     return new URL(rawUrl).hostname;
@@ -64,18 +74,31 @@ function getHostname(rawUrl) {
   }
 }
 
+// Une requête est considérée "first-party" si elle vise :
+// - le même hostname que la page,
+// - un sous-domaine de celui-ci (ex: api.markhorusbj.com pour markhorusbj.com),
+// - un des domaines listés dans EXTRA_API_DOMAINS (backends externes connus).
 function isFirstPartyRequest(requestUrl, pageHostname) {
   const reqHost = getHostname(requestUrl);
   if (!reqHost || !pageHostname) return false;
-  return reqHost === pageHostname || reqHost.endsWith(`.${pageHostname}`);
+  if (reqHost === pageHostname || reqHost.endsWith(`.${pageHostname}`)) {
+    return true;
+  }
+  return EXTRA_API_DOMAINS.some(
+    (domain) => reqHost === domain || reqHost.endsWith(`.${domain}`)
+  );
 }
 
+// Vérifie une page : navigation OK + pas d'erreur API silencieuse en arrière-plan
+// (c'est le but même du projet : détecter un backend qui répond en erreur
+// alors que le frontend a l'air fonctionnel).
 async function checkPage(context, url) {
   const page = await context.newPage();
   const pageHostname = getHostname(url);
 
   const apiErrors = [];
   const consoleErrors = [];
+  // Requêtes first-party (xhr/fetch) encore en vol au moment où on regarde.
   const pendingFirstPartyRequests = new Map();
 
   page.on('request', (req) => {
@@ -92,8 +115,11 @@ async function checkPage(context, url) {
   page.on('response', (response) => {
     const req = response.request();
     const type = req.resourceType();
-    if ((type === 'xhr' || type === 'fetch') && isFirstPartyRequest(req.url(), pageHostname) && response.status() >= 500) {
-      console.log(`[debug-net] Erreur HTTP ${response.status()} sur ${req.url()}`);
+    if (
+      (type === 'xhr' || type === 'fetch') &&
+      isFirstPartyRequest(req.url(), pageHostname) &&
+      response.status() >= 500
+    ) {
       apiErrors.push(`HTTP ${response.status()} ${req.url()}`);
     }
   });
@@ -101,16 +127,9 @@ async function checkPage(context, url) {
   page.on('requestfailed', (req) => {
     pendingFirstPartyRequests.delete(req.url());
     const type = req.resourceType();
-    if (type === 'xhr' || type === 'fetch') {
+    if ((type === 'xhr' || type === 'fetch') && isFirstPartyRequest(req.url(), pageHostname)) {
       const reason = req.failure()?.errorText || 'requête échouée';
-      const firstParty = isFirstPartyRequest(req.url(), pageHostname);
-      
-      // LOG DE DEBUG : on affiche TOUTES les requêtes XHR/Fetch qui échouent
-      console.log(`[debug-net] Échec Réseau (${reason}) sur ${req.url()} ${firstParty ? '' : '(ignoré: non first-party)'}`);
-      
-      if (firstParty) {
-        apiErrors.push(`Réseau: ${reason} ${req.url()}`);
-      }
+      apiErrors.push(`Réseau: ${reason} ${req.url()}`);
     }
   });
 
@@ -135,23 +154,25 @@ async function checkPage(context, url) {
   }
 
   try {
-    // On attend 'load' pour s'assurer que les scripts de la SPA sont bien chargés
+    // Chargement de la page : on attend 'load' pour être sûr que les scripts
+    // de la SPA sont bien chargés et que les appels API sont probablement lancés.
     const response = await page.goto(url, { waitUntil: 'load', timeout: 20000 });
 
     if (!response || !response.ok()) {
       status = 'down';
       msg = `HTTP ${response ? response.status() : 'no response'}`;
     } else {
-      
-      // Délai fixe pour laisser le framework JS (React/Vue) s'initialiser
-      // et lancer ses appels API. 'networkidle' n'est pas fiable car il peut
-      // se déclencher pendant une micro-pause de l'hydrate, avant les calls.
-      await new Promise(resolve => setTimeout(resolve, 3000));
-
-      if (pendingFirstPartyRequests.size > 0) {
-        console.log(`[debug-net] ${pendingFirstPartyRequests.size} requête(s) API first-party en cours. Attente de leur résolution...`);
+      // Attente du réseau "idle" pendant 10 secondes maximum pour laisser
+      // aux frameworks JS le temps de lancer leurs appels API.
+      // Si des requêtes restent pendantes, ce timeout expirera et on passera
+      // à l'étape suivante (les requêtes sont déjà dans pendingFirstPartyRequests).
+      try {
+        await page.waitForLoadState('networkidle', { timeout: 10000 });
+      } catch (e) {
+        // Timeout normal si des requêtes API sont en cours ou bloquées.
       }
 
+      // Attente CONFIRMÉE des appels API en cours (jusqu'à 4 minutes).
       const settled = await waitForPendingRequestsToSettle(PENDING_API_MAX_WAIT_MS);
 
       if (apiErrors.length > 0) {
@@ -164,12 +185,13 @@ async function checkPage(context, url) {
         status = 'down';
         const stuckUrls = Array.from(pendingFirstPartyRequests.keys())
           .slice(0, 2)
-          .map(u => u.replace(/^https?:\/\//, '').slice(0, 40))
+          .map((u) => u.replace(/^https?:\/\//, '').slice(0, 40))
           .join(', ');
         msg = `Backend muet (Timeout 4min): ${pendingFirstPartyRequests.size} requête(s) API sans réponse (ex: ${stuckUrls})`.slice(0, 200);
       }
     }
 
+    // Mesure du temps de chargement réel (Navigation Timing API).
     try {
       const timing = await page.evaluate(() => {
         const [nav] = performance.getEntriesByType('navigation');
@@ -236,6 +258,7 @@ async function main() {
           console.log(`[crawler]   ${token.url} -> ${status} (${msg}) [${loadTimeMs != null ? Math.round(loadTimeMs) + 'ms' : '—'}]`);
           await pushStatus(token.pushToken, status, msg, loadTimeMs);
 
+          // Petite pause entre les pages d'un même site pour éviter le rate-limiting.
           if (i < tokens.length - 1) {
             await new Promise((resolve) => setTimeout(resolve, 2000));
           }
