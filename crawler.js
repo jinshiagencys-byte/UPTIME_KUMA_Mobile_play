@@ -4,25 +4,18 @@ const RELAY_URL = process.env.RELAY_URL;
 const RELAY_SECRET = process.env.RELAY_SECRET;
 const KUMA_URL = process.env.KUMA_URL;
 
-// Domaines supplémentaires considérés comme "first-party" (backends externes).
-// Exemple: "api.autre-domaine.com,backend.example.com"
 const EXTRA_API_DOMAINS = (process.env.EXTRA_API_DOMAINS || '')
   .split(',')
   .map((d) => d.trim())
   .filter(Boolean);
 
-// Durée d'observation après le chargement de la page (en millisecondes).
-const POST_LOAD_WAIT_MS = parseInt(process.env.POST_LOAD_WAIT_MS || '60000', 10);
-
-// Active le log de TOUTES les requêtes (même non first-party) pour debug.
+const POST_LOAD_WAIT_MS = parseInt(process.env.POST_LOAD_WAIT_MS || '120000', 10);
 const DEBUG_LOG_ALL_REQUESTS = (process.env.DEBUG_LOG_ALL_REQUESTS === 'true');
 
 if (!RELAY_URL || !RELAY_SECRET || !KUMA_URL) {
   console.error('RELAY_URL, RELAY_SECRET et KUMA_URL sont requis (env vars).');
   process.exit(1);
 }
-
-// ======================== FONCTIONS UTILITAIRES ========================
 
 async function relayGet(path) {
   const res = await fetch(`${RELAY_URL}${path}`, {
@@ -79,22 +72,17 @@ function getHostname(rawUrl) {
   }
 }
 
-// Une requête est "first-party" si elle vise :
-// - le même hostname que la page,
-// - un sous-domaine de celui-ci,
-// - un domaine listé dans EXTRA_API_DOMAINS.
-function isFirstPartyRequest(requestUrl, pageHostname) {
+// Considère comme "intéressant" tout domaine contenant le hostname de la page
+// ou l'un des domaines extra, OU tout domaine contenant "markhorus" si debug.
+function isRelevantDomain(requestUrl, pageHostname) {
   const reqHost = getHostname(requestUrl);
   if (!reqHost || !pageHostname) return false;
-  if (reqHost === pageHostname || reqHost.endsWith(`.${pageHostname}`)) {
-    return true;
-  }
-  return EXTRA_API_DOMAINS.some(
-    (domain) => reqHost === domain || reqHost.endsWith(`.${domain}`)
-  );
+  if (reqHost === pageHostname || reqHost.endsWith(`.${pageHostname}`)) return true;
+  if (EXTRA_API_DOMAINS.some((d) => reqHost === d || reqHost.endsWith(`.${d}`))) return true;
+  // En mode debug, on remonte aussi tout domaine contenant "markhorus"
+  if (DEBUG_LOG_ALL_REQUESTS && reqHost.includes('markhorus')) return true;
+  return false;
 }
-
-// ======================== VÉRIFICATION D'UNE PAGE ========================
 
 async function checkPage(context, url) {
   const page = await context.newPage();
@@ -102,54 +90,63 @@ async function checkPage(context, url) {
 
   const apiErrors = [];
   const consoleErrors = [];
-  const pendingFirstPartyRequests = new Map();
+  const pendingRelevantRequests = new Map(); // requêtes potentiellement intéressantes (tous types)
 
-  // ----- Écouteurs réseau -----
+  // ----- Écouteurs réseau élargis -----
   page.on('request', (req) => {
     const type = req.resourceType();
-    if (type === 'xhr' || type === 'fetch') {
-      const isFirstParty = isFirstPartyRequest(req.url(), pageHostname);
-      if (DEBUG_LOG_ALL_REQUESTS) {
-        console.log(`[debug-all] Requête ${type}: ${req.url()} ${isFirstParty ? '(first-party)' : '(non first-party)'}`);
-      }
-      if (isFirstParty) {
-        pendingFirstPartyRequests.set(req.url(), true);
-        console.log(`[debug-first] Requête first-party: ${req.url()}`);
-      }
+    const isRelevant = isRelevantDomain(req.url(), pageHostname);
+    if (isRelevant) {
+      pendingRelevantRequests.set(req.url(), { type, start: Date.now() });
+      console.log(`[debug-req] Requête ${type}: ${req.url()}`);
     }
   });
 
   page.on('requestfinished', (req) => {
-    pendingFirstPartyRequests.delete(req.url());
+    pendingRelevantRequests.delete(req.url());
   });
 
   page.on('response', (response) => {
     const req = response.request();
-    const type = req.resourceType();
-    if (type === 'xhr' || type === 'fetch') {
-      const isFirstParty = isFirstPartyRequest(req.url(), pageHostname);
-      if (DEBUG_LOG_ALL_REQUESTS) {
-        console.log(`[debug-all] Réponse ${response.status()} pour ${req.url()} ${isFirstParty ? '(first-party)' : '(non first-party)'}`);
-      }
-      if (isFirstParty && response.status() >= 500) {
-        apiErrors.push(`HTTP ${response.status()} ${req.url()}`);
+    const isRelevant = isRelevantDomain(req.url(), pageHostname);
+    if (isRelevant) {
+      const status = response.status();
+      console.log(`[debug-resp] Réponse ${status} pour ${req.resourceType()} ${req.url()}`);
+      if (status >= 500) {
+        apiErrors.push(`HTTP ${status} ${req.url()}`);
       }
     }
   });
 
   page.on('requestfailed', (req) => {
-    pendingFirstPartyRequests.delete(req.url());
-    const type = req.resourceType();
-    if (type === 'xhr' || type === 'fetch') {
-      const isFirstParty = isFirstPartyRequest(req.url(), pageHostname);
-      if (DEBUG_LOG_ALL_REQUESTS) {
-        const reason = req.failure()?.errorText || 'inconnue';
-        console.log(`[debug-all] Échec réseau (${reason}) pour ${req.url()} ${isFirstParty ? '(first-party)' : '(non first-party)'}`);
-      }
-      if (isFirstParty) {
-        const reason = req.failure()?.errorText || 'requête échouée';
+    pendingRelevantRequests.delete(req.url());
+    const isRelevant = isRelevantDomain(req.url(), pageHostname);
+    if (isRelevant) {
+      const reason = req.failure()?.errorText || 'requête échouée';
+      console.log(`[debug-fail] Échec réseau (${reason}) pour ${req.resourceType()} ${req.url()}`);
+      // On ne remonte que les échecs de type xhr/fetch comme avant
+      if (req.resourceType() === 'xhr' || req.resourceType() === 'fetch') {
         apiErrors.push(`Réseau: ${reason} ${req.url()}`);
       }
+    }
+  });
+
+  // WebSocket : on écoute aussi les frames si besoin
+  page.on('websocket', (ws) => {
+    const wsUrl = ws.url();
+    if (isRelevantDomain(wsUrl, pageHostname)) {
+      console.log(`[debug-ws] WebSocket ouvert: ${wsUrl}`);
+      ws.on('framereceived', (frame) => {
+        console.log(`[debug-ws] Frame reçu (${frame.payload.length} octets) sur ${wsUrl}`);
+      });
+      ws.on('close', () => {
+        console.log(`[debug-ws] WebSocket fermé: ${wsUrl}`);
+        // On peut considérer une fermeture anormale comme une erreur
+      });
+      ws.on('sockererror', (err) => {
+        console.log(`[debug-ws] Erreur WebSocket sur ${wsUrl}: ${err.message}`);
+        apiErrors.push(`WebSocket erreur: ${err.message} ${wsUrl}`);
+      });
     }
   });
 
@@ -162,15 +159,15 @@ async function checkPage(context, url) {
   let loadTimeMs = null;
   const navStart = Date.now();
 
-  const PENDING_API_MAX_WAIT_MS = 4 * 60 * 1000; // 4 minutes
+  const PENDING_API_MAX_WAIT_MS = 4 * 60 * 1000;
   const PENDING_API_POLL_INTERVAL_MS = 500;
 
   async function waitForPendingRequestsToSettle(maxWaitMs) {
     const deadline = Date.now() + maxWaitMs;
-    while (pendingFirstPartyRequests.size > 0 && Date.now() < deadline) {
+    while (pendingRelevantRequests.size > 0 && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, PENDING_API_POLL_INTERVAL_MS));
     }
-    return pendingFirstPartyRequests.size === 0;
+    return pendingRelevantRequests.size === 0;
   }
 
   try {
@@ -183,8 +180,8 @@ async function checkPage(context, url) {
       console.log(`[debug-net] Observation post-chargement pendant ${POST_LOAD_WAIT_MS}ms...`);
       await new Promise((resolve) => setTimeout(resolve, POST_LOAD_WAIT_MS));
 
-      if (pendingFirstPartyRequests.size > 0) {
-        console.log(`[debug-net] ${pendingFirstPartyRequests.size} requête(s) first-party encore en cours. Attente...`);
+      if (pendingRelevantRequests.size > 0) {
+        console.log(`[debug-net] ${pendingRelevantRequests.size} requête(s) pertinente(s) encore en cours. Attente...`);
       }
       const settled = await waitForPendingRequestsToSettle(PENDING_API_MAX_WAIT_MS);
 
@@ -196,15 +193,14 @@ async function checkPage(context, url) {
         msg = `JS Error: ${consoleErrors[0]}`.slice(0, 200);
       } else if (!settled) {
         status = 'down';
-        const stuckUrls = Array.from(pendingFirstPartyRequests.keys())
+        const stuckUrls = Array.from(pendingRelevantRequests.keys())
           .slice(0, 2)
           .map((u) => u.replace(/^https?:\/\//, '').slice(0, 40))
           .join(', ');
-        msg = `Backend muet (Timeout 4min): ${pendingFirstPartyRequests.size} requête(s) API sans réponse (ex: ${stuckUrls})`.slice(0, 200);
+        msg = `Backend muet (Timeout 4min): ${pendingRelevantRequests.size} requête(s) sans réponse (ex: ${stuckUrls})`.slice(0, 200);
       }
     }
 
-    // Mesure du temps de chargement réel (Navigation Timing API).
     try {
       const timing = await page.evaluate(() => {
         const [nav] = performance.getEntriesByType('navigation');
@@ -225,8 +221,6 @@ async function checkPage(context, url) {
 
   return { status, msg, loadTimeMs };
 }
-
-// ======================== BOUCLE PRINCIPALE ========================
 
 async function main() {
   const { sites } = await relayGet('/active-sites');
