@@ -4,18 +4,28 @@ const RELAY_URL = process.env.RELAY_URL;
 const RELAY_SECRET = process.env.RELAY_SECRET;
 const KUMA_URL = process.env.KUMA_URL;
 
+// Domaines supplémentaires (backends externes) – pas nécessaire pour markhorus
 const EXTRA_API_DOMAINS = (process.env.EXTRA_API_DOMAINS || '')
   .split(',')
   .map((d) => d.trim())
   .filter(Boolean);
 
+// Durée d'observation après chargement (ms)
 const POST_LOAD_WAIT_MS = parseInt(process.env.POST_LOAD_WAIT_MS || '120000', 10);
+
+// Active le log de TOUTES les requêtes pour debug
 const DEBUG_LOG_ALL_REQUESTS = (process.env.DEBUG_LOG_ALL_REQUESTS === 'true');
+
+// Détection de rate-limit sur les ressources first-party
+const DETECT_429_ON_ASSETS = (process.env.DETECT_429_ON_ASSETS === 'true');
+const MAX_429_ASSETS = parseInt(process.env.MAX_429_ASSETS || '5', 10);
 
 if (!RELAY_URL || !RELAY_SECRET || !KUMA_URL) {
   console.error('RELAY_URL, RELAY_SECRET et KUMA_URL sont requis (env vars).');
   process.exit(1);
 }
+
+// ==================== FONCTIONS UTILITAIRES ====================
 
 async function relayGet(path) {
   const res = await fetch(`${RELAY_URL}${path}`, {
@@ -72,17 +82,17 @@ function getHostname(rawUrl) {
   }
 }
 
-// Considère comme "intéressant" tout domaine contenant le hostname de la page
-// ou l'un des domaines extra, OU tout domaine contenant "markhorus" si debug.
+// Domaine pertinent = first-party ou domaine contenant "markhorus" si debug
 function isRelevantDomain(requestUrl, pageHostname) {
   const reqHost = getHostname(requestUrl);
   if (!reqHost || !pageHostname) return false;
   if (reqHost === pageHostname || reqHost.endsWith(`.${pageHostname}`)) return true;
   if (EXTRA_API_DOMAINS.some((d) => reqHost === d || reqHost.endsWith(`.${d}`))) return true;
-  // En mode debug, on remonte aussi tout domaine contenant "markhorus"
   if (DEBUG_LOG_ALL_REQUESTS && reqHost.includes('markhorus')) return true;
   return false;
 }
+
+// ==================== VÉRIFICATION D'UNE PAGE ====================
 
 async function checkPage(context, url) {
   const page = await context.newPage();
@@ -90,15 +100,17 @@ async function checkPage(context, url) {
 
   const apiErrors = [];
   const consoleErrors = [];
-  const pendingRelevantRequests = new Map(); // requêtes potentiellement intéressantes (tous types)
+  const pendingRelevantRequests = new Map();
+  let count429Assets = 0;
 
-  // ----- Écouteurs réseau élargis -----
+  // ----- Écouteurs réseau -----
   page.on('request', (req) => {
     const type = req.resourceType();
-    const isRelevant = isRelevantDomain(req.url(), pageHostname);
-    if (isRelevant) {
+    if (isRelevantDomain(req.url(), pageHostname)) {
       pendingRelevantRequests.set(req.url(), { type, start: Date.now() });
-      console.log(`[debug-req] Requête ${type}: ${req.url()}`);
+      if (DEBUG_LOG_ALL_REQUESTS) {
+        console.log(`[debug-req] Requête ${type}: ${req.url()}`);
+      }
     }
   });
 
@@ -108,10 +120,18 @@ async function checkPage(context, url) {
 
   page.on('response', (response) => {
     const req = response.request();
-    const isRelevant = isRelevantDomain(req.url(), pageHostname);
-    if (isRelevant) {
+    if (isRelevantDomain(req.url(), pageHostname)) {
       const status = response.status();
-      console.log(`[debug-resp] Réponse ${status} pour ${req.resourceType()} ${req.url()}`);
+      if (DEBUG_LOG_ALL_REQUESTS) {
+        console.log(`[debug-resp] Réponse ${status} pour ${req.resourceType()} ${req.url()}`);
+      }
+      // Détection de rate-limit sur les assets (scripts, styles, images, fonts)
+      if (status === 429 && DETECT_429_ON_ASSETS) {
+        const type = req.resourceType();
+        if (['script', 'stylesheet', 'image', 'font'].includes(type)) {
+          count429Assets++;
+        }
+      }
       if (status >= 500) {
         apiErrors.push(`HTTP ${status} ${req.url()}`);
       }
@@ -120,18 +140,19 @@ async function checkPage(context, url) {
 
   page.on('requestfailed', (req) => {
     pendingRelevantRequests.delete(req.url());
-    const isRelevant = isRelevantDomain(req.url(), pageHostname);
-    if (isRelevant) {
+    if (isRelevantDomain(req.url(), pageHostname)) {
       const reason = req.failure()?.errorText || 'requête échouée';
-      console.log(`[debug-fail] Échec réseau (${reason}) pour ${req.resourceType()} ${req.url()}`);
-      // On ne remonte que les échecs de type xhr/fetch comme avant
+      if (DEBUG_LOG_ALL_REQUESTS) {
+        console.log(`[debug-fail] Échec réseau (${reason}) pour ${req.resourceType()} ${req.url()}`);
+      }
+      // On ne remonte que les échecs XHR/Fetch comme erreurs API
       if (req.resourceType() === 'xhr' || req.resourceType() === 'fetch') {
         apiErrors.push(`Réseau: ${reason} ${req.url()}`);
       }
     }
   });
 
-  // WebSocket : on écoute aussi les frames si besoin
+  // WebSocket (optionnel)
   page.on('websocket', (ws) => {
     const wsUrl = ws.url();
     if (isRelevantDomain(wsUrl, pageHostname)) {
@@ -141,7 +162,6 @@ async function checkPage(context, url) {
       });
       ws.on('close', () => {
         console.log(`[debug-ws] WebSocket fermé: ${wsUrl}`);
-        // On peut considérer une fermeture anormale comme une erreur
       });
       ws.on('sockererror', (err) => {
         console.log(`[debug-ws] Erreur WebSocket sur ${wsUrl}: ${err.message}`);
@@ -185,7 +205,11 @@ async function checkPage(context, url) {
       }
       const settled = await waitForPendingRequestsToSettle(PENDING_API_MAX_WAIT_MS);
 
-      if (apiErrors.length > 0) {
+      // Détermination du statut final
+      if (DETECT_429_ON_ASSETS && count429Assets >= MAX_429_ASSETS) {
+        status = 'down';
+        msg = `Rate-limit détecté (${count429Assets} ressources en 429)`.slice(0, 200);
+      } else if (apiErrors.length > 0) {
         status = 'down';
         msg = `API Down (${apiErrors[0]})`.slice(0, 200);
       } else if (consoleErrors.length > 0) {
@@ -201,6 +225,7 @@ async function checkPage(context, url) {
       }
     }
 
+    // Mesure du temps de chargement
     try {
       const timing = await page.evaluate(() => {
         const [nav] = performance.getEntriesByType('navigation');
@@ -221,6 +246,8 @@ async function checkPage(context, url) {
 
   return { status, msg, loadTimeMs };
 }
+
+// ==================== BOUCLE PRINCIPALE ====================
 
 async function main() {
   const { sites } = await relayGet('/active-sites');
@@ -265,6 +292,7 @@ async function main() {
           console.log(`[crawler]   ${token.url} -> ${status} (${msg}) [${loadTimeMs != null ? Math.round(loadTimeMs) + 'ms' : '—'}]`);
           await pushStatus(token.pushToken, status, msg, loadTimeMs);
 
+          // Pause entre pages d'un même site (augmentable)
           if (i < tokens.length - 1) {
             await new Promise((resolve) => setTimeout(resolve, 2000));
           }
