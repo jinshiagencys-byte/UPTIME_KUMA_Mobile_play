@@ -125,7 +125,7 @@ async function checkPage(context, url) {
       isFirstPartyRequest(req.url(), pageHostname) &&
       response.status() >= 500
     ) {
-      apiErrors.push(`${response.status()} ${req.url()}`);
+      apiErrors.push(`HTTP ${response.status()} ${req.url()}`);
     }
   });
 
@@ -143,7 +143,7 @@ async function checkPage(context, url) {
     const type = req.resourceType();
     if ((type === 'xhr' || type === 'fetch') && isFirstPartyRequest(req.url(), pageHostname)) {
       const reason = req.failure()?.errorText || 'requête échouée';
-      apiErrors.push(`${reason} ${req.url()}`);
+      apiErrors.push(`Réseau: ${reason} ${req.url()}`);
     }
   });
 
@@ -194,6 +194,19 @@ async function checkPage(context, url) {
       status = 'down';
       msg = `HTTP ${response ? response.status() : 'no response'}`;
     } else {
+      
+      // Sur une SPA (React/Vue), 'domcontentloaded' se déclenche avant que le JS
+      // n'ait lancé les appels API. On attend donc que le réseau soit "idle"
+      // (inactif) pendant un court instant pour s'assurer que le framework a eu
+      // le temps de démarrer et d'émettre ses requêtes XHR/Fetch.
+      // Si une requête bloque indéfiniment, ce timeout de 5s s'activera, mais
+      // les requêtes seront bien présentes dans pendingFirstPartyRequests !
+      try {
+        await page.waitForLoadState('networkidle', { timeout: 5000 });
+      } catch (e) {
+        // Timeout normal si des requêtes API tournent déjà en boucle. On l'ignore.
+      }
+
       // Attente CONFIRMÉE (pas supposée) des appels API en cours. Si un
       // backend met plusieurs minutes à échouer définitivement, on attend
       // ce temps-là plutôt que de deviner après 20s.
@@ -201,16 +214,20 @@ async function checkPage(context, url) {
 
       if (apiErrors.length > 0) {
         status = 'down';
-        msg = `Erreur API: ${apiErrors[0]}`;
+        // Ex: "API Down (HTTP 500): https://..." ou "API Down (Réseau: net::ERR): https://..."
+        msg = `API Down (${apiErrors[0]})`.slice(0, 200);
       } else if (consoleErrors.length > 0) {
         status = 'down';
-        msg = `Erreur JS: ${consoleErrors[0]}`;
+        msg = `JS Error: ${consoleErrors[0]}`.slice(0, 200);
       } else if (!settled) {
         // Après 4 minutes d'attente réelle, toujours pas de réponse
         // confirmée : on ne devine plus au hasard, on le dit tel quel.
         status = 'down';
-        const stuckUrls = Array.from(pendingFirstPartyRequests.keys()).slice(0, 3).join(', ');
-        msg = `Non confirmé après ${Math.round(PENDING_API_MAX_WAIT_MS / 1000)}s: ${pendingFirstPartyRequests.size} appel(s) API du site toujours sans réponse (ex: ${stuckUrls})`.slice(0, 200);
+        const stuckUrls = Array.from(pendingFirstPartyRequests.keys())
+          .slice(0, 2)
+          .map(u => u.replace(/^https?:\/\//, '').slice(0, 40))
+          .join(', ');
+        msg = `Backend muet (Timeout 4min): ${pendingFirstPartyRequests.size} requête(s) API sans réponse (ex: ${stuckUrls})`.slice(0, 200);
       }
     }
 
