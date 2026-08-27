@@ -37,9 +37,6 @@ async function pushStatus(pushToken, status, msg, pingMs) {
     console.error('[push] pushToken manquant, envoi ignoré pour ce monitor.');
     return;
   }
-  // ping = temps de chargement mesuré par Playwright (ms), envoyé à Kuma qui
-  // l'affiche nativement (avgPing, graphique de temps de réponse) exactement
-  // comme s'il s'agissait d'un ping de monitoring HTTP classique.
   const pingParam = Number.isFinite(pingMs) ? `&ping=${Math.round(pingMs)}` : '';
   const url = `${KUMA_URL}/api/push/${pushToken}?status=${status}&msg=${encodeURIComponent(msg)}${pingParam}`;
   try {
@@ -52,9 +49,6 @@ async function pushStatus(pushToken, status, msg, pingMs) {
   }
 }
 
-// Détermine si un site doit être re-vérifié à ce run, en fonction de sa
-// fréquence choisie (crawl_interval_minutes) et de la dernière vérification
-// (last_crawled_at). Si jamais crawlé, on le considère dû immédiatement.
 function isDue(site) {
   if (!site.last_crawled_at) return true;
   const intervalMs = (site.crawl_interval_minutes ?? 1440) * 60 * 1000;
@@ -62,7 +56,6 @@ function isDue(site) {
   return Date.now() >= nextDue;
 }
 
-// Extrait le hostname d'une URL, ou null si invalide.
 function getHostname(rawUrl) {
   try {
     return new URL(rawUrl).hostname;
@@ -71,35 +64,18 @@ function getHostname(rawUrl) {
   }
 }
 
-// Une requête est considérée "first-party" (le backend du site qu'on teste)
-// si elle vise le même hostname que la page, ou un sous-domaine de celui-ci
-// (ex: api.markhorusbj.com pour markhorusbj.com). Tout le reste (Google
-// Analytics, pixels pub, CDN tiers, polices, chat widgets...) est ignoré :
-// ces appels sont fréquemment avortés par le navigateur sans que ce soit un
-// signe de panne du site lui-même, et généraient des faux positifs (ex:
-// beacon google-analytics.com/g/collect avorté = pas une panne du site).
 function isFirstPartyRequest(requestUrl, pageHostname) {
   const reqHost = getHostname(requestUrl);
   if (!reqHost || !pageHostname) return false;
   return reqHost === pageHostname || reqHost.endsWith(`.${pageHostname}`);
 }
 
-// Vérifie une page : navigation OK + pas d'erreur API silencieuse en arrière-plan
-// (c'est le but même du projet : détecter un backend qui répond en erreur
-// alors que le frontend a l'air fonctionnel).
 async function checkPage(context, url) {
   const page = await context.newPage();
   const pageHostname = getHostname(url);
 
   const apiErrors = [];
   const consoleErrors = [];
-  // Requêtes first-party (xhr/fetch) encore en vol au moment où on regarde —
-  // sert uniquement à produire un message clair si page.goto timeout parce
-  // que ces appels restent bloqués en "pending" indéfiniment (le cas
-  // "réalisations qui tournent en rond" observé manuellement : le navigateur
-  // met bien plus de 20s à déclarer l'échec, donc notre propre timeout de
-  // page.goto se déclenche avant que 'requestfailed' ait la moindre chance
-  // de se déclencher).
   const pendingFirstPartyRequests = new Map();
 
   page.on('request', (req) => {
@@ -116,34 +92,25 @@ async function checkPage(context, url) {
   page.on('response', (response) => {
     const req = response.request();
     const type = req.resourceType();
-    // On ne surveille que les appels XHR/fetch (appels API) vers le domaine
-    // du site lui-même — pas les assets statiques, ni les appels vers des
-    // domaines tiers (analytics, pubs, CDN) qui peuvent échouer sans rapport
-    // avec la santé du site.
-    if (
-      (type === 'xhr' || type === 'fetch') &&
-      isFirstPartyRequest(req.url(), pageHostname) &&
-      response.status() >= 500
-    ) {
+    if ((type === 'xhr' || type === 'fetch') && isFirstPartyRequest(req.url(), pageHostname) && response.status() >= 500) {
+      console.log(`[debug-net] Erreur HTTP ${response.status()} sur ${req.url()}`);
       apiErrors.push(`HTTP ${response.status()} ${req.url()}`);
     }
   });
 
-  // Cas distinct du précédent : une requête peut ne JAMAIS recevoir de
-  // réponse (connexion refusée, DNS, timeout, CORS bloqué côté navigateur,
-  // certificat invalide...). Dans ce cas 'response' ne se déclenche pas du
-  // tout — c'est le scénario "le backend n'arrive pas jusqu'au frontend" :
-  // l'appel API part et disparaît silencieusement, sans jamais faire planter
-  // le JS ni renvoyer un code d'erreur exploitable par 'response'. Kuma (et
-  // l'ancienne version de ce script) ne voyaient pas ce cas du tout. Même
-  // filtre first-party que ci-dessus : un beacon analytics avorté ne doit
-  // pas faire passer le site en "down".
   page.on('requestfailed', (req) => {
     pendingFirstPartyRequests.delete(req.url());
     const type = req.resourceType();
-    if ((type === 'xhr' || type === 'fetch') && isFirstPartyRequest(req.url(), pageHostname)) {
+    if (type === 'xhr' || type === 'fetch') {
       const reason = req.failure()?.errorText || 'requête échouée';
-      apiErrors.push(`Réseau: ${reason} ${req.url()}`);
+      const firstParty = isFirstPartyRequest(req.url(), pageHostname);
+      
+      // LOG DE DEBUG : on affiche TOUTES les requêtes XHR/Fetch qui échouent
+      console.log(`[debug-net] Échec Réseau (${reason}) sur ${req.url()} ${firstParty ? '' : '(ignoré: non first-party)'}`);
+      
+      if (firstParty) {
+        apiErrors.push(`Réseau: ${reason} ${req.url()}`);
+      }
     }
   });
 
@@ -156,25 +123,9 @@ async function checkPage(context, url) {
   let loadTimeMs = null;
   const navStart = Date.now();
 
-  // Délai maximum qu'on est prêt à attendre pour obtenir une réponse
-  // CONFIRMÉE (succès ou échec réseau réel) des appels API first-party
-  // encore en vol après le chargement de la page. Observé en conditions
-  // réelles : Chrome met parfois 2 à 3 minutes avant de déclarer un
-  // net::ERR définitif sur un backend qui ne répond jamais (voir DevTools:
-  // "(failed) net::E..." après 2.3-3.1 min). Un timeout plus court (ex:
-  // 20s) ne fait que SUPPOSER un down sans jamais obtenir la vraie réponse
-  // du réseau — ce n'est plus acceptable pour une détection fiable, quelle
-  // que soit la stack du site testé.
   const PENDING_API_MAX_WAIT_MS = 4 * 60 * 1000; // 4 minutes
   const PENDING_API_POLL_INTERVAL_MS = 500;
 
-  // Attend que toutes les requêtes first-party encore en vol se résolvent
-  // réellement (succès via 'requestfinished' ou échec via 'requestfailed'
-  // — les deux listeners existants retirent déjà l'entrée de la map), au
-  // lieu de couper court sur un timeout arbitraire. Retourne true si tout
-  // s'est résolu avant maxWaitMs, false si des appels sont encore bloqués
-  // à l'expiration du délai (cas alors honnêtement signalé comme "non
-  // confirmé" plutôt que comme un down supposé).
   async function waitForPendingRequestsToSettle(maxWaitMs) {
     const deadline = Date.now() + maxWaitMs;
     while (pendingFirstPartyRequests.size > 0 && Date.now() < deadline) {
@@ -184,44 +135,32 @@ async function checkPage(context, url) {
   }
 
   try {
-    // Chargement de la page lui-même : reste volontairement rapide.
-    // 'domcontentloaded' suffit pour savoir si le document HTML arrive —
-    // les appels API first-party (xhr/fetch) sont surveillés séparément
-    // ci-dessous, avec leur propre délai, plus long et honnête.
-    const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+    // On attend 'load' pour s'assurer que les scripts de la SPA sont bien chargés
+    const response = await page.goto(url, { waitUntil: 'load', timeout: 20000 });
 
     if (!response || !response.ok()) {
       status = 'down';
       msg = `HTTP ${response ? response.status() : 'no response'}`;
     } else {
       
-      // Sur une SPA (React/Vue), 'domcontentloaded' se déclenche avant que le JS
-      // n'ait lancé les appels API. On attend donc que le réseau soit "idle"
-      // (inactif) pendant un court instant pour s'assurer que le framework a eu
-      // le temps de démarrer et d'émettre ses requêtes XHR/Fetch.
-      // Si une requête bloque indéfiniment, ce timeout de 5s s'activera, mais
-      // les requêtes seront bien présentes dans pendingFirstPartyRequests !
-      try {
-        await page.waitForLoadState('networkidle', { timeout: 5000 });
-      } catch (e) {
-        // Timeout normal si des requêtes API tournent déjà en boucle. On l'ignore.
+      // Délai fixe pour laisser le framework JS (React/Vue) s'initialiser
+      // et lancer ses appels API. 'networkidle' n'est pas fiable car il peut
+      // se déclencher pendant une micro-pause de l'hydrate, avant les calls.
+      await new Promise(resolve => setTimeout(resolve, 3000));
+
+      if (pendingFirstPartyRequests.size > 0) {
+        console.log(`[debug-net] ${pendingFirstPartyRequests.size} requête(s) API first-party en cours. Attente de leur résolution...`);
       }
 
-      // Attente CONFIRMÉE (pas supposée) des appels API en cours. Si un
-      // backend met plusieurs minutes à échouer définitivement, on attend
-      // ce temps-là plutôt que de deviner après 20s.
       const settled = await waitForPendingRequestsToSettle(PENDING_API_MAX_WAIT_MS);
 
       if (apiErrors.length > 0) {
         status = 'down';
-        // Ex: "API Down (HTTP 500): https://..." ou "API Down (Réseau: net::ERR): https://..."
         msg = `API Down (${apiErrors[0]})`.slice(0, 200);
       } else if (consoleErrors.length > 0) {
         status = 'down';
         msg = `JS Error: ${consoleErrors[0]}`.slice(0, 200);
       } else if (!settled) {
-        // Après 4 minutes d'attente réelle, toujours pas de réponse
-        // confirmée : on ne devine plus au hasard, on le dit tel quel.
         status = 'down';
         const stuckUrls = Array.from(pendingFirstPartyRequests.keys())
           .slice(0, 2)
@@ -231,11 +170,6 @@ async function checkPage(context, url) {
       }
     }
 
-    // Temps de chargement réel mesuré par le navigateur (Navigation Timing
-    // API) : de navigationStart à loadEventEnd. Plus fiable qu'un simple
-    // chrono Node, car c'est la même mesure que le navigateur utilise en
-    // interne. En repli, on utilise le chrono Node si l'API n'est pas
-    // exploitable (page fermée trop vite, navigation échouée, etc).
     try {
       const timing = await page.evaluate(() => {
         const [nav] = performance.getEntriesByType('navigation');
@@ -292,9 +226,6 @@ async function main() {
 
       console.log(`[crawler] "${site.client_name}": ${tokens.length} page(s) à vérifier`);
 
-      // Un seul context Playwright pour tout le groupe : on évite de relancer
-      // un environnement de navigation par page alors qu'un groupe partage
-      // le même site (95% des cas). Une page = un onglet dans ce context.
       const context = await browser.newContext();
       try {
         for (let i = 0; i < tokens.length; i++) {
@@ -305,10 +236,6 @@ async function main() {
           console.log(`[crawler]   ${token.url} -> ${status} (${msg}) [${loadTimeMs != null ? Math.round(loadTimeMs) + 'ms' : '—'}]`);
           await pushStatus(token.pushToken, status, msg, loadTimeMs);
 
-          // Petite pause entre les pages d'un même site pour éviter de
-          // déclencher un rate-limiting (HTTP 429) côté serveur du client :
-          // plusieurs pages du même domaine vérifiées trop vite peuvent
-          // ressembler à du trafic abusif pour certaines protections.
           if (i < tokens.length - 1) {
             await new Promise((resolve) => setTimeout(resolve, 2000));
           }
