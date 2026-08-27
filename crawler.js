@@ -4,20 +4,34 @@ const RELAY_URL = process.env.RELAY_URL;
 const RELAY_SECRET = process.env.RELAY_SECRET;
 const KUMA_URL = process.env.KUMA_URL;
 
+// Domaines supplémentaires considérés comme "first-party" (backends externes).
 const EXTRA_API_DOMAINS = (process.env.EXTRA_API_DOMAINS || '')
   .split(',')
   .map((d) => d.trim())
   .filter(Boolean);
 
-const POST_LOAD_WAIT_MS = parseInt(process.env.POST_LOAD_WAIT_MS || '120000', 10);
-const MAX_429_ASSETS = parseInt(process.env.MAX_429_ASSETS || '5', 10);
+// Durée d'observation après chargement (ms)
+const POST_LOAD_WAIT_MS = parseInt(process.env.POST_LOAD_WAIT_MS || '60000', 10);
+
+// Active le log de toutes les requêtes (debug)
 const DEBUG_LOG_ALL_REQUESTS = (process.env.DEBUG_LOG_ALL_REQUESTS === 'true');
+
+// Délai entre les requêtes (ms) pour ralentir le chargement et éviter le rate-limit.
+const REQUEST_DELAY_MS = parseInt(process.env.REQUEST_DELAY_MS || '150', 10);
+
+// Nombre de tentatives de rechargement en cas de 429 sur la page principale.
+const MAX_429_RETRIES = parseInt(process.env.MAX_429_RETRIES || '3', 10);
+
+// User-agent réaliste
+const USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
 if (!RELAY_URL || !RELAY_SECRET || !KUMA_URL) {
   console.error('RELAY_URL, RELAY_SECRET et KUMA_URL sont requis (env vars).');
   process.exit(1);
 }
 
+// ---------- Fonctions utilitaires (relayGet, relayPost, pushStatus, isDue, getHostname, etc.) ----------
 async function relayGet(path) {
   const res = await fetch(`${RELAY_URL}${path}`, {
     headers: { 'x-relay-secret': RELAY_SECRET },
@@ -43,7 +57,7 @@ async function relayPost(path) {
 
 async function pushStatus(pushToken, status, msg, pingMs) {
   if (!pushToken) {
-    console.error('[push] pushToken manquant, envoi ignoré pour ce monitor.');
+    console.error('[push] pushToken manquant, envoi ignoré.');
     return;
   }
   const pingParam = Number.isFinite(pingMs) ? `&ping=${Math.round(pingMs)}` : '';
@@ -73,72 +87,74 @@ function getHostname(rawUrl) {
   }
 }
 
-function isRelevantDomain(requestUrl, pageHostname) {
+function isFirstPartyRequest(requestUrl, pageHostname) {
   const reqHost = getHostname(requestUrl);
   if (!reqHost || !pageHostname) return false;
-  if (reqHost === pageHostname || reqHost.endsWith(`.${pageHostname}`)) return true;
-  if (EXTRA_API_DOMAINS.some((d) => reqHost === d || reqHost.endsWith(`.${d}`))) return true;
-  if (DEBUG_LOG_ALL_REQUESTS && reqHost.includes('markhorus')) return true;
-  return false;
+  if (reqHost === pageHostname || reqHost.endsWith(`.${pageHostname}`)) {
+    return true;
+  }
+  return EXTRA_API_DOMAINS.some(
+    (domain) => reqHost === domain || reqHost.endsWith(`.${domain}`)
+  );
 }
 
+// ---------- Vérification d'une page ----------
 async function checkPage(context, url) {
+  // Applique un délai entre les requêtes pour éviter les rafales
+  await context.route('**/*', async (route) => {
+    await new Promise((resolve) => setTimeout(resolve, REQUEST_DELAY_MS));
+    route.continue();
+  });
+
   const page = await context.newPage();
   const pageHostname = getHostname(url);
 
   const apiErrors = [];
-  let count429Assets = 0;
-  const pendingRelevantRequests = new Map();
+  const consoleErrors = [];
+  const pendingFirstPartyRequests = new Map();
 
+  // Écouteurs réseau (inchangés dans l'idée, mais on garde les logs)
   page.on('request', (req) => {
-    if (isRelevantDomain(req.url(), pageHostname)) {
-      pendingRelevantRequests.set(req.url(), { type: req.resourceType() });
+    const type = req.resourceType();
+    if ((type === 'xhr' || type === 'fetch') && isFirstPartyRequest(req.url(), pageHostname)) {
+      pendingFirstPartyRequests.set(req.url(), true);
       if (DEBUG_LOG_ALL_REQUESTS) {
-        console.log(`[debug-req] Requête ${req.resourceType()}: ${req.url()}`);
+        console.log(`[debug-req] Requête first-party: ${req.url()}`);
       }
     }
   });
 
   page.on('requestfinished', (req) => {
-    pendingRelevantRequests.delete(req.url());
+    pendingFirstPartyRequests.delete(req.url());
   });
 
   page.on('response', (response) => {
     const req = response.request();
-    if (isRelevantDomain(req.url(), pageHostname)) {
-      const status = response.status();
-      const type = req.resourceType();
+    const type = req.resourceType();
+    if ((type === 'xhr' || type === 'fetch') && isFirstPartyRequest(req.url(), pageHostname)) {
+      if (response.status() >= 500) {
+        apiErrors.push(`HTTP ${response.status()} ${req.url()}`);
+      }
       if (DEBUG_LOG_ALL_REQUESTS) {
-        console.log(`[debug-resp] Réponse ${status} pour ${type} ${req.url()}`);
-      }
-
-      // Détection 429 sur les assets (toujours active)
-      if (status === 429 && ['script', 'stylesheet', 'image', 'font'].includes(type)) {
-        count429Assets++;
-      }
-
-      if ((type === 'xhr' || type === 'fetch') && status >= 500) {
-        apiErrors.push(`HTTP ${status} sur ${req.url()}`);
+        console.log(`[debug-resp] Réponse ${response.status()} pour ${req.url()}`);
       }
     }
   });
 
   page.on('requestfailed', (req) => {
-    pendingRelevantRequests.delete(req.url());
-    if (isRelevantDomain(req.url(), pageHostname)) {
-      const type = req.resourceType();
+    pendingFirstPartyRequests.delete(req.url());
+    const type = req.resourceType();
+    if ((type === 'xhr' || type === 'fetch') && isFirstPartyRequest(req.url(), pageHostname)) {
       const reason = req.failure()?.errorText || 'requête échouée';
+      apiErrors.push(`Réseau: ${reason} ${req.url()}`);
       if (DEBUG_LOG_ALL_REQUESTS) {
-        console.log(`[debug-fail] Échec réseau (${reason}) pour ${type} ${req.url()}`);
-      }
-      if (type === 'xhr' || type === 'fetch') {
-        apiErrors.push(`Réseau: ${reason} sur ${req.url()}`);
+        console.log(`[debug-fail] Échec réseau (${reason}) sur ${req.url()}`);
       }
     }
   });
 
   page.on('pageerror', (err) => {
-    apiErrors.push(`JS Error: ${err.message}`);
+    consoleErrors.push(err.message);
   });
 
   let status = 'up';
@@ -151,14 +167,29 @@ async function checkPage(context, url) {
 
   async function waitForPendingRequestsToSettle(maxWaitMs) {
     const deadline = Date.now() + maxWaitMs;
-    while (pendingRelevantRequests.size > 0 && Date.now() < deadline) {
+    while (pendingFirstPartyRequests.size > 0 && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, PENDING_API_POLL_INTERVAL_MS));
     }
-    return pendingRelevantRequests.size === 0;
+    return pendingFirstPartyRequests.size === 0;
+  }
+
+  // Fonction pour recharger la page avec retry sur 429
+  async function gotoWithRetry(page, url, maxRetries = MAX_429_RETRIES) {
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      const response = await page.goto(url, { waitUntil: 'load', timeout: 20000 });
+      if (response && response.status() !== 429) {
+        return response;
+      }
+      if (response && response.status() === 429) {
+        console.log(`[retry] 429 reçu, tentative ${attempt + 1}/${maxRetries}. Attente ${(attempt + 1) * 10}s...`);
+        await page.waitForTimeout((attempt + 1) * 10000);
+      }
+    }
+    return await page.goto(url, { waitUntil: 'load', timeout: 20000 }); // dernier essai
   }
 
   try {
-    const response = await page.goto(url, { waitUntil: 'load', timeout: 20000 });
+    const response = await gotoWithRetry(page, url);
 
     if (!response || !response.ok()) {
       status = 'down';
@@ -167,27 +198,28 @@ async function checkPage(context, url) {
       console.log(`[debug-net] Observation post-chargement pendant ${POST_LOAD_WAIT_MS}ms...`);
       await new Promise((resolve) => setTimeout(resolve, POST_LOAD_WAIT_MS));
 
-      if (pendingRelevantRequests.size > 0) {
-        console.log(`[debug-net] ${pendingRelevantRequests.size} requête(s) pertinente(s) encore en cours. Attente...`);
+      if (pendingFirstPartyRequests.size > 0) {
+        console.log(`[debug-net] ${pendingFirstPartyRequests.size} requête(s) first-party encore en cours. Attente...`);
       }
       const settled = await waitForPendingRequestsToSettle(PENDING_API_MAX_WAIT_MS);
 
-      if (count429Assets >= MAX_429_ASSETS) {
-        status = 'down';
-        msg = `Rate-limit détecté (${count429Assets} ressources en 429)`.slice(0, 200);
-      } else if (apiErrors.length > 0) {
+      if (apiErrors.length > 0) {
         status = 'down';
         msg = `API Down (${apiErrors[0]})`.slice(0, 200);
+      } else if (consoleErrors.length > 0) {
+        status = 'down';
+        msg = `JS Error: ${consoleErrors[0]}`.slice(0, 200);
       } else if (!settled) {
         status = 'down';
-        const stuckUrls = Array.from(pendingRelevantRequests.keys())
+        const stuckUrls = Array.from(pendingFirstPartyRequests.keys())
           .slice(0, 2)
           .map((u) => u.replace(/^https?:\/\//, '').slice(0, 40))
           .join(', ');
-        msg = `Backend muet (Timeout 4min): ${pendingRelevantRequests.size} requête(s) sans réponse (ex: ${stuckUrls})`.slice(0, 200);
+        msg = `Backend muet (Timeout 4min): ${pendingFirstPartyRequests.size} requête(s) API sans réponse (ex: ${stuckUrls})`.slice(0, 200);
       }
     }
 
+    // Mesure du temps de chargement
     try {
       const timing = await page.evaluate(() => {
         const [nav] = performance.getEntriesByType('navigation');
@@ -209,11 +241,23 @@ async function checkPage(context, url) {
   return { status, msg, loadTimeMs };
 }
 
+// ---------- Boucle principale ----------
 async function main() {
   const { sites } = await relayGet('/active-sites');
   console.log(`[crawler] ${sites.length} site(s) actif(s) au total`);
 
-  const browser = await chromium.launch();
+  const browser = await chromium.launch({
+    headless: true, // en production, headless "new" est mieux, mais on garde true
+    args: [
+      '--disable-blink-features=AutomationControlled',
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-web-security',
+      '--disable-features=IsolateOrigins,site-per-process',
+    ],
+  });
+
   let totalPages = 0;
   let totalDown = 0;
   let totalSkipped = 0;
@@ -226,7 +270,7 @@ async function main() {
       }
 
       if (!isDue(site)) {
-        console.log(`[crawler] "${site.client_name}" pas encore dû (interval ${site.crawl_interval_minutes ?? 1440}min, dernier crawl ${site.last_crawled_at}), skip`);
+        console.log(`[crawler] "${site.client_name}" pas encore dû, skip`);
         totalSkipped += 1;
         continue;
       }
@@ -242,7 +286,17 @@ async function main() {
 
       console.log(`[crawler] "${site.client_name}": ${tokens.length} page(s) à vérifier`);
 
-      const context = await browser.newContext();
+      const context = await browser.newContext({
+        userAgent: USER_AGENT,
+        viewport: { width: 1366, height: 768 },
+        locale: 'fr-FR',
+        timezoneId: 'Europe/Paris',
+        colorScheme: 'light',
+        deviceScaleFactor: 1,
+        hasTouch: false,
+        isMobile: false,
+      });
+
       try {
         for (let i = 0; i < tokens.length; i++) {
           const token = tokens[i];
@@ -252,8 +306,9 @@ async function main() {
           console.log(`[crawler]   ${token.url} -> ${status} (${msg}) [${loadTimeMs != null ? Math.round(loadTimeMs) + 'ms' : '—'}]`);
           await pushStatus(token.pushToken, status, msg, loadTimeMs);
 
+          // Pause plus longue entre les pages pour éviter le rate-limit
           if (i < tokens.length - 1) {
-            await new Promise((resolve) => setTimeout(resolve, 2000));
+            await new Promise((resolve) => setTimeout(resolve, 10000)); // 10 secondes
           }
         }
       } finally {
