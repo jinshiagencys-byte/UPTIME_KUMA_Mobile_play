@@ -32,12 +32,16 @@ async function relayPost(path) {
   return data;
 }
 
-async function pushStatus(pushToken, status, msg) {
+async function pushStatus(pushToken, status, msg, pingMs) {
   if (!pushToken) {
     console.error('[push] pushToken manquant, envoi ignoré pour ce monitor.');
     return;
   }
-  const url = `${KUMA_URL}/api/push/${pushToken}?status=${status}&msg=${encodeURIComponent(msg)}&ping=`;
+  // ping = temps de chargement mesuré par Playwright (ms), envoyé à Kuma qui
+  // l'affiche nativement (avgPing, graphique de temps de réponse) exactement
+  // comme s'il s'agissait d'un ping de monitoring HTTP classique.
+  const pingParam = Number.isFinite(pingMs) ? `&ping=${Math.round(pingMs)}` : '';
+  const url = `${KUMA_URL}/api/push/${pushToken}?status=${status}&msg=${encodeURIComponent(msg)}${pingParam}`;
   try {
     const res = await fetch(url);
     if (!res.ok) {
@@ -83,6 +87,8 @@ async function checkPage(context, url) {
 
   let status = 'up';
   let msg = 'OK';
+  let loadTimeMs = null;
+  const navStart = Date.now();
 
   try {
     const response = await page.goto(url, { waitUntil: 'networkidle', timeout: 20000 });
@@ -97,14 +103,31 @@ async function checkPage(context, url) {
       status = 'down';
       msg = `Erreur JS: ${consoleErrors[0]}`;
     }
+
+    // Temps de chargement réel mesuré par le navigateur (Navigation Timing
+    // API) : de navigationStart à loadEventEnd. Plus fiable qu'un simple
+    // chrono Node, car c'est la même mesure que le navigateur utilise en
+    // interne. En repli, on utilise le chrono Node si l'API n'est pas
+    // exploitable (page fermée trop vite, navigation échouée, etc).
+    try {
+      const timing = await page.evaluate(() => {
+        const [nav] = performance.getEntriesByType('navigation');
+        if (nav && nav.loadEventEnd > 0) return nav.loadEventEnd;
+        return null;
+      });
+      loadTimeMs = timing != null ? timing : Date.now() - navStart;
+    } catch {
+      loadTimeMs = Date.now() - navStart;
+    }
   } catch (err) {
     status = 'down';
     msg = String(err.message || err).slice(0, 200);
+    loadTimeMs = Date.now() - navStart;
   } finally {
     await page.close();
   }
 
-  return { status, msg };
+  return { status, msg, loadTimeMs };
 }
 
 async function main() {
@@ -150,10 +173,10 @@ async function main() {
         for (let i = 0; i < tokens.length; i++) {
           const token = tokens[i];
           totalPages += 1;
-          const { status, msg } = await checkPage(context, token.url);
+          const { status, msg, loadTimeMs } = await checkPage(context, token.url);
           if (status === 'down') totalDown += 1;
-          console.log(`[crawler]   ${token.url} -> ${status} (${msg})`);
-          await pushStatus(token.pushToken, status, msg);
+          console.log(`[crawler]   ${token.url} -> ${status} (${msg}) [${loadTimeMs != null ? Math.round(loadTimeMs) + 'ms' : '—'}]`);
+          await pushStatus(token.pushToken, status, msg, loadTimeMs);
 
           // Petite pause entre les pages d'un même site pour éviter de
           // déclencher un rate-limiting (HTTP 429) côté serveur du client :
