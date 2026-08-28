@@ -4,25 +4,22 @@ const RELAY_URL = process.env.RELAY_URL;
 const RELAY_SECRET = process.env.RELAY_SECRET;
 const KUMA_URL = process.env.KUMA_URL;
 
-// Domaines supplémentaires considérés comme "first-party" (backends externes).
 const EXTRA_API_DOMAINS = (process.env.EXTRA_API_DOMAINS || '')
   .split(',')
   .map((d) => d.trim())
   .filter(Boolean);
 
-// Durée d'observation après chargement (ms)
 const POST_LOAD_WAIT_MS = parseInt(process.env.POST_LOAD_WAIT_MS || '60000', 10);
-
-// Active le log de toutes les requêtes (debug)
 const DEBUG_LOG_ALL_REQUESTS = (process.env.DEBUG_LOG_ALL_REQUESTS === 'true');
-
-// Délai entre les requêtes (ms) pour ralentir le chargement et éviter le rate-limit.
 const REQUEST_DELAY_MS = parseInt(process.env.REQUEST_DELAY_MS || '150', 10);
-
-// Nombre de tentatives de rechargement en cas de 429 sur la page principale.
 const MAX_429_RETRIES = parseInt(process.env.MAX_429_RETRIES || '3', 10);
 
-// User-agent réaliste
+// Détection de page vide
+const DETECT_EMPTY_PAGE = (process.env.DETECT_EMPTY_PAGE === 'true');
+const EMPTY_PAGE_MIN_TEXT_LENGTH = parseInt(process.env.EMPTY_PAGE_MIN_TEXT_LENGTH || '50', 10);
+const EMPTY_PAGE_MIN_IMAGES = parseInt(process.env.EMPTY_PAGE_MIN_IMAGES || '2', 10);
+const EMPTY_PAGE_MIN_MAIN_ELEMENTS = parseInt(process.env.EMPTY_PAGE_MIN_MAIN_ELEMENTS || '1', 10);
+
 const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
@@ -31,7 +28,7 @@ if (!RELAY_URL || !RELAY_SECRET || !KUMA_URL) {
   process.exit(1);
 }
 
-// ---------- Fonctions utilitaires (relayGet, relayPost, pushStatus, isDue, getHostname, etc.) ----------
+// ---------- Fonctions utilitaires ----------
 async function relayGet(path) {
   const res = await fetch(`${RELAY_URL}${path}`, {
     headers: { 'x-relay-secret': RELAY_SECRET },
@@ -100,7 +97,7 @@ function isFirstPartyRequest(requestUrl, pageHostname) {
 
 // ---------- Vérification d'une page ----------
 async function checkPage(context, url) {
-  // Applique un délai entre les requêtes pour éviter les rafales
+  // Ralentissement des requêtes pour éviter le rate-limit
   await context.route('**/*', async (route) => {
     await new Promise((resolve) => setTimeout(resolve, REQUEST_DELAY_MS));
     route.continue();
@@ -113,7 +110,7 @@ async function checkPage(context, url) {
   const consoleErrors = [];
   const pendingFirstPartyRequests = new Map();
 
-  // Écouteurs réseau (inchangés dans l'idée, mais on garde les logs)
+  // Écouteurs réseau
   page.on('request', (req) => {
     const type = req.resourceType();
     if ((type === 'xhr' || type === 'fetch') && isFirstPartyRequest(req.url(), pageHostname)) {
@@ -173,7 +170,6 @@ async function checkPage(context, url) {
     return pendingFirstPartyRequests.size === 0;
   }
 
-  // Fonction pour recharger la page avec retry sur 429
   async function gotoWithRetry(page, url, maxRetries = MAX_429_RETRIES) {
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       const response = await page.goto(url, { waitUntil: 'load', timeout: 20000 });
@@ -185,7 +181,7 @@ async function checkPage(context, url) {
         await page.waitForTimeout((attempt + 1) * 10000);
       }
     }
-    return await page.goto(url, { waitUntil: 'load', timeout: 20000 }); // dernier essai
+    return await page.goto(url, { waitUntil: 'load', timeout: 20000 });
   }
 
   try {
@@ -198,10 +194,35 @@ async function checkPage(context, url) {
       console.log(`[debug-net] Observation post-chargement pendant ${POST_LOAD_WAIT_MS}ms...`);
       await new Promise((resolve) => setTimeout(resolve, POST_LOAD_WAIT_MS));
 
+      // Attente des requêtes pendantes
       if (pendingFirstPartyRequests.size > 0) {
         console.log(`[debug-net] ${pendingFirstPartyRequests.size} requête(s) first-party encore en cours. Attente...`);
       }
       const settled = await waitForPendingRequestsToSettle(PENDING_API_MAX_WAIT_MS);
+
+      // Détection de page vide si activée
+      if (DETECT_EMPTY_PAGE) {
+        const contentInfo = await page.evaluate(() => {
+          const bodyText = document.body ? document.body.innerText.trim().length : 0;
+          const images = document.querySelectorAll('img').length;
+          const mainElements = document.querySelectorAll('main, #root, #app, .content').length;
+          const mainChildren = document.querySelector('main, #root, #app, .content')?.children.length || 0;
+          return { bodyText, images, mainElements, mainChildren };
+        });
+
+        console.log(`[debug-dom] Contenu: ${JSON.stringify(contentInfo)}`);
+        console.log(`[debug-dom] Seuils: text >= ${EMPTY_PAGE_MIN_TEXT_LENGTH}, images >= ${EMPTY_PAGE_MIN_IMAGES}, mainElements >= ${EMPTY_PAGE_MIN_MAIN_ELEMENTS}`);
+
+        const pageIsEmpty =
+          contentInfo.bodyText < EMPTY_PAGE_MIN_TEXT_LENGTH &&
+          contentInfo.images < EMPTY_PAGE_MIN_IMAGES &&
+          contentInfo.mainElements < EMPTY_PAGE_MIN_MAIN_ELEMENTS;
+
+        if (pageIsEmpty && (apiErrors.length > 0 || pendingFirstPartyRequests.size > 0 || consoleErrors.length > 0)) {
+          status = 'down';
+          msg = 'Page vide (backend probablement muet)';
+        }
+      }
 
       if (apiErrors.length > 0) {
         status = 'down';
@@ -247,7 +268,7 @@ async function main() {
   console.log(`[crawler] ${sites.length} site(s) actif(s) au total`);
 
   const browser = await chromium.launch({
-    headless: true, // en production, headless "new" est mieux, mais on garde true
+    headless: true,
     args: [
       '--disable-blink-features=AutomationControlled',
       '--no-sandbox',
@@ -306,9 +327,8 @@ async function main() {
           console.log(`[crawler]   ${token.url} -> ${status} (${msg}) [${loadTimeMs != null ? Math.round(loadTimeMs) + 'ms' : '—'}]`);
           await pushStatus(token.pushToken, status, msg, loadTimeMs);
 
-          // Pause plus longue entre les pages pour éviter le rate-limit
           if (i < tokens.length - 1) {
-            await new Promise((resolve) => setTimeout(resolve, 10000)); // 10 secondes
+            await new Promise((resolve) => setTimeout(resolve, 10000));
           }
         }
       } finally {
