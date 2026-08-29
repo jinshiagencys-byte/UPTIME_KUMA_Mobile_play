@@ -1,20 +1,20 @@
 const { chromium } = require('playwright');
-const axios = require('axios');
 
 // Variables d'environnement
 const RELAY_URL = process.env.RELAY_URL;
 const RELAY_SECRET = process.env.RELAY_SECRET;
 const KUMA_URL = process.env.KUMA_URL;
 
-// Paramètres de configuration (avec valeurs par défaut)
+// Paramètres de configuration
 const NETWORK_IDLE_TIMEOUT_MS = parseInt(process.env.NETWORK_IDLE_TIMEOUT_MS || '15000', 10);
-const BLANK_PAGE_THRESHOLD = parseFloat(process.env.BLANK_PAGE_THRESHOLD || '0.9', 10);
 const MIN_TEXT_LENGTH = parseInt(process.env.MIN_TEXT_LENGTH || '100', 10);
-const IGNORED_DOMAINS = (process.env.IGNORED_DOMAINS || 'google-analytics.com,doubleclick.net,facebook.net,cdn.jsdelivr.net').split(',').map(d => d.trim());
+const IGNORED_DOMAINS = (process.env.IGNORED_DOMAINS || 'google-analytics.com,doubleclick.net,facebook.net,cdn.jsdelivr.net')
+  .split(',')
+  .map(d => d.trim());
 
 console.log('[crawler] Début du script');
 
-// --- Fonctions utilitaires ---
+// --- Utilitaires ---
 
 function getHostname(url) {
   try {
@@ -29,52 +29,83 @@ function isIgnoredDomain(url) {
   return IGNORED_DOMAINS.some(domain => hostname.includes(domain));
 }
 
-// Requête GET vers le relay (avec secret)
+// --- Appels HTTP vers le relay (via fetch) ---
+
 async function relayGet(path) {
   const url = `${RELAY_URL}${path}`;
-  const response = await axios.get(url, {
+  const res = await fetch(url, {
     headers: { 'x-relay-secret': RELAY_SECRET }
   });
-  return response.data;
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status} sur ${url}`);
+  }
+  return await res.json();
 }
 
-// Requête POST vers le relay (pour pousser le statut)
-async function pushStatus(monitorId, status, msg, ping) {
-  const url = `${KUMA_URL}/api/push/${monitorId}`; // Utilise le push endpoint de Kuma
-  // Ici on utilise la méthode push via l'API Kuma (push token)
-  // Dans notre cas, on a les push tokens stockés en base, on peut les utiliser.
-  // Mais le crawler utilise le push token pour envoyer le statut.
-  // Il faut récupérer le push token pour chaque monitor. On va les obtenir via une route du relay.
-  // Pour simplifier, on va utiliser la route /push-tokens?groupId=...
-  // On va récupérer les push tokens en amont.
-  // Je propose de modifier la fonction pour qu'elle prenne un pushToken en paramètre.
-  // On va plutôt utiliser une autre approche : on a les monitors PUSH créés avec un token,
-  // on peut les envoyer directement à Kuma.
-  // Mais pour l'instant, je vais laisser en place une implémentation qui utilise l'API Kuma push.
-  // On suppose qu'on a le pushToken.
-  // Je vais réécrire cette fonction pour utiliser le push token.
+async function relayPost(path, body = {}) {
+  const url = `${RELAY_URL}${path}`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'x-relay-secret': RELAY_SECRET,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(body)
+  });
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status} sur ${url}`);
+  }
+  return await res.json();
 }
 
-// Fonction pour récupérer les pages (push tokens) d'un site via son groupId
+// --- Récupération des pages (push tokens) d'un groupe ---
+
 async function getPagesForSite(groupId) {
   const data = await relayGet(`/push-tokens?groupId=${groupId}`);
   if (!data.success) {
     throw new Error('Erreur lors de la récupération des pages');
   }
-  return data.tokens; // tableau d'objets { url, monitorId, pushToken, name }
+  return data.tokens; // [{ url, monitorId, pushToken, name }]
 }
 
-// Fonction isDue
+// --- Déterminer si un site est dû ---
+
 function isDue(site) {
   const last = site.last_crawled_at ? new Date(site.last_crawled_at) : null;
-  const intervalMinutes = site.crawl_interval_minutes || 1440; // défaut 24h
+  const intervalMinutes = site.crawl_interval_minutes || 1440; // 24h par défaut
   const now = new Date();
   const due = !last || (now - last) / 60000 >= intervalMinutes;
-  console.log(`[isDue] site ${site.id} (${site.client_name}) : last_crawled_at=${last}, interval=${intervalMinutes}min, due=${due}`);
+  console.log(`[isDue] site ${site.id} (${site.client_name}) : last=${last}, interval=${intervalMinutes}min, due=${due}`);
   return due;
 }
 
-// --- checkPage (fournie précédemment) ---
+// --- Marquer un site comme crawlé ---
+
+async function markSiteCrawled(siteId) {
+  try {
+    await relayPost(`/sites/${siteId}/mark-crawled`, {});
+    console.log(`[crawler] Site ${siteId} marqué comme crawlé.`);
+  } catch (err) {
+    console.error(`[crawler] Erreur lors du marquage du site ${siteId} :`, err.message);
+  }
+}
+
+// --- Envoyer le statut à Kuma via push token ---
+
+async function sendStatusToKuma(pushToken, status, msg) {
+  const kumaPushUrl = `${KUMA_URL}/api/push/${pushToken}`;
+  const params = new URLSearchParams();
+  params.append('status', status === 'up' ? 'up' : 'down');
+  if (msg) params.append('msg', msg);
+  const url = `${kumaPushUrl}?${params.toString()}`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status} lors du push vers Kuma`);
+  }
+}
+
+// --- Vérification d'une page (avec Playwright) ---
+
 async function checkPage(context, url) {
   const page = await context.newPage();
   let status = 'up';
@@ -115,16 +146,13 @@ async function checkPage(context, url) {
       const textLength = await page.evaluate(() => document.body.innerText.length);
       const isBlankPage = textLength < MIN_TEXT_LENGTH;
 
-      let blankByPixels = false;
-      // (optionnel) on pourrait ajouter l'analyse de pixels si nécessaire
-
       if (sawApiError) {
         status = 'down';
         msg = 'Erreur API détectée (HTTP ≥500 ou échec réseau)';
       } else if (!networkIdleReached) {
         status = 'down';
         msg = `Réseau jamais au repos après ${NETWORK_IDLE_TIMEOUT_MS}ms (backend muet ?)`;
-      } else if (isBlankPage || blankByPixels) {
+      } else if (isBlankPage) {
         status = 'down';
         msg = 'Page vide / écran blanc';
       }
@@ -151,7 +179,8 @@ async function checkPage(context, url) {
   return { status, msg, loadTimeMs };
 }
 
-// --- Fonction main ---
+// --- Fonction principale ---
+
 async function main() {
   console.log('[crawler] main() démarrée');
 
@@ -175,7 +204,7 @@ async function main() {
       return;
     }
 
-    // 3. Pour chaque site, lancer le crawler
+    // 3. Traiter chaque site
     for (const site of dueSites) {
       console.log(`[crawler] Traitement du site ${site.id} : ${site.client_name} (${site.site_url})`);
 
@@ -186,13 +215,13 @@ async function main() {
         console.log(`[crawler] ${pages.length} pages trouvées pour le groupe ${site.kuma_group_id}`);
       } catch (err) {
         console.error(`[crawler] Erreur lors de la récupération des pages pour le site ${site.id}:`, err.message);
-        continue; // passer au site suivant
+        // On marque quand même le site comme crawlé pour éviter de bloquer
+        await markSiteCrawled(site.id);
+        continue;
       }
 
       if (pages.length === 0) {
         console.log(`[crawler] Aucune page à vérifier pour le site ${site.id}.`);
-        // Marquer quand même comme crawlé pour éviter de le retraiter en boucle ?
-        // On va le marquer.
         await markSiteCrawled(site.id);
         continue;
       }
@@ -202,66 +231,37 @@ async function main() {
       const context = await browser.newContext({
         userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       });
-      let allOk = true;
 
       for (const pageInfo of pages) {
         console.log(`[crawler] Vérification de la page : ${pageInfo.url}`);
         const result = await checkPage(context, pageInfo.url);
         console.log(`[crawler] Résultat pour ${pageInfo.url} : status=${result.status}, msg=${result.msg}`);
 
-        // Envoyer le statut à Kuma via le push token
         try {
           await sendStatusToKuma(pageInfo.pushToken, result.status, result.msg);
         } catch (err) {
           console.error(`[crawler] Erreur lors de l'envoi du statut pour ${pageInfo.url}:`, err.message);
-          allOk = false;
         }
 
-        // Petit délai entre les pages pour éviter les 429
+        // Délai de 2s entre les pages (anti‑429)
         await new Promise(resolve => setTimeout(resolve, 2000));
       }
 
       await browser.close();
 
-      // Marquer le site comme crawlé (last_crawled_at = maintenant)
+      // Marquer le site comme crawlé
       await markSiteCrawled(site.id);
-
       console.log(`[crawler] Fin du traitement du site ${site.id}`);
     }
 
     console.log('[crawler] main() terminée avec succès');
   } catch (err) {
     console.error('[crawler] Erreur dans main():', err);
-    throw err; // pour être capturé par le catch global
+    throw err;
   }
 }
 
-// Fonction pour marquer un site comme crawlé
-async function markSiteCrawled(siteId) {
-  try {
-    await axios.post(`${RELAY_URL}/sites/${siteId}/mark-crawled`, {}, {
-      headers: { 'x-relay-secret': RELAY_SECRET }
-    });
-    console.log(`[crawler] Site ${siteId} marqué comme crawlé.`);
-  } catch (err) {
-    console.error(`[crawler] Erreur lors du marquage du site ${siteId}:`, err.message);
-  }
-}
-
-// Fonction pour envoyer le statut à Kuma via push token
-async function sendStatusToKuma(pushToken, status, msg) {
-  // L'URL de push de Kuma est généralement : https://kuma-url/api/push/<token>?status=up&msg=...
-  // On peut aussi envoyer un ping (temps de réponse) si on le souhaite.
-  // Ici on envoie juste le statut.
-  const kumaPushUrl = `${KUMA_URL}/api/push/${pushToken}`;
-  const params = new URLSearchParams();
-  params.append('status', status === 'up' ? 'up' : 'down');
-  if (msg) params.append('msg', msg);
-  // On pourrait ajouter ping=... mais on ne le mesure pas pour l'instant.
-  await axios.get(kumaPushUrl, { params, timeout: 10000 });
-}
-
-// --- Appel de main avec gestion d'erreur ---
+// --- Exécution ---
 console.log('[crawler] Appel de main()');
 main().catch((err) => {
   console.error('[crawler] Erreur non catchée dans main:', err);
