@@ -1,14 +1,14 @@
 name: Uptime Kuma Playwright Monitor
+
 on:
   schedule:
-    # Toutes les 3 heures. La vraie fréquence de vérification par site est
+    # Toutes les 5 heures. La vraie fréquence de vérification par site est
     # gérée par isDue() dans crawler.js (crawl_interval_minutes en base) —
     # ce cron ne fait que "réveiller" le crawler assez souvent pour qu'aucun
-    # site ne rate son échéance de plus de 3h. GitHub Actions ne garantit
-    # pas une exactitude à la minute près sur les cron schedules (retards
-    # possibles en cas de forte charge sur les runners publics).
+    # site ne rate son échéance de plus de 5h.
     - cron: '0 */5 * * *'
   workflow_dispatch: {} # permet de lancer manuellement depuis l'onglet Actions
+
 jobs:
   crawl:
     runs-on: ubuntu-latest
@@ -16,7 +16,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: '22'          # 👈 CHANGEMENT ICI : Node 22 au lieu de 20
+          cache: 'npm'                # optionnel, accélère l'installation
       - name: Install dependencies
         run: npm ci
       - name: Install Playwright browsers
