@@ -28,6 +28,26 @@ async function checkPage(context, url) {
   let sawApiError = false;
   let networkIdleReached = false;
 
+  // --- Journal brut de tous les domaines contactés en xhr/fetch ---
+  // Aucune supposition ici sur ce qui "devrait" être une API : on note
+  // juste le hostname de CHAQUE requête xhr/fetch observée, avec un
+  // exemple d'URL complète. C'est purement de l'observation.
+  const observedDomains = new Map(); // hostname -> { count, examples: [] }
+
+  function recordObservedRequest(reqUrl) {
+    if (isIgnoredDomain(reqUrl)) return;
+    let hostname;
+    try {
+      hostname = new URL(reqUrl).hostname;
+    } catch {
+      return;
+    }
+    const entry = observedDomains.get(hostname) || { count: 0, examples: [] };
+    entry.count += 1;
+    if (entry.examples.length < 3) entry.examples.push(reqUrl);
+    observedDomains.set(hostname, entry);
+  }
+
   // Écouteurs réseau (pour erreurs API)
   page.on('response', (response) => {
     if (response.status() >= 500 && !isIgnoredDomain(response.url())) {
@@ -39,6 +59,15 @@ async function checkPage(context, url) {
       if (!isIgnoredDomain(req.url())) {
         sawApiError = true;
       }
+    }
+  });
+
+  // Nouveau listener : capture toute requête xhr/fetch, réussie ou non,
+  // pour construire le journal brut ci-dessus.
+  page.on('request', (req) => {
+    const type = req.resourceType();
+    if (type === 'xhr' || type === 'fetch') {
+      recordObservedRequest(req.url());
     }
   });
 
@@ -101,6 +130,19 @@ async function checkPage(context, url) {
     msg = String(err.message || err).slice(0, 200);
     loadTimeMs = Date.now() - navStart;
   } finally {
+    // --- Log du journal brut, quoi qu'il arrive (page up ou down) ---
+    // On trie par nombre d'appels décroissant, purement descriptif.
+    const sortedDomains = Array.from(observedDomains.entries())
+      .sort((a, b) => b[1].count - a[1].count);
+
+    console.log(`[network-log] ${url} — ${sortedDomains.length} domaine(s) xhr/fetch observé(s) :`);
+    for (const [hostname, entry] of sortedDomains) {
+      console.log(`  - ${hostname} (${entry.count} appel(s)) ex: ${entry.examples.join(', ')}`);
+    }
+    if (sortedDomains.length === 0) {
+      console.log('  (aucune requête xhr/fetch observée)');
+    }
+
     await page.close();
   }
 
