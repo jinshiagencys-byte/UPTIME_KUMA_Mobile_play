@@ -104,7 +104,7 @@ async function sendStatusToKuma(pushToken, status, msg) {
   }
 }
 
-// --- Vérification d'une page (avec Playwright) ---
+// --- Vérification d'une page (avec Playwright) avec listener de requêtes ---
 
 async function checkPage(context, url) {
   const page = await context.newPage();
@@ -115,6 +115,23 @@ async function checkPage(context, url) {
 
   let sawApiError = false;
   let networkIdleReached = false;
+
+  // --- NOUVEAU : collecte des domaines observés pour les requêtes XHR/fetch ---
+  const observedDomains = new Set();
+  const observedUrls = [];
+
+  page.on('request', (request) => {
+    const resourceType = request.resourceType();
+    if (resourceType === 'xhr' || resourceType === 'fetch') {
+      const reqUrl = request.url();
+      if (!isIgnoredDomain(reqUrl)) {
+        const hostname = getHostname(reqUrl);
+        observedDomains.add(hostname);
+        observedUrls.push(reqUrl);
+        // On peut logger en temps réel si besoin, mais on le fera en fin de check
+      }
+    }
+  });
 
   page.on('response', (response) => {
     if (response.status() >= 500 && !isIgnoredDomain(response.url())) {
@@ -173,6 +190,13 @@ async function checkPage(context, url) {
     msg = String(err.message || err).slice(0, 200);
     loadTimeMs = Date.now() - navStart;
   } finally {
+    // --- LOG des domaines observés ---
+    if (observedDomains.size > 0) {
+      console.log(`[crawler] Domaines XHR/fetch observés pour ${url} :`, Array.from(observedDomains).join(', '));
+      console.log(`[crawler] URLs complètes (échantillon) :`, observedUrls.slice(0, 5).join(', '));
+    } else {
+      console.log(`[crawler] Aucune requête XHR/fetch observée pour ${url}`);
+    }
     await page.close();
   }
 
@@ -215,7 +239,6 @@ async function main() {
         console.log(`[crawler] ${pages.length} pages trouvées pour le groupe ${site.kuma_group_id}`);
       } catch (err) {
         console.error(`[crawler] Erreur lors de la récupération des pages pour le site ${site.id}:`, err.message);
-        // On marque quand même le site comme crawlé pour éviter de bloquer
         await markSiteCrawled(site.id);
         continue;
       }
@@ -226,7 +249,7 @@ async function main() {
         continue;
       }
 
-      // Créer un contexte Playwright partagé pour ce site (performance)
+      // Créer un contexte Playwright partagé pour ce site
       const browser = await chromium.launch({ headless: true });
       const context = await browser.newContext({
         userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -243,13 +266,10 @@ async function main() {
           console.error(`[crawler] Erreur lors de l'envoi du statut pour ${pageInfo.url}:`, err.message);
         }
 
-        // Délai de 2s entre les pages (anti‑429)
         await new Promise(resolve => setTimeout(resolve, 2000));
       }
 
       await browser.close();
-
-      // Marquer le site comme crawlé
       await markSiteCrawled(site.id);
       console.log(`[crawler] Fin du traitement du site ${site.id}`);
     }
