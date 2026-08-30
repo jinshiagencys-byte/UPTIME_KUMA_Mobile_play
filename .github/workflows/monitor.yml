@@ -24,6 +24,14 @@ jobs:
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
 
+      - name: Diagnostiquer la syntaxe réelle d'OpenClaw
+        run: |
+          ~/.npm-global/bin/openclaw --version
+          echo "--- aide: agent ---"
+          ~/.npm-global/bin/openclaw agent --help || true
+          echo "--- aide: agent exec ---"
+          ~/.npm-global/bin/openclaw agent exec --help || true
+
       - name: Écrire la tâche dans un fichier
         run: |
           cat > task.md << 'EOF'
