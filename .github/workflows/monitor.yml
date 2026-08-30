@@ -11,7 +11,7 @@ jobs:
       - name: Checkout du code
         uses: actions/checkout@v4
         with:
-          repository: votre-org/SentinelSite
+          repository: UPTIME_KUMA_Mobile_play
           ref: main
 
       - name: Setup Node.js
