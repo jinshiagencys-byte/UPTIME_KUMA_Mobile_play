@@ -22,6 +22,7 @@ jobs:
         run: |
           ~/.npm-global/bin/openclaw config set agents.defaults.model.primary "openrouter/free"
           ~/.npm-global/bin/openclaw config set gateway.mode "local"
+          ~/.npm-global/bin/openclaw config set gateway.auth.token "ci-test-token-12345"
           ~/.npm-global/bin/openclaw config set browser.enabled true
           ~/.npm-global/bin/openclaw config set browser.headless true
           ~/.npm-global/bin/openclaw config set browser.noSandbox true
@@ -48,6 +49,7 @@ jobs:
       - name: Lancer OpenClaw en mode autonome (via Gateway)
         run: |
           ~/.npm-global/bin/openclaw agent \
+            --token "ci-test-token-12345" \
             --session-key "ci:usinformatique-test" \
             --message-file task.md \
             --json
