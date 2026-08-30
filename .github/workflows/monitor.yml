@@ -1,4 +1,4 @@
-name: OpenClaw - Test Autonome sur usinformatique.com
+name: OpenClaw - Test Autonome sur usinformatique.com (avec fallback)
 
 on:
   workflow_dispatch:
@@ -21,7 +21,7 @@ jobs:
           echo "$HOME/.npm-global/bin" >> $GITHUB_PATH
           ~/.npm-global/bin/openclaw --version
 
-      - name: Configurer OpenClaw avec OpenRouter (modèle NVIDIA Nemotron 3 Ultra 550B)
+      - name: Configurer OpenClaw (browser et gateway)
         run: |
           ~/.npm-global/bin/openclaw config set browser.enabled true
           ~/.npm-global/bin/openclaw config set browser.headless true
@@ -29,7 +29,6 @@ jobs:
           ~/.npm-global/bin/openclaw config set browser.defaultProfile openclaw
           ~/.npm-global/bin/openclaw config set gateway.mode "local"
           ~/.npm-global/bin/openclaw config set gateway.auth.token "ci-test-token-12345"
-          ~/.npm-global/bin/openclaw config set agents.defaults.model.primary "nvidia/nemotron-3-ultra-550b-a55b:free"
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
 
@@ -49,12 +48,62 @@ jobs:
           Va sur https://usinformatique.com avec l'outil browser. Explore le site comme un humain : scroll, clique sur un produit, ajoute-le au panier, puis vérifie que le produit est bien présent dans le panier après l'ajout. Si tu vois des erreurs JavaScript ou des pages blanches, prends une capture d'écran. À la fin, dis-moi si le site est UP ou DOWN, avec une explication précise de ce que tu as testé (y compris si le panier a réellement fonctionné ou affiché une erreur).
           EOF
 
-      - name: Lancer OpenClaw en mode autonome (via Gateway)
+      - name: Lancer OpenClaw avec fallback sur plusieurs modèles
+        id: agent_run
         run: |
-          ~/.npm-global/bin/openclaw agent \
-            --session-key "ci:usinformatique-test" \
-            --message-file task.md \
-            --json
+          set +e  # Éviter l'arrêt immédiat sur erreur
+
+          # Liste des modèles gratuits par ordre de préférence
+          MODELS=(
+            "nvidia/nemotron-3-ultra-550b-a55b:free"
+            "nvidia/nemotron-3.5-lightning:free"
+            "nvidia/nemotron-3-super-120b-a12b:free"
+            "thinkingmachines/inkling:free"
+            "minimax/minimax-m2.7:free"
+            "cohere/north-mini-code:free"
+            "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
+            "z-ai/glm-5.2:free"
+            "google/gemma-4-31b-it:free"
+            "google/gemma-4-26b-a4b-it:free"
+            "minimax/minimax-m3:free"
+          )
+
+          SUCCESS=false
+          for MODEL in "${MODELS[@]}"; do
+            echo "======================================"
+            echo "Essai du modèle : $MODEL"
+            echo "======================================"
+
+            # Configurer le modèle
+            ~/.npm-global/bin/openclaw config set agents.defaults.model.primary "$MODEL"
+
+            # Lancer l'agent
+            ~/.npm-global/bin/openclaw agent \
+              --session-key "ci:usinformatique-test" \
+              --message-file task.md \
+              --json > output.json 2>&1
+
+            EXIT_CODE=$?
+            if [ $EXIT_CODE -eq 0 ]; then
+              echo "✅ Succès avec le modèle $MODEL"
+              SUCCESS=true
+              cat output.json
+              break
+            else
+              echo "❌ Échec avec le modèle $MODEL (code $EXIT_CODE)"
+              echo "--- Sortie d'erreur ---"
+              cat output.json
+              echo "----------------------"
+            fi
+          done
+
+          if [ "$SUCCESS" = false ]; then
+            echo "Aucun modèle n'a fonctionné."
+            exit 1
+          fi
+
+          exit 0
+
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           OPENCLAW_GATEWAY_TOKEN: "ci-test-token-12345"
@@ -66,4 +115,5 @@ jobs:
           name: openclaw-screenshots
           path: |
             gateway.log
+            output.json
             ~/.openclaw/workspace/screenshots/
