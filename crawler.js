@@ -1,29 +1,35 @@
 const { chromium } = require('playwright');
 
-// Variables d'environnement
+// ============================================================
+// 1. CONFIGURATION (variables d'environnement)
+// ============================================================
+
 const RELAY_URL = process.env.RELAY_URL;
 const RELAY_SECRET = process.env.RELAY_SECRET;
 const KUMA_URL = process.env.KUMA_URL;
 
-// Paramètres de configuration (avec valeurs par défaut)
-const NETWORK_IDLE_TIMEOUT_MS = parseInt(process.env.NETWORK_IDLE_TIMEOUT_MS || '15000', 10);
+// Timeouts et seuils
 const API_WAIT_TIMEOUT_MS = parseInt(process.env.API_WAIT_TIMEOUT_MS || '30000', 10);
-const POST_LOAD_WAIT_MS = parseInt(process.env.POST_LOAD_WAIT_MS || '30000', 10);
+const MAX_LOAD_TIME_MS = parseInt(process.env.MAX_LOAD_TIME_MS || '10000', 10);
 const MIN_TEXT_LENGTH = parseInt(process.env.MIN_TEXT_LENGTH || '100', 10);
-const IGNORED_DOMAINS = (process.env.IGNORED_DOMAINS || 'google-analytics.com,doubleclick.net,facebook.net,cdn.jsdelivr.net')
+const MAX_CLICKS = parseInt(process.env.MAX_CLICKS || '3', 10);        // nombre max de clics dans le parcours
+const ENABLE_USER_FLOW = process.env.ENABLE_USER_FLOW !== 'false';   // activé par défaut
+const ENABLE_SCROLL = process.env.ENABLE_SCROLL !== 'false';
+
+const IGNORED_DOMAINS = (process.env.IGNORED_DOMAINS || 
+  'google-analytics.com,doubleclick.net,facebook.net,cdn.jsdelivr.net,google.com,googleapis.com,gstatic.com')
   .split(',')
   .map(d => d.trim());
 
 console.log('[crawler] Début du script');
+console.log(`[crawler] Configuration : API_WAIT=${API_WAIT_TIMEOUT_MS}ms, MAX_LOAD=${MAX_LOAD_TIME_MS}ms, USER_FLOW=${ENABLE_USER_FLOW}`);
 
-// --- Utilitaires ---
+// ============================================================
+// 2. UTILITAIRES
+// ============================================================
 
 function getHostname(url) {
-  try {
-    return new URL(url).hostname;
-  } catch {
-    return '';
-  }
+  try { return new URL(url).hostname; } catch { return ''; }
 }
 
 function isIgnoredDomain(url) {
@@ -31,177 +37,172 @@ function isIgnoredDomain(url) {
   return IGNORED_DOMAINS.some(domain => hostname.includes(domain));
 }
 
+// Détecte si une réponse JSON contient des données exploitables
 function checkIfDataPresent(json) {
   if (!json) return false;
   if (Array.isArray(json) && json.length > 0) return true;
-  if (json.data && Array.isArray(json.data) && json.data.length > 0) return true;
-  if (json.items && Array.isArray(json.items) && json.items.length > 0) return true;
-  if (json.results && Array.isArray(json.results) && json.results.length > 0) return true;
-  if (json.products && Array.isArray(json.products) && json.products.length > 0) return true;
+  // Cas standard : { data: [...] }
+  for (const key of ['data', 'items', 'results', 'products', 'users', 'posts', 'list']) {
+    if (json[key] && Array.isArray(json[key]) && json[key].length > 0) return true;
+  }
+  // Objet non vide sans propriété d'erreur
   if (typeof json === 'object' && !Array.isArray(json)) {
     const keys = Object.keys(json);
-    if (keys.length > 0 && !json.error && !json.message) return true;
+    if (keys.length > 0 && !json.error && !json.message && json.success !== false) {
+      return true;
+    }
   }
   return false;
 }
 
+// Compte le nombre d'éléments dans une réponse API
 function countDataItems(json) {
   if (!json) return 0;
   if (Array.isArray(json)) return json.length;
-  if (json.data && Array.isArray(json.data)) return json.data.length;
-  if (json.items && Array.isArray(json.items)) return json.items.length;
-  if (json.results && Array.isArray(json.results)) return json.results.length;
-  if (json.products && Array.isArray(json.products)) return json.products.length;
+  for (const key of ['data', 'items', 'results', 'products', 'users', 'posts', 'list']) {
+    if (json[key] && Array.isArray(json[key])) return json[key].length;
+  }
   return 0;
 }
 
-// --- Appels HTTP vers le relay (via fetch) ---
+// ============================================================
+// 3. APPELS HTTP VERS LE RELAY
+// ============================================================
 
 async function relayGet(path) {
   const url = `${RELAY_URL}${path}`;
-  const res = await fetch(url, {
-    headers: { 'x-relay-secret': RELAY_SECRET }
-  });
-  if (!res.ok) {
-    throw new Error(`HTTP ${res.status} sur ${url}`);
-  }
-  return await res.json();
+  const res = await fetch(url, { headers: { 'x-relay-secret': RELAY_SECRET } });
+  if (!res.ok) throw new Error(`HTTP ${res.status} sur ${url}`);
+  return res.json();
 }
 
 async function relayPost(path, body = {}) {
   const url = `${RELAY_URL}${path}`;
   const res = await fetch(url, {
     method: 'POST',
-    headers: {
-      'x-relay-secret': RELAY_SECRET,
-      'Content-Type': 'application/json'
-    },
+    headers: { 'x-relay-secret': RELAY_SECRET, 'Content-Type': 'application/json' },
     body: JSON.stringify(body)
   });
-  if (!res.ok) {
-    throw new Error(`HTTP ${res.status} sur ${url}`);
-  }
-  return await res.json();
+  if (!res.ok) throw new Error(`HTTP ${res.status} sur ${url}`);
+  return res.json();
 }
 
-// --- Récupération des pages (push tokens) d'un groupe ---
+// ============================================================
+// 4. FONCTIONS SPÉCIFIQUES (sites, tokens, etc.)
+// ============================================================
 
 async function getPagesForSite(groupId) {
   const data = await relayGet(`/push-tokens?groupId=${groupId}`);
-  if (!data.success) {
-    throw new Error('Erreur lors de la récupération des pages');
-  }
-  return data.tokens; // [{ url, monitorId, pushToken, name }]
+  if (!data.success) throw new Error('Erreur récupération pages');
+  return data.tokens;
 }
-
-// --- Déterminer si un site est dû ---
 
 function isDue(site) {
   const last = site.last_crawled_at ? new Date(site.last_crawled_at) : null;
-  const intervalMinutes = site.crawl_interval_minutes || 1440; // 24h par défaut
+  const interval = site.crawl_interval_minutes || 1440;
   const now = new Date();
-  const due = !last || (now - last) / 60000 >= intervalMinutes;
-  console.log(`[isDue] site ${site.id} (${site.client_name}) : last=${last}, interval=${intervalMinutes}min, due=${due}`);
+  const due = !last || (now - last) / 60000 >= interval;
+  console.log(`[isDue] ${site.client_name} (${site.id}) : due=${due}`);
   return due;
 }
-
-// --- Marquer un site comme crawlé ---
 
 async function markSiteCrawled(siteId) {
   try {
     await relayPost(`/sites/${siteId}/mark-crawled`, {});
-    console.log(`[crawler] Site ${siteId} marqué comme crawlé.`);
+    console.log(`[crawler] Site ${siteId} marqué crawlé.`);
   } catch (err) {
-    console.error(`[crawler] Erreur lors du marquage du site ${siteId} :`, err.message);
+    console.error(`[crawler] Erreur mark-crawled ${siteId} :`, err.message);
   }
 }
-
-// --- Envoyer le statut à Kuma via push token ---
 
 async function sendStatusToKuma(pushToken, status, msg) {
-  const kumaPushUrl = `${KUMA_URL}/api/push/${pushToken}`;
-  const params = new URLSearchParams();
-  params.append('status', status === 'up' ? 'up' : 'down');
-  if (msg) params.append('msg', msg);
-  const url = `${kumaPushUrl}?${params.toString()}`;
+  const url = `${KUMA_URL}/api/push/${pushToken}?status=${status === 'up' ? 'up' : 'down'}&msg=${encodeURIComponent(msg || '')}`;
   const res = await fetch(url);
-  if (!res.ok) {
-    throw new Error(`HTTP ${res.status} lors du push vers Kuma`);
-  }
+  if (!res.ok) throw new Error(`HTTP ${res.status} lors du push Kuma`);
 }
 
-// --- Vérification d'une page (version améliorée) ---
+// ============================================================
+// 5. VÉRIFICATION D'UNE PAGE (avec parcours utilisateur)
+// ============================================================
 
 async function checkPage(context, url) {
   const page = await context.newPage();
   const navStart = Date.now();
   let status = 'up';
   let msg = 'OK';
-  let loadTimeMs = null;
+  let loadTimeMs = 0;
 
-  // Collecte des requêtes XHR/fetch
+  // Collecte des erreurs et requêtes
   const apiRequests = [];
   const failedRequests = [];
   let apiDataReceived = false;
   let apiDataHasContent = false;
   let apiDataCount = 0;
   let uiContent = { textLength: 0, elementCount: 0, hasContent: false };
+  let jsErrors = [];
+  let consoleErrors = [];
 
-  // Intercepter les requêtes
+  // ---- Listeners ----
+
+  // Requêtes XHR/fetch
   page.on('request', (request) => {
     if (request.resourceType() === 'xhr' || request.resourceType() === 'fetch') {
       const reqUrl = request.url();
       if (!isIgnoredDomain(reqUrl)) {
-        apiRequests.push({
-          url: reqUrl,
-          method: request.method(),
-          startTime: Date.now()
-        });
+        apiRequests.push({ url: reqUrl, method: request.method() });
       }
     }
   });
 
-  // Intercepter les réponses (pour analyser le contenu JSON)
+  // Réponses : analyse des statuts et du contenu JSON
   page.on('response', async (response) => {
     const req = response.request();
     if (req.resourceType() === 'xhr' || req.resourceType() === 'fetch') {
       const url = response.url();
-      if (!isIgnoredDomain(url)) {
-        const statusCode = response.status();
-        if (statusCode >= 500) {
-          failedRequests.push({ url, status: statusCode, type: 'http_error' });
-          return;
-        }
+      if (isIgnoredDomain(url)) return;
+      const statusCode = response.status();
 
-        // Analyser les réponses JSON des endpoints API
-        if (statusCode === 200 && (url.includes('/api/') || url.includes('/graphql'))) {
-          try {
-            const json = await response.json().catch(() => null);
-            if (json) {
-              apiDataReceived = true;
+      if (statusCode >= 500) {
+        failedRequests.push({ url, status: statusCode, type: 'http_error' });
+        return;
+      }
+
+      // Analyser les réponses JSON (même en 200, on vérifie le contenu)
+      if (statusCode === 200 && (url.includes('/api/') || url.includes('/graphql'))) {
+        try {
+          const json = await response.json().catch(() => null);
+          if (json) {
+            apiDataReceived = true;
+            // Détection d'erreur silencieuse (success: false, error: "...")
+            if (json.success === false || json.error || json.message) {
+              failedRequests.push({
+                url,
+                status: 200,
+                type: 'silent_error',
+                message: json.error || json.message || 'success=false'
+              });
+            } else {
               const hasData = checkIfDataPresent(json);
               if (hasData) {
                 apiDataHasContent = true;
                 apiDataCount += countDataItems(json);
               } else {
-                // API a répondu 200 mais sans données
+                // Réponse 200 mais sans données → considéré comme échec
                 failedRequests.push({
                   url,
                   status: 200,
                   type: 'empty_data',
-                  message: 'API a répondu 200 mais données vides'
+                  message: 'JSON valide mais sans données'
                 });
               }
             }
-          } catch (e) {
-            // Pas du JSON, on ignore
           }
-        }
+        } catch (e) { /* pas du JSON, on ignore */ }
       }
     }
   });
 
-  // Détecter les échecs réseau
+  // Échecs réseau (DNS, connexion)
   page.on('requestfailed', (request) => {
     if (request.resourceType() === 'xhr' || request.resourceType() === 'fetch') {
       if (!isIgnoredDomain(request.url())) {
@@ -214,25 +215,111 @@ async function checkPage(context, url) {
     }
   });
 
-  try {
-    // Charger la page
-    const response = await page.goto(url, {
-      waitUntil: 'load',
-      timeout: 30000
+  // Erreurs JavaScript non catchées
+  page.on('pageerror', (error) => {
+    jsErrors.push(error.message);
+    failedRequests.push({
+      type: 'js_error',
+      message: error.message
     });
+  });
 
+  // Erreurs de console (console.error)
+  page.on('console', (msg) => {
+    if (msg.type() === 'error') {
+      const text = msg.text();
+      consoleErrors.push(text);
+      failedRequests.push({
+        type: 'console_error',
+        message: text
+      });
+    }
+  });
+
+  // ---- Exécution du test ----
+
+  try {
+    // 5a. Chargement initial
+    const response = await page.goto(url, { waitUntil: 'load', timeout: 30000 });
     if (!response || !response.ok()) {
       status = 'down';
       msg = `HTTP ${response ? response.status() : 'no response'}`;
     } else {
-      // Attendre que les requêtes API se terminent (timeout configurable)
-      console.log(`[crawler] Attente de ${API_WAIT_TIMEOUT_MS}ms pour les requêtes API...`);
+      // 5b. Attente des requêtes API (premier délai)
+      console.log(`[crawler] Attente initiale ${API_WAIT_TIMEOUT_MS}ms pour les requêtes...`);
       await page.waitForTimeout(API_WAIT_TIMEOUT_MS);
 
-      // Vérifier le contenu affiché dans le DOM
+      // 5c. PARCOURS UTILISATEUR (scroll + clics) si activé
+      if (ENABLE_USER_FLOW) {
+        console.log('[crawler] Début du parcours utilisateur');
+
+        // Scroll en bas et en haut pour déclencher le lazy loading
+        if (ENABLE_SCROLL) {
+          await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+          await page.waitForTimeout(2000);
+          await page.evaluate(() => window.scrollTo(0, 0));
+          await page.waitForTimeout(2000);
+          console.log('[crawler] Scroll effectué');
+        }
+
+        // Clics sur les premiers liens internes (non destructeurs)
+        let clicksDone = 0;
+        const clickedUrls = new Set();
+
+        // Sélecteurs : on cible les liens, onglets, boutons qui mènent à du contenu
+        const selectors = [
+          'a[href*="product"]',
+          'a[href*="category"]',
+          'a[href*="detail"]',
+          'button[aria-label*="next"]',
+          'a.tab',
+          'li.nav-item a',
+          'a[href*="page"]',
+          'a[href*="blog"]',
+          'button:has-text("Voir plus")'
+        ];
+
+        for (const selector of selectors) {
+          if (clicksDone >= MAX_CLICKS) break;
+          try {
+            const elements = await page.$$(selector);
+            for (const el of elements) {
+              if (clicksDone >= MAX_CLICKS) break;
+              const href = await el.getAttribute('href');
+              // Éviter les liens externes, les actions de déconnexion, etc.
+              if (href) {
+                if (href.startsWith('http') && !href.includes(new URL(url).hostname)) continue;
+                if (href.includes('logout') || href.includes('delete') || href.includes('remove')) continue;
+              }
+              // Ne pas cliquer deux fois sur la même URL
+              if (href && clickedUrls.has(href)) continue;
+              if (href) clickedUrls.add(href);
+
+              // Rendre l'élément visible et cliquer
+              await el.scrollIntoViewIfNeeded();
+              await el.click({ timeout: 5000 });
+              clicksDone++;
+              console.log(`[crawler] Clic #${clicksDone} sur ${selector} (${href || 'pas de href'})`);
+
+              // Attendre que les requêtes se déclenchent
+              await page.waitForTimeout(3000);
+            }
+          } catch (e) {
+            // Sélecteur non trouvé ou erreur de clic, on continue
+          }
+        }
+
+        // Dernier délai pour capturer les requêtes déclenchées par les clics
+        await page.waitForTimeout(5000);
+        console.log(`[crawler] Parcours terminé (${clicksDone} clics effectués)`);
+      }
+
+      // 5d. Analyse finale du DOM
       uiContent = await page.evaluate(() => {
         const textContent = document.body.innerText || '';
-        const dataElements = document.querySelectorAll('[class*="item"], [class*="product"], [class*="card"], li, .post, .article');
+        const dataElements = document.querySelectorAll(
+          '[class*="item"], [class*="product"], [class*="card"], li, .post, .article, tr, .row'
+        );
         return {
           textLength: textContent.length,
           elementCount: dataElements.length,
@@ -240,30 +327,45 @@ async function checkPage(context, url) {
         };
       });
 
-      // Décision finale
+      loadTimeMs = Date.now() - navStart;
+
+      // 5e. Synthèse des erreurs
       const errors = [];
 
+      // Lenteur
+      if (loadTimeMs > MAX_LOAD_TIME_MS) {
+        errors.push(`Chargement trop lent : ${loadTimeMs}ms (seuil ${MAX_LOAD_TIME_MS}ms)`);
+      }
+
+      // Absence d'API
       if (apiRequests.length === 0) {
         errors.push('Aucun appel API détecté (site statique ou backend muet)');
       }
 
+      // Échecs variés
       if (failedRequests.length > 0) {
-        const errorMessages = failedRequests.map(r =>
-          r.type === 'empty_data' ? `${r.url} (données vides)` :
-          r.type === 'http_error' ? `${r.url} (HTTP ${r.status})` :
-          `${r.url} (${r.error || 'échec réseau'})`
-        );
-        errors.push(`Échecs détectés : ${errorMessages.join(', ')}`);
+        const details = failedRequests.map(r => {
+          if (r.type === 'http_error') return `${r.url} (HTTP ${r.status})`;
+          if (r.type === 'empty_data') return `${r.url} (données vides)`;
+          if (r.type === 'silent_error') return `${r.url} (silencieux: ${r.message})`;
+          if (r.type === 'network_error') return `${r.url} (${r.error})`;
+          if (r.type === 'js_error') return `JS error: ${r.message}`;
+          if (r.type === 'console_error') return `Console error: ${r.message}`;
+          return `${r.url} (${r.type})`;
+        });
+        errors.push(`Échecs détectés : ${details.join('; ')}`);
       }
 
+      // Contenu UI insuffisant
       if (!uiContent.hasContent) {
         errors.push('Page ne semble pas afficher de données (texte court ou absence d\'éléments)');
       }
 
+      // Cohérence API ↔ UI
       if (apiDataReceived && apiDataHasContent && apiDataCount > 0) {
-        const uiElementCount = uiContent.elementCount;
-        if (uiElementCount < apiDataCount * 0.5) {
-          errors.push(`Incohérence : API retourne ${apiDataCount} éléments, mais seulement ${uiElementCount} affichés`);
+        const uiCount = uiContent.elementCount;
+        if (uiCount < apiDataCount * 0.5) {
+          errors.push(`Incohérence : API ${apiDataCount} éléments, UI ${uiCount} affichés`);
         }
       }
 
@@ -272,34 +374,28 @@ async function checkPage(context, url) {
         msg = errors.join('; ');
       } else {
         status = 'up';
-        msg = 'OK (API et contenu validés)';
+        msg = 'OK (API, contenu, performance, pas d\'erreur JS)';
       }
     }
-
-    loadTimeMs = Date.now() - navStart;
   } catch (err) {
     status = 'down';
-    msg = String(err.message || err).slice(0, 200);
+    msg = String(err.message || err).slice(0, 300);
     loadTimeMs = Date.now() - navStart;
   } finally {
-    // Logs détaillés
+    // ---- LOGS DÉTAILLÉS ----
     const observedDomains = new Set();
     apiRequests.forEach(r => {
       try { observedDomains.add(new URL(r.url).hostname); } catch {}
     });
-    if (observedDomains.size > 0) {
-      console.log(`[crawler] Domaines XHR/fetch observés pour ${url} :`, Array.from(observedDomains).join(', '));
-      console.log(`[crawler] URLs complètes (échantillon) :`, apiRequests.slice(0, 5).map(r => r.url).join(', '));
-    } else {
-      console.log(`[crawler] Aucune requête XHR/fetch observée pour ${url}`);
+    console.log(`[crawler] Domaines XHR/fetch : ${Array.from(observedDomains).join(', ') || 'aucun'}`);
+    if (failedRequests.length) {
+      console.log(`[crawler] Échecs (${failedRequests.length}) :`, failedRequests.map(r => r.url || r.message).join(', '));
     }
-    if (failedRequests.length > 0) {
-      console.log(`[crawler] Échecs détectés :`, failedRequests.map(r =>
-        `${r.url} (${r.type})`
-      ).join(', '));
-    }
-    console.log(`[crawler] UI : ${apiDataCount} données API, ${uiContent.elementCount} éléments affichés`);
-    console.log(`[crawler] Résultat final : ${status} - ${msg}`);
+    if (jsErrors.length) console.log(`[crawler] Erreurs JS :`, jsErrors.join('; '));
+    if (consoleErrors.length) console.log(`[crawler] Erreurs console :`, consoleErrors.join('; '));
+    console.log(`[crawler] Temps de chargement : ${loadTimeMs}ms (seuil ${MAX_LOAD_TIME_MS}ms)`);
+    console.log(`[crawler] UI : ${apiDataCount} données API, ${uiContent.elementCount} éléments`);
+    console.log(`[crawler] Résultat : ${status} - ${msg}`);
 
     await page.close();
   }
@@ -307,89 +403,77 @@ async function checkPage(context, url) {
   return { status, msg, loadTimeMs };
 }
 
-// --- Fonction principale ---
+// ============================================================
+// 6. FONCTION PRINCIPALE
+// ============================================================
 
 async function main() {
   console.log('[crawler] main() démarrée');
-
   try {
-    // 1. Récupérer les sites actifs depuis le relay
-    console.log('[crawler] Appel à /active-sites');
     const sitesData = await relayGet('/active-sites');
-    console.log('[crawler] Réponse /active-sites reçue, sites trouvés :', sitesData.sites ? sitesData.sites.length : 0);
+    console.log(`[crawler] Sites actifs : ${sitesData.sites?.length || 0}`);
 
     if (!sitesData.success || !sitesData.sites || sitesData.sites.length === 0) {
-      console.log('[crawler] Aucun site actif trouvé. Fin du crawler.');
+      console.log('[crawler] Aucun site actif. Fin.');
       return;
     }
 
-    // 2. Filtrer les sites dus
-    const dueSites = sitesData.sites.filter(site => isDue(site));
-    console.log(`[crawler] ${dueSites.length} site(s) dus sur ${sitesData.sites.length} au total.`);
+    const dueSites = sitesData.sites.filter(isDue);
+    console.log(`[crawler] Sites dus : ${dueSites.length}`);
 
-    if (dueSites.length === 0) {
-      console.log('[crawler] Aucun site à crawler pour le moment. Fin.');
-      return;
-    }
-
-    // 3. Traiter chaque site
     for (const site of dueSites) {
-      console.log(`[crawler] Traitement du site ${site.id} : ${site.client_name} (${site.site_url})`);
-
-      // Récupérer les pages (push tokens) associées au groupe
+      console.log(`[crawler] --- Traitement de ${site.client_name} (${site.site_url}) ---`);
       let pages = [];
       try {
         pages = await getPagesForSite(site.kuma_group_id);
-        console.log(`[crawler] ${pages.length} pages trouvées pour le groupe ${site.kuma_group_id}`);
       } catch (err) {
-        console.error(`[crawler] Erreur lors de la récupération des pages pour le site ${site.id}:`, err.message);
+        console.error(`[crawler] Erreur récupération pages :`, err.message);
         await markSiteCrawled(site.id);
         continue;
       }
 
       if (pages.length === 0) {
-        console.log(`[crawler] Aucune page à vérifier pour le site ${site.id}.`);
+        console.log(`[crawler] Aucune page. Marquage.`);
         await markSiteCrawled(site.id);
         continue;
       }
 
-      // Créer un contexte Playwright partagé pour ce site
       const browser = await chromium.launch({ headless: true });
       const context = await browser.newContext({
         userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       });
 
       for (const pageInfo of pages) {
-        console.log(`[crawler] Vérification de la page : ${pageInfo.url}`);
+        console.log(`[crawler] Vérification : ${pageInfo.url}`);
         const result = await checkPage(context, pageInfo.url);
-        console.log(`[crawler] Résultat pour ${pageInfo.url} : status=${result.status}, msg=${result.msg}`);
-
+        console.log(`[crawler] Résultat : ${result.status} - ${result.msg}`);
         try {
           await sendStatusToKuma(pageInfo.pushToken, result.status, result.msg);
         } catch (err) {
-          console.error(`[crawler] Erreur lors de l'envoi du statut pour ${pageInfo.url}:`, err.message);
+          console.error(`[crawler] Erreur push Kuma :`, err.message);
         }
-
-        // Délai de 2s entre les pages (anti‑429)
         await new Promise(resolve => setTimeout(resolve, 2000));
       }
 
       await browser.close();
       await markSiteCrawled(site.id);
-      console.log(`[crawler] Fin du traitement du site ${site.id}`);
+      console.log(`[crawler] --- Fin de ${site.client_name} ---`);
     }
 
     console.log('[crawler] main() terminée avec succès');
   } catch (err) {
-    console.error('[crawler] Erreur dans main():', err);
+    console.error('[crawler] Erreur fatale dans main() :', err);
     throw err;
   }
 }
 
-// --- Exécution ---
+// ============================================================
+// 7. EXÉCUTION
+// ============================================================
+
 console.log('[crawler] Appel de main()');
 main().catch((err) => {
-  console.error('[crawler] Erreur non catchée dans main:', err);
+  console.error('[crawler] Erreur non catchée :', err);
   process.exit(1);
 });
 console.log('[crawler] main() appelée (asynchrone)');
