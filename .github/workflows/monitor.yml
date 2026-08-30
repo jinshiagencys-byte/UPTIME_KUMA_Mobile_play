@@ -20,7 +20,7 @@ jobs:
 
       - name: Configurer OpenClaw avec OpenRouter et le navigateur
         run: |
-          ~/.npm-global/bin/openclaw config set agents.defaults.model.primary "openrouter/free"
+          ~/.npm-global/bin/openclaw config set agents.defaults.model.primary "openrouter/openai/gpt-oss-120b:free"
           ~/.npm-global/bin/openclaw config set gateway.mode "local"
           ~/.npm-global/bin/openclaw config set gateway.auth.token "ci-test-token-12345"
           ~/.npm-global/bin/openclaw config set browser.enabled true
@@ -43,7 +43,7 @@ jobs:
       - name: Écrire la tâche dans un fichier
         run: |
           cat > task.md << 'EOF'
-          Va sur https://usinformatique.com. Explore le site comme un humain avec le navigateur : scroll, clique sur un produit, ajoute-le au panier, puis vérifie que le produit est bien présent dans le panier après l'ajout. Si tu vois des erreurs JavaScript ou des pages blanches, prends une capture d'écran. À la fin, dis-moi si le site est UP ou DOWN, avec une explication précise de ce que tu as testé (y compris si le panier a réellement fonctionné ou affiché une erreur).
+          Va sur https://usinformatique.com avec l'outil browser. Explore le site comme un humain : scroll, clique sur un produit, ajoute-le au panier, puis vérifie que le produit est bien présent dans le panier après l'ajout. Si tu vois des erreurs JavaScript ou des pages blanches, prends une capture d'écran. À la fin, dis-moi si le site est UP ou DOWN, avec une explication précise de ce que tu as testé (y compris si le panier a réellement fonctionné ou affiché une erreur).
           EOF
 
       - name: Lancer OpenClaw en mode autonome (via Gateway)
