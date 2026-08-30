@@ -28,25 +28,36 @@ jobs:
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
 
+      - name: Démarrer le Gateway OpenClaw en arrière-plan
+        run: |
+          nohup ~/.npm-global/bin/openclaw gateway --force > gateway.log 2>&1 &
+          echo "Attente du démarrage du Gateway..."
+          sleep 10
+          ~/.npm-global/bin/openclaw gateway status || true
+          cat gateway.log
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+
       - name: Écrire la tâche dans un fichier
         run: |
           cat > task.md << 'EOF'
-          Va sur https://usinformatique.com. Explore le site comme un humain : scroll, clique sur les produits, vérifie que le panier fonctionne, et que les données s'affichent correctement. Si tu vois des erreurs JavaScript ou des pages blanches, prends une capture d'écran. À la fin, dis-moi si le site est UP ou DOWN, avec une explication de ce que tu as testé.
+          Va sur https://usinformatique.com. Explore le site comme un humain avec le navigateur : scroll, clique sur un produit, ajoute-le au panier, puis vérifie que le produit est bien présent dans le panier après l'ajout. Si tu vois des erreurs JavaScript ou des pages blanches, prends une capture d'écran. À la fin, dis-moi si le site est UP ou DOWN, avec une explication précise de ce que tu as testé (y compris si le panier a réellement fonctionné ou affiché une erreur).
           EOF
 
-      - name: Lancer OpenClaw en mode autonome
+      - name: Lancer OpenClaw en mode autonome (via Gateway)
         run: |
           ~/.npm-global/bin/openclaw agent \
-            --local \
             --session-key "ci:usinformatique-test" \
             --message-file task.md \
             --json
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
 
-      - name: Upload des captures (si OpenClaw en a pris)
+      - name: Upload des logs et captures
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: openclaw-screenshots
-          path: ~/.openclaw/workspace/screenshots/
+          path: |
+            gateway.log
+            ~/.openclaw/workspace/screenshots/
