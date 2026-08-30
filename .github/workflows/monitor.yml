@@ -1,12 +1,9 @@
 name: OpenClaw - Test Autonome sur usinformatique.com
-
 on:
   workflow_dispatch:
-
 jobs:
   autonomous-test:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout du code
         uses: actions/checkout@v4
@@ -21,22 +18,17 @@ jobs:
           echo "$HOME/.npm-global/bin" >> $GITHUB_PATH
           ~/.npm-global/bin/openclaw --version
 
-      - name: Afficher l'aide (pour vérifier les commandes)
-        run: |
-          ~/.npm-global/bin/openclaw --help
-
       - name: Configurer OpenClaw avec OpenRouter
         run: |
           ~/.npm-global/bin/openclaw config set agents.defaults.model.primary "openrouter/free"
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
 
-      - name: Lancer l'agent OpenClaw en mode autonome
+      - name: Lancer OpenClaw en mode autonome
         run: |
-          ~/.npm-global/bin/openclaw agent \
-            --prompt "Va sur https://usinformatique.com. Explore le site comme un humain : scroll, clique sur les produits, vérifie que le panier fonctionne, et que les données s'affichent correctement. Si tu vois des erreurs JavaScript ou des pages blanches, prends une capture d'écran. À la fin, dis-moi si le site est UP ou DOWN, avec une explication de ce que tu as testé." \
-            --browser true \
-            --output json
+          ~/.npm-global/bin/openclaw agent exec \
+            "Va sur https://usinformatique.com. Explore le site comme un humain : scroll, clique sur les produits, vérifie que le panier fonctionne, et que les données s'affichent correctement. Si tu vois des erreurs JavaScript ou des pages blanches, prends une capture d'écran. À la fin, dis-moi si le site est UP ou DOWN, avec une explication de ce que tu as testé." \
+            --json
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
 
