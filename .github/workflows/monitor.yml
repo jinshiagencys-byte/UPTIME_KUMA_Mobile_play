@@ -14,6 +14,7 @@ jobs:
       - name: Récupérer les sites actifs
         id: get-sites
         run: |
+          # Adaptez selon la structure de votre API
           SITES=$(curl -s https://kuma-relay.up.railway.app/active-sites | jq -c '[.sites[] | {id: .id, url: .site_url}]')
           echo "sites=$SITES" >> "$GITHUB_OUTPUT"
 
@@ -43,9 +44,11 @@ jobs:
           ~/.npm-global/bin/openclaw config set browser.enabled true
           ~/.npm-global/bin/openclaw config set browser.headless true
           ~/.npm-global/bin/openclaw config set browser.noSandbox true
+          ~/.npm-global/bin/openclaw config set gateway.mode "local"
           ~/.npm-global/bin/openclaw config set gateway.auth.token "ci-test-token-12345"
           ~/.npm-global/bin/openclaw config set agents.defaults.model.primary "mistral/mistral-small-latest"
-          ~/.npm-global/bin/openclaw config set agents.defaults.model.fallback "openrouter/openrouter/fusion"
+          # Fallback optionnel (si OpenClaw supporte)
+          # ~/.npm-global/bin/openclaw config set agents.defaults.model.fallback "openrouter/openrouter/fusion"
         env:
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
@@ -77,6 +80,9 @@ jobs:
             --session-key "ci:${{ matrix.site.id }}" \
             --message-file task.md \
             --json > output.json 2>&1
+          if [ $? -ne 0 ]; then
+            echo "agent_failed=true" >> $GITHUB_OUTPUT
+          fi
         env:
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
@@ -85,13 +91,18 @@ jobs:
       - name: Extraire et envoyer le résultat au Relay
         if: always()
         run: |
-          if [ -f "output.json" ]; then
+          # Vérifier si output.json existe
+          if [ ! -f output.json ]; then
+            STATUS="ERROR"
+            REASON="Agent did not produce output.json"
+          elif [ "${{ steps.agent_run.outputs.agent_failed }}" == "true" ]; then
+            STATUS="ERROR"
+            REASON="Agent execution failed"
+          else
             STATUS=$(jq -r '.result.payloads[0].status // "UNKNOWN"' output.json)
             REASON=$(jq -r '.result.payloads[0].text' output.json | head -c 300)
-          else
-            STATUS="ERROR"
-            REASON="Agent execution failed or output.json missing"
           fi
+          # Envoyer au relay
           curl -X POST "https://kuma-relay.up.railway.app/sites/${{ matrix.site.id }}/report" \
             -H "x-relay-secret: ${{ secrets.RELAY_SECRET }}" \
             -H "Content-Type: application/json" \
