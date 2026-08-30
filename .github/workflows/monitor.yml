@@ -1,7 +1,7 @@
 name: Test OpenClaw sur usinformatique.com
 
 on:
-  workflow_dispatch:  # Déclenchement manuel pour le test
+  workflow_dispatch:  # Déclenchement manuel
 
 jobs:
   test-with-openclaw:
@@ -10,39 +10,37 @@ jobs:
     steps:
       - name: Checkout du code
         uses: actions/checkout@v4
-        # Pas besoin de spécifier le repository car le workflow est dans le même dépôt
-        # Si vous voulez explicitement, vous pouvez ajouter :
-        # with:
-        #   repository: jinshiagencys-byte/UPTIME_KUMA_Mobile_play
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      - name: Installer les dépendances (Playwright + crawler)
+      - name: Installer Playwright
         run: |
           npm install
           npx playwright install --with-deps chromium
 
-      - name: Installer OpenClaw (CLI)
+      - name: Installer OpenClaw (via script officiel)
         run: |
-          npm install -g openclaw
-          openclaw --version
+          curl -fsSL https://openclaw.ai/install.sh | bash
+          # Ajouter le répertoire d'installation au PATH pour les étapes suivantes
+          echo "$HOME/.openclaw/bin" >> $GITHUB_PATH
+          # Vérification
+          ~/.openclaw/bin/openclaw --version || echo "OpenClaw installé"
 
-      - name: Configurer OpenClaw avec OpenRouter (modèle gratuit)
+      - name: Configurer OpenClaw avec OpenRouter
         run: |
-          # Définir la clé API OpenRouter comme variable d'environnement
-          echo "OPENROUTER_API_KEY=${{ secrets.OPENROUTER_API_KEY }}" >> $GITHUB_ENV
-          # Configurer OpenClaw pour utiliser OpenRouter (non-interactif)
-          openclaw config --set provider=openrouter
-          openclaw config --set model=openrouter/free
+          # Définir la clé API comme variable d'environnement pour OpenClaw
+          export OPENROUTER_API_KEY=${{ secrets.OPENROUTER_API_KEY }}
+          # Configurer OpenClaw pour utiliser OpenRouter
+          ~/.openclaw/bin/openclaw config --set provider=openrouter
+          ~/.openclaw/bin/openclaw config --set model=openrouter/free
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
 
-      - name: Lancer le test sur usinformatique.com (avec OpenClaw)
+      - name: Lancer le test sur usinformatique.com
         run: |
-          # On lance le script crawler.js directement sur le site cible
           node -e "
             const { checkPage } = require('./crawler.js');
             const { chromium } = require('playwright');
@@ -55,7 +53,6 @@ jobs:
               console.log('📊 Résultat final :', JSON.stringify(result, null, 2));
               await browser.close();
 
-              // Sortie avec code d'erreur si down
               if (result.status === 'down') {
                 console.error('❌ Site déclaré DOWN par OpenClaw');
                 process.exit(1);
@@ -66,10 +63,11 @@ jobs:
             })();
           "
         env:
-          # Variables d'environnement pour le crawler (optionnelles)
           ENABLE_USER_FLOW: 'true'
           MAX_CLICKS: 5
           API_WAIT_TIMEOUT_MS: 30000
+          # OpenClaw a besoin de la clé OpenRouter (aussi passée via env)
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
 
       - name: Upload des preuves (si échec)
         if: failure()
