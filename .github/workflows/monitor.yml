@@ -1,51 +1,47 @@
-name: Test IA sur usinformatique.com
+name: OpenClaw - Test Autonome sur usinformatique.com
 
 on:
   workflow_dispatch:
 
 jobs:
-  test:
+  autonomous-test:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout du code
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Installer les dépendances
+      - name: Installer OpenClaw (via script officiel)
         run: |
-          npm install
-          npx playwright install --with-deps chromium
+          # Téléchargement et exécution du script d'installation
+          curl -fsSL https://openclaw.ai/install.sh | bash
+          # Ajout du binaire au PATH pour les étapes suivantes
+          echo "$HOME/.openclaw/bin" >> $GITHUB_PATH
+          # Vérification de l'installation
+          ~/.openclaw/bin/openclaw --version
 
-      - name: Lancer le test sur usinformatique.com
+      - name: Configurer OpenClaw avec OpenRouter
         run: |
-          node -e "
-            const { checkPage } = require('./crawler.js');
-            const { chromium } = require('playwright');
-
-            (async () => {
-              const browser = await chromium.launch({ headless: true });
-              const context = await browser.newContext();
-              console.log('🔍 Test du site : https://usinformatique.com');
-              const result = await checkPage(context, 'https://usinformatique.com');
-              console.log('📊 Résultat final :', JSON.stringify(result, null, 2));
-              await browser.close();
-
-              if (result.status === 'down') {
-                console.error('❌ Site déclaré DOWN par l\'IA');
-                process.exit(1);
-              } else {
-                console.log('✅ Site déclaré UP par l\'IA');
-                process.exit(0);
-              }
-            })();
-          "
+          # On utilise la clé OpenRouter (les modèles gratuits sont dispo)
+          export OPENROUTER_API_KEY=${{ secrets.OPENROUTER_API_KEY }}
+          ~/.openclaw/bin/openclaw config --set provider=openrouter
+          ~/.openclaw/bin/openclaw config --set model=openrouter/free
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          ENABLE_USER_FLOW: 'true'
-          MAX_CLICKS: 5
-          API_WAIT_TIMEOUT_MS: 30000
+
+      - name: Lancer OpenClaw en mode autonome (sans code Playwright)
+        run: |
+          # OpenClaw va ouvrir le navigateur, explorer, cliquer, et juger par lui-même
+          ~/.openclaw/bin/openclaw run "Test du site usinformatique.com" \
+            --task "Va sur https://usinformatique.com. Explore le site comme un humain : scroll, clique sur les produits, vérifie que le panier fonctionne, et que les données s'affichent correctement. Si tu vois des erreurs JavaScript ou des pages blanches, prends une capture d'écran. À la fin, dis-moi si le site est UP ou DOWN, avec une explication de ce que tu as testé." \
+            --browser true \
+            --output json
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+
+      - name: Upload des captures (si OpenClaw en a pris)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openclaw-screenshots
+          path: ~/.openclaw/workspace/screenshots/
