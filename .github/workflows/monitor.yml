@@ -1,12 +1,9 @@
 name: OpenClaw - Test Autonome sur usinformatique.com
-
 on:
   workflow_dispatch:
-
 jobs:
   autonomous-test:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout du code
         uses: actions/checkout@v4
@@ -23,9 +20,9 @@ jobs:
 
       - name: Configurer OpenClaw avec OpenRouter
         run: |
-          # Configuration du provider et du modèle avec la bonne syntaxe
-          ~/.npm-global/bin/openclaw config provider=openrouter
-          ~/.npm-global/bin/openclaw config model=openrouter/free
+          # Bonne syntaxe : "config set <path> <value>"
+          ~/.npm-global/bin/openclaw config set agents.defaults.model.provider "openrouter"
+          ~/.npm-global/bin/openclaw config set agents.defaults.model.primary "openrouter/free"
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
 
