@@ -1,4 +1,4 @@
-name: OpenClaw - Test Autonome sur usinformatique.com (fallback fiable)
+name: OpenClaw - Test Autonome (Groq → Mistral → OpenRouter) - v2
 
 on:
   workflow_dispatch:
@@ -11,17 +11,22 @@ jobs:
       - name: Checkout du code
         uses: actions/checkout@v4
 
-      - name: Installer Playwright (pour le navigateur)
+      - name: Installer Playwright
         run: |
           npx playwright install --with-deps chromium
 
-      - name: Installer OpenClaw (via script officiel)
+      - name: Installer OpenClaw
         run: |
           curl -fsSL https://openclaw.ai/install.sh | bash
           echo "$HOME/.npm-global/bin" >> $GITHUB_PATH
           ~/.npm-global/bin/openclaw --version
 
-      - name: Configurer OpenClaw (browser et gateway)
+      - name: Installer les providers (Groq + OpenRouter)
+        run: |
+          ~/.npm-global/bin/openclaw plugins install @openclaw/groq-provider || true
+          ~/.npm-global/bin/openclaw plugins install @openclaw/openrouter-provider || true
+
+      - name: Configurer OpenClaw (browser + gateway)
         run: |
           ~/.npm-global/bin/openclaw config set browser.enabled true
           ~/.npm-global/bin/openclaw config set browser.headless true
@@ -30,9 +35,11 @@ jobs:
           ~/.npm-global/bin/openclaw config set gateway.mode "local"
           ~/.npm-global/bin/openclaw config set gateway.auth.token "ci-test-token-12345"
         env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
 
-      - name: Démarrer le Gateway OpenClaw en arrière-plan
+      - name: Démarrer le Gateway
         run: |
           nohup ~/.npm-global/bin/openclaw gateway --force > gateway.log 2>&1 &
           echo "Attente du démarrage du Gateway..."
@@ -40,37 +47,45 @@ jobs:
           ~/.npm-global/bin/openclaw gateway status || true
           cat gateway.log
         env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
 
-      - name: Écrire la tâche dans un fichier
+      - name: Écrire la tâche
         run: |
           cat > task.md << 'EOF'
-          Va sur https://usinformatique.com avec l'outil browser. Explore le site comme un humain : scroll, clique sur un produit, ajoute-le au panier, puis vérifie que le produit est bien présent dans le panier après l'ajout. Si tu vois des erreurs JavaScript ou des pages blanches, prends une capture d'écran. À la fin, dis-moi si le site est UP ou DOWN, avec une explication précise de ce que tu as testé (y compris si le panier a réellement fonctionné ou affiché une erreur).
+          Va sur https://usinformatique.com avec l'outil browser. Explore le site comme un humain : scroll, clique sur un produit, ajoute-le au panier, puis vérifie que le produit est bien présent dans le panier après l'ajout. Si tu vois des erreurs JavaScript ou des pages blanches, prends une capture d'écran. À la fin, dis-moi si le site est UP ou DOWN, avec une explication précise de ce que tu as testé.
           EOF
 
-      - name: Lancer OpenClaw avec fallback sur modèles confirmés
+      - name: Lancer OpenClaw (fallback Groq → Mistral → OpenRouter)
         id: agent_run
         run: |
           set +e
 
-          # Liste des modèles gratuits fiables (identifiants exacts)
-          MODELS=(
-            "nvidia/nemotron-3-ultra:free"
-            "nvidia/nemotron-3.5-lightning:free"
-            "nvidia/nemotron-3-super:free"
-            "thinkingmachines/inkling:free"
-            "minimax/minimax-m2.7:free"
-            "cohere/north-mini-code:free"
-            "openrouter/free"   # fallback ultime : choisit automatiquement le meilleur disponible
+          # Liste des modèles actifs en août 2026 (ordre : Groq → Mistral → OpenRouter)
+          CONFIGS=(
+            # Groq - modèles encore supportés
+            "groq/mixtral-8x7b-32768"
+            "groq/gemma2-9b-it"
+
+            # Mistral - gamme 2026
+            "mistral/mistral-large-latest"
+            "mistral/mistral-small-latest"
+            "mistral/codestral-latest"
+            "mistral/mistral-medium"  # alias pour medium 3.5
+
+            # OpenRouter - syntaxe exacte (double namespace)
+            "openrouter/openrouter/fusion"
+            "openrouter/meta-llama/llama-3-8b-instruct:free"
           )
 
           SUCCESS=false
-          for MODEL in "${MODELS[@]}"; do
+          for CONFIG in "${CONFIGS[@]}"; do
             echo "======================================"
-            echo "Essai du modèle : $MODEL"
+            echo "Essai de la configuration : $CONFIG"
             echo "======================================"
 
-            ~/.npm-global/bin/openclaw config set agents.defaults.model.primary "$MODEL"
+            ~/.npm-global/bin/openclaw config set agents.defaults.model.primary "$CONFIG"
 
             ~/.npm-global/bin/openclaw agent \
               --session-key "ci:usinformatique-test" \
@@ -79,26 +94,28 @@ jobs:
 
             EXIT_CODE=$?
             if [ $EXIT_CODE -eq 0 ]; then
-              echo "✅ Succès avec le modèle $MODEL"
+              echo "✅ Succès avec $CONFIG"
               SUCCESS=true
               cat output.json
               break
             else
-              echo "❌ Échec avec le modèle $MODEL (code $EXIT_CODE)"
-              echo "--- Sortie d'erreur ---"
+              echo "❌ Échec avec $CONFIG (code $EXIT_CODE)"
+              echo "--- Sortie ---"
               cat output.json
-              echo "----------------------"
+              echo "--------------"
             fi
           done
 
           if [ "$SUCCESS" = false ]; then
-            echo "Aucun modèle n'a fonctionné."
+            echo "Aucune configuration n'a fonctionné."
             exit 1
           fi
 
           exit 0
 
         env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           OPENCLAW_GATEWAY_TOKEN: "ci-test-token-12345"
 
@@ -106,7 +123,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: openclaw-screenshots
+          name: openclaw-artifacts
           path: |
             gateway.log
             output.json
