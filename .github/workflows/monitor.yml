@@ -18,17 +18,17 @@ jobs:
           echo "$HOME/.npm-global/bin" >> $GITHUB_PATH
           ~/.npm-global/bin/openclaw --version
 
-      - name: Configurer OpenClaw avec Google Gemini et le navigateur
+      - name: Configurer OpenClaw avec OpenRouter et le navigateur
         run: |
-          ~/.npm-global/bin/openclaw config set agents.defaults.model.primary "google/gemini-2.5-flash"
-          ~/.npm-global/bin/openclaw config set gateway.mode "local"
-          ~/.npm-global/bin/openclaw config set gateway.auth.token "ci-test-token-12345"
           ~/.npm-global/bin/openclaw config set browser.enabled true
           ~/.npm-global/bin/openclaw config set browser.headless true
           ~/.npm-global/bin/openclaw config set browser.noSandbox true
           ~/.npm-global/bin/openclaw config set browser.defaultProfile openclaw
+          ~/.npm-global/bin/openclaw config set gateway.mode "local"
+          ~/.npm-global/bin/openclaw config set gateway.auth.token "ci-test-token-12345"
+          ~/.npm-global/bin/openclaw config set agents.defaults.model.primary "openrouter/meta-llama/llama-3.3-70b-instruct:free"
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
 
       - name: Démarrer le Gateway OpenClaw en arrière-plan
         run: |
@@ -38,7 +38,7 @@ jobs:
           ~/.npm-global/bin/openclaw gateway status || true
           cat gateway.log
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
 
       - name: Écrire la tâche dans un fichier
         run: |
@@ -53,7 +53,7 @@ jobs:
             --message-file task.md \
             --json
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           OPENCLAW_GATEWAY_TOKEN: "ci-test-token-12345"
 
       - name: Upload des logs et captures
