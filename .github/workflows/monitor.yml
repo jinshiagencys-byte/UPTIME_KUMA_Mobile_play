@@ -10,9 +10,6 @@ jobs:
     steps:
       - name: Checkout du code
         uses: actions/checkout@v4
-        with:
-          repository: UPTIME_KUMA_Mobile_play
-          ref: main
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
