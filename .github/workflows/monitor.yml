@@ -14,7 +14,8 @@ jobs:
       - name: Récupérer les sites actifs
         id: get-sites
         run: |
-          SITES=$(curl -s https://kuma-relay.up.railway.app/active-sites | jq -c '[.[] | {id, url}]')
+          # Adaptez la structure selon votre API
+          SITES=$(curl -s https://kuma-relay.up.railway.app/active-sites | jq -c '[.sites[] | {id: .id, url: .site_url}]')
           echo "sites=$SITES" >> "$GITHUB_OUTPUT"
 
   autonomous-test:
@@ -47,8 +48,11 @@ jobs:
           ~/.npm-global/bin/openclaw config set gateway.auth.token "ci-test-token-12345"
           ~/.npm-global/bin/openclaw config set gateway.model "mistral/mistral-small-latest"
           ~/.npm-global/bin/openclaw config set agents.defaults.model.primary "mistral/mistral-small-latest"
+          # Fallback si Mistral échoue
+          ~/.npm-global/bin/openclaw config set agents.defaults.model.fallback "openrouter/openrouter/fusion"
         env:
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
 
       - name: Démarrer le Gateway
         run: |
@@ -57,6 +61,7 @@ jobs:
           ~/.npm-global/bin/openclaw gateway status || true
         env:
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
 
       - name: Générer la tâche (prompt générique)
         run: |
@@ -70,14 +75,40 @@ jobs:
           EOF
 
       - name: Lancer OpenClaw
+        id: agent_run
         run: |
           ~/.npm-global/bin/openclaw agent \
             --session-key "ci:${{ matrix.site.id }}" \
             --message-file task.md \
             --json > output.json 2>&1
+          # Si l'agent échoue, on capture l'erreur mais on continue
+          if [ $? -ne 0 ]; then
+            echo "agent_failed=true" >> $GITHUB_OUTPUT
+          fi
         env:
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           OPENCLAW_GATEWAY_TOKEN: "ci-test-token-12345"
+
+      - name: Extraire et envoyer le résultat au Relay
+        if: always()
+        run: |
+          # Si l'agent a échoué, on envoie un statut ERROR
+          if [ "${{ steps.agent_run.outputs.agent_failed }}" == "true" ]; then
+            STATUS="ERROR"
+            REASON="Agent execution failed"
+          else
+            # Essayer d'extraire le statut du output.json (structure à adapter)
+            STATUS=$(jq -r '.result.payloads[0].status // "UNKNOWN"' output.json)
+            REASON=$(jq -r '.result.payloads[0].text' output.json | head -c 300)
+          fi
+          # Envoyer au relay
+          curl -X POST "https://kuma-relay.up.railway.app/sites/${{ matrix.site.id }}/report" \
+            -H "x-relay-secret: ${{ secrets.RELAY_SECRET }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"status\": \"$STATUS\", \"message\": \"$REASON\"}" || echo "Relay report failed"
+        env:
+          RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
 
       - name: Upload des artefacts
         if: always()
