@@ -1,30 +1,73 @@
-name: Uptime Kuma Playwright Monitor
+name: Test OpenClaw sur usinformatique.com (via OpenRouter)
 
 on:
-  schedule:
-    # Toutes les 5 heures. La vraie fréquence de vérification par site est
-    # gérée par isDue() dans crawler.js (crawl_interval_minutes en base) —
-    # ce cron ne fait que "réveiller" le crawler assez souvent pour qu'aucun
-    # site ne rate son échéance de plus de 5h.
-    - cron: '0 */5 * * *'
-  workflow_dispatch: {} # permet de lancer manuellement depuis l'onglet Actions
+  workflow_dispatch:
 
 jobs:
-  crawl:
+  test-with-openclaw:
     runs-on: ubuntu-latest
+    
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Checkout du code
+        uses: actions/checkout@v4
         with:
-          node-version: '22'          # 👈 CHANGEMENT ICI : Node 22 au lieu de 20
-          cache: 'npm'                # optionnel, accélère l'installation
-      - name: Install dependencies
-        run: npm ci
-      - name: Install Playwright browsers
-        run: npx playwright install --with-deps chromium
-      - name: Run crawler
-        env:
-          RELAY_URL: ${{ secrets.RELAY_URL }}
-          RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
-          KUMA_URL: ${{ secrets.KUMA_URL }}
-        run: node crawler.js
+          repository: votre-org/SentinelSite
+          ref: main
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Installer les dépendances (Playwright)
+        run: |
+          npm install
+          npx playwright install --with-deps chromium
+
+      - name: Installer OpenClaw (CLI)
+        run: |
+          npm install -g openclaw
+          openclaw --version
+
+      - name: Configurer les variables d'environnement (dont OpenRouter)
+        run: |
+          echo "RELAY_URL=${{ secrets.RELAY_URL }}" >> $GITHUB_ENV
+          echo "RELAY_SECRET=${{ secrets.RELAY_SECRET }}" >> $GITHUB_ENV
+          echo "KUMA_URL=${{ secrets.KUMA_URL }}" >> $GITHUB_ENV
+          
+          # Configuration OpenRouter (clé API)
+          echo "OPENROUTER_API_KEY=${{ secrets.OPENROUTER_API_KEY }}" >> $GITHUB_ENV
+          
+          # Modèle gratuit OpenRouter
+          echo "OPENCLAW_MODEL=openrouter/free" >> $GITHUB_ENV
+          echo "OPENCLAW_PROVIDER=openrouter" >> $GITHUB_ENV
+          
+          echo "ENABLE_USER_FLOW=true" >> $GITHUB_ENV
+          echo "MAX_CLICKS=5" >> $GITHUB_ENV
+          echo "POST_LOAD_WAIT_MS=30000" >> $GITHUB_ENV
+
+      - name: Lancer le test sur usinformatique.com
+        run: |
+          # On utilise la version modifiée de crawler.js qui appelle OpenClaw
+          node -e "
+            const { chromium } = require('playwright');
+            const { checkPage } = require('./crawler.js');
+            
+            (async () => {
+              const browser = await chromium.launch({ headless: true });
+              const context = await browser.newContext();
+              const result = await checkPage(context, 'https://usinformatique.com');
+              console.log('Résultat final:', JSON.stringify(result, null, 2));
+              await browser.close();
+              process.exit(result.status === 'up' ? 0 : 1);
+            })();
+          "
+
+      - name: Upload des preuves (si échec)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots-and-logs
+          path: |
+            ./screenshots/
+            ./logs/
