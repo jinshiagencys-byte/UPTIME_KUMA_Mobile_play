@@ -21,6 +21,7 @@ jobs:
       - name: Configurer OpenClaw avec OpenRouter et le navigateur
         run: |
           ~/.npm-global/bin/openclaw config set agents.defaults.model.primary "openrouter/free"
+          ~/.npm-global/bin/openclaw config set gateway.mode "local"
           ~/.npm-global/bin/openclaw config set browser.enabled true
           ~/.npm-global/bin/openclaw config set browser.headless true
           ~/.npm-global/bin/openclaw config set browser.noSandbox true
