@@ -21,7 +21,7 @@ jobs:
           echo "$HOME/.npm-global/bin" >> $GITHUB_PATH
           ~/.npm-global/bin/openclaw --version
 
-      - name: Configurer OpenClaw avec OpenRouter (modèle NVIDIA Nemotron 3 Ultra)
+      - name: Configurer OpenClaw avec OpenRouter (modèle NVIDIA Nemotron 3 Ultra 550B)
         run: |
           ~/.npm-global/bin/openclaw config set browser.enabled true
           ~/.npm-global/bin/openclaw config set browser.headless true
@@ -29,7 +29,7 @@ jobs:
           ~/.npm-global/bin/openclaw config set browser.defaultProfile openclaw
           ~/.npm-global/bin/openclaw config set gateway.mode "local"
           ~/.npm-global/bin/openclaw config set gateway.auth.token "ci-test-token-12345"
-          ~/.npm-global/bin/openclaw config set agents.defaults.model.primary "nvidia/nemotron-3-ultra:free"
+          ~/.npm-global/bin/openclaw config set agents.defaults.model.primary "nvidia/nemotron-3-ultra-550b-a55b:free"
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
 
