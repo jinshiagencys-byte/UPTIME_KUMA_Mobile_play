@@ -1,9 +1,12 @@
 name: OpenClaw - Test Autonome sur usinformatique.com
+
 on:
   workflow_dispatch:
+
 jobs:
   autonomous-test:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout du code
         uses: actions/checkout@v4
@@ -18,13 +21,7 @@ jobs:
           echo "$HOME/.npm-global/bin" >> $GITHUB_PATH
           ~/.npm-global/bin/openclaw --version
 
-      - name: Installer le plugin Groq
-        run: |
-          ~/.npm-global/bin/openclaw plugins install @openclaw/groq-provider
-        env:
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-
-      - name: Configurer OpenClaw avec Groq et le navigateur
+      - name: Configurer OpenClaw avec OpenRouter (modèle NVIDIA Nemotron 3 Ultra)
         run: |
           ~/.npm-global/bin/openclaw config set browser.enabled true
           ~/.npm-global/bin/openclaw config set browser.headless true
@@ -32,9 +29,9 @@ jobs:
           ~/.npm-global/bin/openclaw config set browser.defaultProfile openclaw
           ~/.npm-global/bin/openclaw config set gateway.mode "local"
           ~/.npm-global/bin/openclaw config set gateway.auth.token "ci-test-token-12345"
-          ~/.npm-global/bin/openclaw config set agents.defaults.model.primary "groq/openai/gpt-oss-20b"
+          ~/.npm-global/bin/openclaw config set agents.defaults.model.primary "nvidia/nemotron-3-ultra:free"
         env:
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
 
       - name: Démarrer le Gateway OpenClaw en arrière-plan
         run: |
@@ -44,7 +41,7 @@ jobs:
           ~/.npm-global/bin/openclaw gateway status || true
           cat gateway.log
         env:
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
 
       - name: Écrire la tâche dans un fichier
         run: |
@@ -59,7 +56,7 @@ jobs:
             --message-file task.md \
             --json
         env:
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           OPENCLAW_GATEWAY_TOKEN: "ci-test-token-12345"
 
       - name: Upload des logs et captures
