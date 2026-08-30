@@ -45,8 +45,6 @@ jobs:
           ~/.npm-global/bin/openclaw config set browser.enabled true
           ~/.npm-global/bin/openclaw config set browser.headless true
           ~/.npm-global/bin/openclaw config set browser.noSandbox true
-          ~/.npm-global/bin/openclaw config set gateway.mode "local"
-          ~/.npm-global/bin/openclaw config set gateway.auth.token "ci-test-token-12345"
 
           # Provider Google en mode natif (pour le fallback)
           ~/.npm-global/bin/openclaw config set providers.google.api "google-generative-ai"
