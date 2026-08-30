@@ -49,12 +49,12 @@ jobs:
       - name: Lancer OpenClaw en mode autonome (via Gateway)
         run: |
           ~/.npm-global/bin/openclaw agent \
-            --token "ci-test-token-12345" \
             --session-key "ci:usinformatique-test" \
             --message-file task.md \
             --json
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENCLAW_GATEWAY_TOKEN: "ci-test-token-12345"
 
       - name: Upload des logs et captures
         if: always()
