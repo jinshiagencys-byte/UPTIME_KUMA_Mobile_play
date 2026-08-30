@@ -1,4 +1,4 @@
-name: OpenClaw - Test Autonome sur usinformatique.com (avec fallback)
+name: OpenClaw - Test Autonome sur usinformatique.com (fallback fiable)
 
 on:
   workflow_dispatch:
@@ -48,24 +48,20 @@ jobs:
           Va sur https://usinformatique.com avec l'outil browser. Explore le site comme un humain : scroll, clique sur un produit, ajoute-le au panier, puis vérifie que le produit est bien présent dans le panier après l'ajout. Si tu vois des erreurs JavaScript ou des pages blanches, prends une capture d'écran. À la fin, dis-moi si le site est UP ou DOWN, avec une explication précise de ce que tu as testé (y compris si le panier a réellement fonctionné ou affiché une erreur).
           EOF
 
-      - name: Lancer OpenClaw avec fallback sur plusieurs modèles
+      - name: Lancer OpenClaw avec fallback sur modèles confirmés
         id: agent_run
         run: |
-          set +e  # Éviter l'arrêt immédiat sur erreur
+          set +e
 
-          # Liste des modèles gratuits par ordre de préférence
+          # Liste des modèles gratuits fiables (identifiants exacts)
           MODELS=(
-            "nvidia/nemotron-3-ultra-550b-a55b:free"
+            "nvidia/nemotron-3-ultra:free"
             "nvidia/nemotron-3.5-lightning:free"
-            "nvidia/nemotron-3-super-120b-a12b:free"
+            "nvidia/nemotron-3-super:free"
             "thinkingmachines/inkling:free"
             "minimax/minimax-m2.7:free"
             "cohere/north-mini-code:free"
-            "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
-            "z-ai/glm-5.2:free"
-            "google/gemma-4-31b-it:free"
-            "google/gemma-4-26b-a4b-it:free"
-            "minimax/minimax-m3:free"
+            "openrouter/free"   # fallback ultime : choisit automatiquement le meilleur disponible
           )
 
           SUCCESS=false
@@ -74,10 +70,8 @@ jobs:
             echo "Essai du modèle : $MODEL"
             echo "======================================"
 
-            # Configurer le modèle
             ~/.npm-global/bin/openclaw config set agents.defaults.model.primary "$MODEL"
 
-            # Lancer l'agent
             ~/.npm-global/bin/openclaw agent \
               --session-key "ci:usinformatique-test" \
               --message-file task.md \
