@@ -32,7 +32,7 @@ jobs:
           ~/.npm-global/bin/openclaw config set browser.defaultProfile openclaw
           ~/.npm-global/bin/openclaw config set gateway.mode "local"
           ~/.npm-global/bin/openclaw config set gateway.auth.token "ci-test-token-12345"
-          ~/.npm-global/bin/openclaw config set agents.defaults.model.primary "groq/openai/gpt-oss-120b"
+          ~/.npm-global/bin/openclaw config set agents.defaults.model.primary "groq/openai/gpt-oss-20b"
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
 
