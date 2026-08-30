@@ -14,7 +14,7 @@ jobs:
       - name: Récupérer les sites actifs
         id: get-sites
         run: |
-          # Adaptez la structure selon votre API
+          # Adaptez la structure de l'URL selon votre API
           SITES=$(curl -s https://kuma-relay.up.railway.app/active-sites | jq -c '[.sites[] | {id: .id, url: .site_url}]')
           echo "sites=$SITES" >> "$GITHUB_OUTPUT"
 
@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      max-parallel: 1   # ← FIX : un site à la fois pour éviter le rate limit
+      max-parallel: 1   # Évite les rate limits (un site à la fois)
       matrix:
         site: ${{ fromJson(needs.fetch-sites.outputs.sites) }}
 
@@ -40,16 +40,25 @@ jobs:
           echo "$HOME/.npm-global/bin" >> $GITHUB_PATH
           ~/.npm-global/bin/openclaw --version
 
-      - name: Configurer OpenClaw
+      - name: Configurer OpenClaw (Mistral + Google natif)
         run: |
           ~/.npm-global/bin/openclaw config set browser.enabled true
           ~/.npm-global/bin/openclaw config set browser.headless true
           ~/.npm-global/bin/openclaw config set browser.noSandbox true
           ~/.npm-global/bin/openclaw config set gateway.mode "local"
           ~/.npm-global/bin/openclaw config set gateway.auth.token "ci-test-token-12345"
+
+          # Provider Google en mode natif (pour le fallback)
+          ~/.npm-global/bin/openclaw config set providers.google.api "google-generative-ai"
+
+          # Modèle principal : Mistral Small (fiable et bon pour l'agent)
           ~/.npm-global/bin/openclaw config set agents.defaults.model.primary "mistral/mistral-small-latest"
+
+          # Fallback : Google Gemini Flash (si Mistral rate)
+          ~/.npm-global/bin/openclaw config set agents.defaults.model.fallback "google/gemini-2.5-flash"
         env:
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
 
       - name: Démarrer le Gateway
         run: |
@@ -58,6 +67,7 @@ jobs:
           ~/.npm-global/bin/openclaw gateway status || true
         env:
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
 
       - name: Générer la tâche (prompt générique)
         run: |
@@ -81,14 +91,18 @@ jobs:
 
           while [ $ATTEMPT -lt $MAX_RETRIES ]; do
             ATTEMPT=$((ATTEMPT+1))
+            echo "======================================"
             echo "Tentative $ATTEMPT/$MAX_RETRIES pour ${{ matrix.site.url }}"
+            echo "======================================"
+
             ~/.npm-global/bin/openclaw agent \
               --session-key "ci:${{ matrix.site.id }}" \
               --message-file task.md \
               --json > output.json 2>&1
+
             EXIT_CODE=$?
 
-            # Si la sortie contient "rate limit" ou "429", on réessaie
+            # Vérifier si la sortie indique un rate limit (429)
             if grep -q "rate limit\|429" output.json 2>/dev/null; then
               echo "⚠️ Rate limit détecté, nouvelle tentative dans ${RETRY_DELAY}s..."
               sleep $RETRY_DELAY
@@ -96,31 +110,31 @@ jobs:
             fi
 
             if [ $EXIT_CODE -eq 0 ]; then
+              echo "✅ Agent réussi pour ${{ matrix.site.url }}"
               SUCCESS=true
               break
             else
-              echo "❌ Échec de l'agent (code $EXIT_CODE), on réessaie..."
+              echo "❌ Échec de l'agent (code $EXIT_CODE), nouvelle tentative dans 5s..."
               sleep 5
             fi
           done
 
           if [ "$SUCCESS" = true ]; then
-            echo "✅ Agent réussi pour ${{ matrix.site.url }}"
             echo "agent_failed=false" >> $GITHUB_OUTPUT
           else
             echo "❌ Échec final de l'agent pour ${{ matrix.site.url }}"
             echo "agent_failed=true" >> $GITHUB_OUTPUT
-            # On garde le dernier output.json pour analyse
           fi
 
         env:
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           OPENCLAW_GATEWAY_TOKEN: "ci-test-token-12345"
 
       - name: Extraire et envoyer le résultat au Relay
         if: always()
         run: |
-          # Si l'agent a échoué ou output.json est absent
+          # Vérifier si output.json existe
           if [ ! -f output.json ]; then
             STATUS="ERROR"
             REASON="Agent did not produce output.json"
@@ -128,7 +142,7 @@ jobs:
             STATUS="ERROR"
             REASON="Agent execution failed after retries"
           else
-            # Extraire le statut (structure à valider)
+            # Extraire le statut (structure du JSON à adapter si besoin)
             STATUS=$(jq -r '.result.payloads[0].status // "UNKNOWN"' output.json)
             REASON=$(jq -r '.result.payloads[0].text' output.json | head -c 300)
           fi
