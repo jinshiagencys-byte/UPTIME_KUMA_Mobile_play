@@ -1,19 +1,36 @@
-name: OpenClaw - Test Autonome (Groq → Mistral → OpenRouter) - v2
+name: OpenClaw - Monitoring Autonome Multi-Sites
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *"
 
 jobs:
-  autonomous-test:
+  fetch-sites:
     runs-on: ubuntu-latest
+    outputs:
+      sites: ${{ steps.get-sites.outputs.sites }}
+    steps:
+      - name: Récupérer les sites actifs
+        id: get-sites
+        run: |
+          SITES=$(curl -s https://kuma-relay.up.railway.app/active-sites | jq -c '[.[] | {id, url}]')
+          echo "sites=$SITES" >> "$GITHUB_OUTPUT"
+
+  autonomous-test:
+    needs: fetch-sites
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        site: ${{ fromJson(needs.fetch-sites.outputs.sites) }}
 
     steps:
       - name: Checkout du code
         uses: actions/checkout@v4
 
       - name: Installer Playwright
-        run: |
-          npx playwright install --with-deps chromium
+        run: npx playwright install --with-deps chromium
 
       - name: Installer OpenClaw
         run: |
@@ -21,109 +38,52 @@ jobs:
           echo "$HOME/.npm-global/bin" >> $GITHUB_PATH
           ~/.npm-global/bin/openclaw --version
 
-      - name: Installer les providers (Groq + OpenRouter)
-        run: |
-          ~/.npm-global/bin/openclaw plugins install @openclaw/groq-provider || true
-          ~/.npm-global/bin/openclaw plugins install @openclaw/openrouter-provider || true
-
-      - name: Configurer OpenClaw (browser + gateway)
+      - name: Configurer OpenClaw
         run: |
           ~/.npm-global/bin/openclaw config set browser.enabled true
           ~/.npm-global/bin/openclaw config set browser.headless true
           ~/.npm-global/bin/openclaw config set browser.noSandbox true
-          ~/.npm-global/bin/openclaw config set browser.defaultProfile openclaw
           ~/.npm-global/bin/openclaw config set gateway.mode "local"
           ~/.npm-global/bin/openclaw config set gateway.auth.token "ci-test-token-12345"
+          ~/.npm-global/bin/openclaw config set gateway.model "mistral/mistral-small-latest"
+          ~/.npm-global/bin/openclaw config set agents.defaults.model.primary "mistral/mistral-small-latest"
         env:
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
 
       - name: Démarrer le Gateway
         run: |
           nohup ~/.npm-global/bin/openclaw gateway --force > gateway.log 2>&1 &
-          echo "Attente du démarrage du Gateway..."
           sleep 10
           ~/.npm-global/bin/openclaw gateway status || true
-          cat gateway.log
         env:
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
 
-      - name: Écrire la tâche
+      - name: Générer la tâche (prompt générique)
         run: |
-          cat > task.md << 'EOF'
-          Va sur https://usinformatique.com avec l'outil browser. Explore le site comme un humain : scroll, clique sur un produit, ajoute-le au panier, puis vérifie que le produit est bien présent dans le panier après l'ajout. Si tu vois des erreurs JavaScript ou des pages blanches, prends une capture d'écran. À la fin, dis-moi si le site est UP ou DOWN, avec une explication précise de ce que tu as testé.
+          cat > task.md << EOF
+          Va sur ${{ matrix.site.url }} avec l'outil browser.
+          1. Explore le site comme un humain : scroll, observe la structure.
+          2. Identifie toi-même les 2 ou 3 actions les plus importantes de ce site (ex: formulaire de contact, recherche, ajout au panier, connexion, navigation menu) selon ce que tu observes.
+          3. Teste chacune de ces actions et vérifie qu'elle produit le résultat attendu.
+          4. Si tu vois une erreur JavaScript, une page blanche, ou un résultat incohérent (ex: action qui ne fait rien), prends une capture d'écran et note-le précisément.
+          5. Termine par un verdict clair : UP ou DOWN, avec la liste des actions testées et leur résultat.
           EOF
 
-      - name: Lancer OpenClaw (fallback Groq → Mistral → OpenRouter)
-        id: agent_run
+      - name: Lancer OpenClaw
         run: |
-          set +e
-
-          # Liste des modèles actifs en août 2026 (ordre : Groq → Mistral → OpenRouter)
-          CONFIGS=(
-            # Groq - modèles encore supportés
-            "groq/mixtral-8x7b-32768"
-            "groq/gemma2-9b-it"
-
-            # Mistral - gamme 2026
-            "mistral/mistral-large-latest"
-            "mistral/mistral-small-latest"
-            "mistral/codestral-latest"
-            "mistral/mistral-medium"  # alias pour medium 3.5
-
-            # OpenRouter - syntaxe exacte (double namespace)
-            "openrouter/openrouter/fusion"
-            "openrouter/meta-llama/llama-3-8b-instruct:free"
-          )
-
-          SUCCESS=false
-          for CONFIG in "${CONFIGS[@]}"; do
-            echo "======================================"
-            echo "Essai de la configuration : $CONFIG"
-            echo "======================================"
-
-            ~/.npm-global/bin/openclaw config set agents.defaults.model.primary "$CONFIG"
-
-            ~/.npm-global/bin/openclaw agent \
-              --session-key "ci:usinformatique-test" \
-              --message-file task.md \
-              --json > output.json 2>&1
-
-            EXIT_CODE=$?
-            if [ $EXIT_CODE -eq 0 ]; then
-              echo "✅ Succès avec $CONFIG"
-              SUCCESS=true
-              cat output.json
-              break
-            else
-              echo "❌ Échec avec $CONFIG (code $EXIT_CODE)"
-              echo "--- Sortie ---"
-              cat output.json
-              echo "--------------"
-            fi
-          done
-
-          if [ "$SUCCESS" = false ]; then
-            echo "Aucune configuration n'a fonctionné."
-            exit 1
-          fi
-
-          exit 0
-
+          ~/.npm-global/bin/openclaw agent \
+            --session-key "ci:${{ matrix.site.id }}" \
+            --message-file task.md \
+            --json > output.json 2>&1
         env:
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           OPENCLAW_GATEWAY_TOKEN: "ci-test-token-12345"
 
-      - name: Upload des logs et captures
+      - name: Upload des artefacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: openclaw-artifacts
+          name: openclaw-${{ matrix.site.id }}
           path: |
             gateway.log
             output.json
