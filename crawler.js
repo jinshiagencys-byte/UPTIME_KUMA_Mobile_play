@@ -1,290 +1,227 @@
-const { chromium } = require('playwright');
-
-// Variables d'environnement
-const RELAY_URL = process.env.RELAY_URL;
-const RELAY_SECRET = process.env.RELAY_SECRET;
-const KUMA_URL = process.env.KUMA_URL;
-
-// Paramètres de configuration
-const NETWORK_IDLE_TIMEOUT_MS = parseInt(process.env.NETWORK_IDLE_TIMEOUT_MS || '15000', 10);
-const MIN_TEXT_LENGTH = parseInt(process.env.MIN_TEXT_LENGTH || '100', 10);
-const IGNORED_DOMAINS = (process.env.IGNORED_DOMAINS || 'google-analytics.com,doubleclick.net,facebook.net,cdn.jsdelivr.net')
-  .split(',')
-  .map(d => d.trim());
-
-console.log('[crawler] Début du script');
-
-// --- Utilitaires ---
-
-function getHostname(url) {
-  try {
-    return new URL(url).hostname;
-  } catch {
-    return '';
-  }
-}
-
-function isIgnoredDomain(url) {
-  const hostname = getHostname(url);
-  return IGNORED_DOMAINS.some(domain => hostname.includes(domain));
-}
-
-// --- Appels HTTP vers le relay (via fetch) ---
-
-async function relayGet(path) {
-  const url = `${RELAY_URL}${path}`;
-  const res = await fetch(url, {
-    headers: { 'x-relay-secret': RELAY_SECRET }
-  });
-  if (!res.ok) {
-    throw new Error(`HTTP ${res.status} sur ${url}`);
-  }
-  return await res.json();
-}
-
-async function relayPost(path, body = {}) {
-  const url = `${RELAY_URL}${path}`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'x-relay-secret': RELAY_SECRET,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify(body)
-  });
-  if (!res.ok) {
-    throw new Error(`HTTP ${res.status} sur ${url}`);
-  }
-  return await res.json();
-}
-
-// --- Récupération des pages (push tokens) d'un groupe ---
-
-async function getPagesForSite(groupId) {
-  const data = await relayGet(`/push-tokens?groupId=${groupId}`);
-  if (!data.success) {
-    throw new Error('Erreur lors de la récupération des pages');
-  }
-  return data.tokens; // [{ url, monitorId, pushToken, name }]
-}
-
-// --- Déterminer si un site est dû ---
-
-function isDue(site) {
-  const last = site.last_crawled_at ? new Date(site.last_crawled_at) : null;
-  const intervalMinutes = site.crawl_interval_minutes || 1440; // 24h par défaut
-  const now = new Date();
-  const due = !last || (now - last) / 60000 >= intervalMinutes;
-  console.log(`[isDue] site ${site.id} (${site.client_name}) : last=${last}, interval=${intervalMinutes}min, due=${due}`);
-  return due;
-}
-
-// --- Marquer un site comme crawlé ---
-
-async function markSiteCrawled(siteId) {
-  try {
-    await relayPost(`/sites/${siteId}/mark-crawled`, {});
-    console.log(`[crawler] Site ${siteId} marqué comme crawlé.`);
-  } catch (err) {
-    console.error(`[crawler] Erreur lors du marquage du site ${siteId} :`, err.message);
-  }
-}
-
-// --- Envoyer le statut à Kuma via push token ---
-
-async function sendStatusToKuma(pushToken, status, msg) {
-  const kumaPushUrl = `${KUMA_URL}/api/push/${pushToken}`;
-  const params = new URLSearchParams();
-  params.append('status', status === 'up' ? 'up' : 'down');
-  if (msg) params.append('msg', msg);
-  const url = `${kumaPushUrl}?${params.toString()}`;
-  const res = await fetch(url);
-  if (!res.ok) {
-    throw new Error(`HTTP ${res.status} lors du push vers Kuma`);
-  }
-}
-
-// --- Vérification d'une page (avec Playwright) avec listener de requêtes ---
-
-async function checkPage(context, url) {
+async function checkPage(context, url, siteUrl) {
   const page = await context.newPage();
   let status = 'up';
   let msg = 'OK';
   let loadTimeMs = null;
   const navStart = Date.now();
 
-  let sawApiError = false;
-  let networkIdleReached = false;
+  // Collecte des requêtes XHR/fetch
+  const apiRequests = [];
+  const apiResponses = [];
+  const failedRequests = [];
+  let apiDataReceived = false;
+  let apiDataHasContent = false;
+  let apiDataCount = 0;
 
-  // --- NOUVEAU : collecte des domaines observés pour les requêtes XHR/fetch ---
-  const observedDomains = new Set();
-  const observedUrls = [];
-
+  // Intercepter les requêtes API
   page.on('request', (request) => {
-    const resourceType = request.resourceType();
-    if (resourceType === 'xhr' || resourceType === 'fetch') {
+    if (request.resourceType() === 'xhr' || request.resourceType() === 'fetch') {
       const reqUrl = request.url();
       if (!isIgnoredDomain(reqUrl)) {
-        const hostname = getHostname(reqUrl);
-        observedDomains.add(hostname);
-        observedUrls.push(reqUrl);
-        // On peut logger en temps réel si besoin, mais on le fera en fin de check
+        apiRequests.push({
+          url: reqUrl,
+          method: request.method(),
+          startTime: Date.now()
+        });
       }
     }
   });
 
-  page.on('response', (response) => {
-    if (response.status() >= 500 && !isIgnoredDomain(response.url())) {
-      sawApiError = true;
+  // Intercepter les réponses API (pour vérifier le contenu)
+  page.on('response', async (response) => {
+    const req = response.request();
+    if (req.resourceType() === 'xhr' || req.resourceType() === 'fetch') {
+      const url = response.url();
+      if (!isIgnoredDomain(url)) {
+        const statusCode = response.status();
+        apiResponses.push({
+          url,
+          status: statusCode,
+          time: Date.now()
+        });
+
+        // Vérifier les erreurs HTTP
+        if (statusCode >= 500) {
+          failedRequests.push({ url, status: statusCode, type: 'http_error' });
+          return;
+        }
+
+        // Vérifier le contenu des réponses JSON (si c'est une API)
+        if (statusCode === 200 && (url.includes('/api/') || url.includes('/graphql'))) {
+          try {
+            const json = await response.json().catch(() => null);
+            if (json) {
+              apiDataReceived = true;
+              
+              // Vérifier si la réponse contient des données
+              const hasData = checkIfDataPresent(json);
+              if (hasData) {
+                apiDataHasContent = true;
+                apiDataCount += countDataItems(json);
+              } else {
+                // L'API a répondu 200 mais sans données → alerte
+                failedRequests.push({ 
+                  url, 
+                  status: 200, 
+                  type: 'empty_data',
+                  message: 'API a répondu 200 mais données vides'
+                });
+              }
+            }
+          } catch (e) {
+            // Impossible de parser le JSON → ce n'est pas une API JSON
+          }
+        }
+      }
     }
   });
-  page.on('requestfailed', (req) => {
-    if (req.resourceType() === 'xhr' || req.resourceType() === 'fetch') {
-      if (!isIgnoredDomain(req.url())) {
-        sawApiError = true;
+
+  // Détecter les échecs réseau
+  page.on('requestfailed', (request) => {
+    if (request.resourceType() === 'xhr' || request.resourceType() === 'fetch') {
+      if (!isIgnoredDomain(request.url())) {
+        failedRequests.push({
+          url: request.url(),
+          type: 'network_error',
+          error: request.failure()?.errorText || 'failed'
+        });
       }
     }
   });
 
   try {
-    const response = await page.goto(url, { waitUntil: 'load', timeout: 20000 });
+    // Charger la page
+    const response = await page.goto(url, { 
+      waitUntil: 'load', 
+      timeout: 30000 
+    });
 
     if (!response || !response.ok()) {
       status = 'down';
       msg = `HTTP ${response ? response.status() : 'no response'}`;
     } else {
-      try {
-        await page.waitForLoadState('networkidle', { timeout: NETWORK_IDLE_TIMEOUT_MS });
-        networkIdleReached = true;
-      } catch (e) {
-        networkIdleReached = false;
-      }
+      // Attendre que les requêtes API se terminent (avec timeout)
+      const API_WAIT_MS = parseInt(process.env.API_WAIT_TIMEOUT_MS || '30000', 10);
+      await page.waitForTimeout(API_WAIT_MS);
 
-      const textLength = await page.evaluate(() => document.body.innerText.length);
-      const isBlankPage = textLength < MIN_TEXT_LENGTH;
-
-      if (sawApiError) {
-        status = 'down';
-        msg = 'Erreur API détectée (HTTP ≥500 ou échec réseau)';
-      } else if (!networkIdleReached) {
-        status = 'down';
-        msg = `Réseau jamais au repos après ${NETWORK_IDLE_TIMEOUT_MS}ms (backend muet ?)`;
-      } else if (isBlankPage) {
-        status = 'down';
-        msg = 'Page vide / écran blanc';
-      }
-    }
-
-    try {
-      const timing = await page.evaluate(() => {
-        const [nav] = performance.getEntriesByType('navigation');
-        if (nav && nav.loadEventEnd > 0) return nav.loadEventEnd;
-        return null;
+      // Vérifier le contenu affiché dans le DOM
+      const uiContent = await page.evaluate(() => {
+        // Récupérer tous les textes visibles
+        const textContent = document.body.innerText || '';
+        // Compter les éléments qui ressemblent à des données (li, div avec des classes)
+        const dataElements = document.querySelectorAll('[class*="item"], [class*="product"], [class*="card"], li, .post, .article');
+        return {
+          textLength: textContent.length,
+          elementCount: dataElements.length,
+          hasContent: textContent.length > 200 && dataElements.length > 0
+        };
       });
-      loadTimeMs = timing != null ? timing : Date.now() - navStart;
-    } catch {
-      loadTimeMs = Date.now() - navStart;
+
+      // Décision finale basée sur plusieurs critères
+      const errors = [];
+
+      // 1. Y a-t-il eu des requêtes API ?
+      if (apiRequests.length === 0) {
+        errors.push('Aucun appel API détecté (site statique ou backend muet)');
+      }
+
+      // 2. Les requêtes API ont-elles toutes réussi ?
+      if (failedRequests.length > 0) {
+        const errorMessages = failedRequests.map(r => 
+          r.type === 'empty_data' ? `${r.url} (données vides)` :
+          r.type === 'http_error' ? `${r.url} (HTTP ${r.status})` :
+          `${r.url} (${r.error || 'échec réseau'})`
+        );
+        errors.push(`Échecs détectés : ${errorMessages.join(', ')}`);
+      }
+
+      // 3. Les données sont-elles bien affichées dans l'UI ?
+      if (!uiContent.hasContent) {
+        errors.push('Page ne semble pas afficher de données (texte court ou absence d\'éléments)');
+      }
+
+      // 4. Vérifier la cohérence API ↔ UI (si on a des données API)
+      if (apiDataReceived && apiDataHasContent && apiDataCount > 0) {
+        // On compare le nombre d'éléments affichés avec le nombre retourné par l'API
+        const uiElementCount = uiContent.elementCount;
+        if (uiElementCount < apiDataCount * 0.5) {
+          errors.push(`Incohérence : API retourne ${apiDataCount} éléments, mais seulement ${uiElementCount} affichés`);
+        }
+      }
+
+      // Décision finale
+      if (errors.length > 0) {
+        status = 'down';
+        msg = errors.join('; ');
+      } else {
+        status = 'up';
+        msg = 'OK (API et contenu validés)';
+      }
     }
+
+    loadTimeMs = Date.now() - navStart;
   } catch (err) {
     status = 'down';
     msg = String(err.message || err).slice(0, 200);
     loadTimeMs = Date.now() - navStart;
   } finally {
-    // --- LOG des domaines observés ---
+    // Log des domaines observés
+    const observedDomains = new Set();
+    apiRequests.forEach(r => {
+      try { observedDomains.add(new URL(r.url).hostname); } catch {}
+    });
     if (observedDomains.size > 0) {
       console.log(`[crawler] Domaines XHR/fetch observés pour ${url} :`, Array.from(observedDomains).join(', '));
-      console.log(`[crawler] URLs complètes (échantillon) :`, observedUrls.slice(0, 5).join(', '));
+      console.log(`[crawler] URLs complètes (échantillon) :`, apiRequests.slice(0, 5).map(r => r.url).join(', '));
     } else {
       console.log(`[crawler] Aucune requête XHR/fetch observée pour ${url}`);
     }
+    if (failedRequests.length > 0) {
+      console.log(`[crawler] Échecs détectés :`, failedRequests.map(r => 
+        `${r.url} (${r.type})`
+      ).join(', '));
+    }
+    console.log(`[crawler] UI : ${apiDataCount} données API, ${uiContent?.elementCount || 0} éléments affichés`);
+    
     await page.close();
   }
 
   return { status, msg, loadTimeMs };
 }
 
-// --- Fonction principale ---
-
-async function main() {
-  console.log('[crawler] main() démarrée');
-
-  try {
-    // 1. Récupérer les sites actifs depuis le relay
-    console.log('[crawler] Appel à /active-sites');
-    const sitesData = await relayGet('/active-sites');
-    console.log('[crawler] Réponse /active-sites reçue, sites trouvés :', sitesData.sites ? sitesData.sites.length : 0);
-
-    if (!sitesData.success || !sitesData.sites || sitesData.sites.length === 0) {
-      console.log('[crawler] Aucun site actif trouvé. Fin du crawler.');
-      return;
+// Fonction utilitaire pour vérifier si une réponse JSON contient des données
+function checkIfDataPresent(json) {
+  if (!json) return false;
+  
+  // Si c'est un tableau non vide
+  if (Array.isArray(json) && json.length > 0) return true;
+  
+  // Si c'est un objet avec une propriété "data" qui est un tableau non vide
+  if (json.data && Array.isArray(json.data) && json.data.length > 0) return true;
+  if (json.items && Array.isArray(json.items) && json.items.length > 0) return true;
+  if (json.results && Array.isArray(json.results) && json.results.length > 0) return true;
+  if (json.products && Array.isArray(json.products) && json.products.length > 0) return true;
+  
+  // Si c'est un objet non vide avec des propriétés
+  if (typeof json === 'object' && !Array.isArray(json)) {
+    const keys = Object.keys(json);
+    if (keys.length > 0) {
+      // Vérifier qu'il n'y a pas un message d'erreur
+      if (json.error || json.message) return false;
+      return true;
     }
-
-    // 2. Filtrer les sites dus
-    const dueSites = sitesData.sites.filter(site => isDue(site));
-    console.log(`[crawler] ${dueSites.length} site(s) dus sur ${sitesData.sites.length} au total.`);
-
-    if (dueSites.length === 0) {
-      console.log('[crawler] Aucun site à crawler pour le moment. Fin.');
-      return;
-    }
-
-    // 3. Traiter chaque site
-    for (const site of dueSites) {
-      console.log(`[crawler] Traitement du site ${site.id} : ${site.client_name} (${site.site_url})`);
-
-      // Récupérer les pages (push tokens) associées au groupe
-      let pages = [];
-      try {
-        pages = await getPagesForSite(site.kuma_group_id);
-        console.log(`[crawler] ${pages.length} pages trouvées pour le groupe ${site.kuma_group_id}`);
-      } catch (err) {
-        console.error(`[crawler] Erreur lors de la récupération des pages pour le site ${site.id}:`, err.message);
-        await markSiteCrawled(site.id);
-        continue;
-      }
-
-      if (pages.length === 0) {
-        console.log(`[crawler] Aucune page à vérifier pour le site ${site.id}.`);
-        await markSiteCrawled(site.id);
-        continue;
-      }
-
-      // Créer un contexte Playwright partagé pour ce site
-      const browser = await chromium.launch({ headless: true });
-      const context = await browser.newContext({
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      });
-
-      for (const pageInfo of pages) {
-        console.log(`[crawler] Vérification de la page : ${pageInfo.url}`);
-        const result = await checkPage(context, pageInfo.url);
-        console.log(`[crawler] Résultat pour ${pageInfo.url} : status=${result.status}, msg=${result.msg}`);
-
-        try {
-          await sendStatusToKuma(pageInfo.pushToken, result.status, result.msg);
-        } catch (err) {
-          console.error(`[crawler] Erreur lors de l'envoi du statut pour ${pageInfo.url}:`, err.message);
-        }
-
-        await new Promise(resolve => setTimeout(resolve, 2000));
-      }
-
-      await browser.close();
-      await markSiteCrawled(site.id);
-      console.log(`[crawler] Fin du traitement du site ${site.id}`);
-    }
-
-    console.log('[crawler] main() terminée avec succès');
-  } catch (err) {
-    console.error('[crawler] Erreur dans main():', err);
-    throw err;
   }
+  
+  return false;
 }
 
-// --- Exécution ---
-console.log('[crawler] Appel de main()');
-main().catch((err) => {
-  console.error('[crawler] Erreur non catchée dans main:', err);
-  process.exit(1);
-});
-console.log('[crawler] main() appelée (asynchrone)');
+// Fonction utilitaire pour compter les éléments dans une réponse JSON
+function countDataItems(json) {
+  if (!json) return 0;
+  if (Array.isArray(json)) return json.length;
+  if (json.data && Array.isArray(json.data)) return json.data.length;
+  if (json.items && Array.isArray(json.items)) return json.items.length;
+  if (json.results && Array.isArray(json.results)) return json.results.length;
+  if (json.products && Array.isArray(json.products)) return json.products.length;
+  return 0;
+}
