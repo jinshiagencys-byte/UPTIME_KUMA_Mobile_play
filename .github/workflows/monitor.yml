@@ -14,7 +14,7 @@ jobs:
       - name: Récupérer les sites actifs
         id: get-sites
         run: |
-          # Adaptez selon la structure de votre API
+          # Adaptez la structure selon votre API
           SITES=$(curl -s https://kuma-relay.up.railway.app/active-sites | jq -c '[.sites[] | {id: .id, url: .site_url}]')
           echo "sites=$SITES" >> "$GITHUB_OUTPUT"
 
@@ -23,6 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
+      max-parallel: 1   # ← FIX : un site à la fois pour éviter le rate limit
       matrix:
         site: ${{ fromJson(needs.fetch-sites.outputs.sites) }}
 
@@ -47,11 +48,8 @@ jobs:
           ~/.npm-global/bin/openclaw config set gateway.mode "local"
           ~/.npm-global/bin/openclaw config set gateway.auth.token "ci-test-token-12345"
           ~/.npm-global/bin/openclaw config set agents.defaults.model.primary "mistral/mistral-small-latest"
-          # Fallback optionnel (si OpenClaw supporte)
-          # ~/.npm-global/bin/openclaw config set agents.defaults.model.fallback "openrouter/openrouter/fusion"
         env:
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
 
       - name: Démarrer le Gateway
         run: |
@@ -60,7 +58,6 @@ jobs:
           ~/.npm-global/bin/openclaw gateway status || true
         env:
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
 
       - name: Générer la tâche (prompt générique)
         run: |
@@ -73,35 +70,69 @@ jobs:
           5. Termine par un verdict clair : UP ou DOWN, avec la liste des actions testées et leur résultat.
           EOF
 
-      - name: Lancer OpenClaw
+      - name: Lancer OpenClaw (avec retry en cas de 429)
         id: agent_run
         run: |
-          ~/.npm-global/bin/openclaw agent \
-            --session-key "ci:${{ matrix.site.id }}" \
-            --message-file task.md \
-            --json > output.json 2>&1
-          if [ $? -ne 0 ]; then
+          set +e
+          MAX_RETRIES=3
+          RETRY_DELAY=30
+          ATTEMPT=0
+          SUCCESS=false
+
+          while [ $ATTEMPT -lt $MAX_RETRIES ]; do
+            ATTEMPT=$((ATTEMPT+1))
+            echo "Tentative $ATTEMPT/$MAX_RETRIES pour ${{ matrix.site.url }}"
+            ~/.npm-global/bin/openclaw agent \
+              --session-key "ci:${{ matrix.site.id }}" \
+              --message-file task.md \
+              --json > output.json 2>&1
+            EXIT_CODE=$?
+
+            # Si la sortie contient "rate limit" ou "429", on réessaie
+            if grep -q "rate limit\|429" output.json 2>/dev/null; then
+              echo "⚠️ Rate limit détecté, nouvelle tentative dans ${RETRY_DELAY}s..."
+              sleep $RETRY_DELAY
+              continue
+            fi
+
+            if [ $EXIT_CODE -eq 0 ]; then
+              SUCCESS=true
+              break
+            else
+              echo "❌ Échec de l'agent (code $EXIT_CODE), on réessaie..."
+              sleep 5
+            fi
+          done
+
+          if [ "$SUCCESS" = true ]; then
+            echo "✅ Agent réussi pour ${{ matrix.site.url }}"
+            echo "agent_failed=false" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Échec final de l'agent pour ${{ matrix.site.url }}"
             echo "agent_failed=true" >> $GITHUB_OUTPUT
+            # On garde le dernier output.json pour analyse
           fi
+
         env:
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           OPENCLAW_GATEWAY_TOKEN: "ci-test-token-12345"
 
       - name: Extraire et envoyer le résultat au Relay
         if: always()
         run: |
-          # Vérifier si output.json existe
+          # Si l'agent a échoué ou output.json est absent
           if [ ! -f output.json ]; then
             STATUS="ERROR"
             REASON="Agent did not produce output.json"
           elif [ "${{ steps.agent_run.outputs.agent_failed }}" == "true" ]; then
             STATUS="ERROR"
-            REASON="Agent execution failed"
+            REASON="Agent execution failed after retries"
           else
+            # Extraire le statut (structure à valider)
             STATUS=$(jq -r '.result.payloads[0].status // "UNKNOWN"' output.json)
             REASON=$(jq -r '.result.payloads[0].text' output.json | head -c 300)
           fi
+
           # Envoyer au relay
           curl -X POST "https://kuma-relay.up.railway.app/sites/${{ matrix.site.id }}/report" \
             -H "x-relay-secret: ${{ secrets.RELAY_SECRET }}" \
