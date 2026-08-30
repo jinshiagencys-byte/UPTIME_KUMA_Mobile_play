@@ -1,12 +1,9 @@
 name: OpenClaw - Test Autonome sur usinformatique.com
-
 on:
   workflow_dispatch:
-
 jobs:
   autonomous-test:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout du code
         uses: actions/checkout@v4
@@ -17,9 +14,16 @@ jobs:
 
       - name: Installer OpenClaw (via script officiel)
         run: |
-          curl -fsSL https://openclaw.ai | bash
+          curl -fsSL https://openclaw.ai/install.sh | bash
           echo "$HOME/.npm-global/bin" >> $GITHUB_PATH
           ~/.npm-global/bin/openclaw --version
+
+      - name: Configurer OpenClaw avec OpenRouter
+        run: |
+          # Le modèle se règle en une seule clé "provider/model"
+          ~/.npm-global/bin/openclaw config set agents.defaults.model.primary "openrouter/free"
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
 
       - name: Lancer OpenClaw en mode autonome
         run: |
@@ -29,8 +33,6 @@ jobs:
             --output json
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          OPENCLAW_AGENTS_DEFAULTS_MODEL_PROVIDER: "openrouter"
-          OPENCLAW_AGENTS_DEFAULTS_MODEL_PRIMARY: "openrouter/free"
 
       - name: Upload des captures (si OpenClaw en a pris)
         if: always()
