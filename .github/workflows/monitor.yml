@@ -1,10 +1,10 @@
-name: Test OpenClaw sur usinformatique.com
+name: Test IA sur usinformatique.com
 
 on:
-  workflow_dispatch:  # Déclenchement manuel
+  workflow_dispatch:
 
 jobs:
-  test-with-openclaw:
+  test:
     runs-on: ubuntu-latest
 
     steps:
@@ -16,28 +16,10 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Installer Playwright
+      - name: Installer les dépendances
         run: |
           npm install
           npx playwright install --with-deps chromium
-
-      - name: Installer OpenClaw (via script officiel)
-        run: |
-          curl -fsSL https://openclaw.ai/install.sh | bash
-          # Ajouter le répertoire d'installation au PATH pour les étapes suivantes
-          echo "$HOME/.openclaw/bin" >> $GITHUB_PATH
-          # Vérification
-          ~/.openclaw/bin/openclaw --version || echo "OpenClaw installé"
-
-      - name: Configurer OpenClaw avec OpenRouter
-        run: |
-          # Définir la clé API comme variable d'environnement pour OpenClaw
-          export OPENROUTER_API_KEY=${{ secrets.OPENROUTER_API_KEY }}
-          # Configurer OpenClaw pour utiliser OpenRouter
-          ~/.openclaw/bin/openclaw config --set provider=openrouter
-          ~/.openclaw/bin/openclaw config --set model=openrouter/free
-        env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
 
       - name: Lancer le test sur usinformatique.com
         run: |
@@ -54,26 +36,16 @@ jobs:
               await browser.close();
 
               if (result.status === 'down') {
-                console.error('❌ Site déclaré DOWN par OpenClaw');
+                console.error('❌ Site déclaré DOWN par l\'IA');
                 process.exit(1);
               } else {
-                console.log('✅ Site déclaré UP par OpenClaw');
+                console.log('✅ Site déclaré UP par l\'IA');
                 process.exit(0);
               }
             })();
           "
         env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           ENABLE_USER_FLOW: 'true'
           MAX_CLICKS: 5
           API_WAIT_TIMEOUT_MS: 30000
-          # OpenClaw a besoin de la clé OpenRouter (aussi passée via env)
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-
-      - name: Upload des preuves (si échec)
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: screenshots-and-logs
-          path: |
-            ./screenshots/
-            ./logs/
