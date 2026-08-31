@@ -54,6 +54,20 @@ jobs:
               "auth": {
                 "token": "ci-test-token-12345"
               }
+            },
+            "models": {
+              "providers": {
+                "mistral": {
+                  "models": [
+                    { "id": "mistral-small-latest", "name": "mistral-small-latest" }
+                  ]
+                },
+                "google": {
+                  "models": [
+                    { "id": "gemini-2.5-flash", "name": "gemini-2.5-flash" }
+                  ]
+                }
+              }
             }
           }
           EOF
@@ -67,14 +81,14 @@ jobs:
           # Enregistrer les clés API dans le auth store d'OpenClaw : les
           # variables d'env seules ne sont PAS reprises automatiquement par
           # tous les providers (vu en CI : "No API key found for provider").
-          printf "%s\n" "$MISTRAL_API_KEY" | ~/.npm-global/bin/openclaw models auth paste-api-key --provider mistral 2>/dev/null || true
-          printf "%s\n" "$GOOGLE_API_KEY" | ~/.npm-global/bin/openclaw models auth paste-api-key --provider google 2>/dev/null || true
+          printf "%s\n" "$MISTRAL_API_KEY" | ~/.npm-global/bin/openclaw models auth paste-api-key --provider mistral || echo "⚠️ Échec enregistrement clé Mistral"
+          printf "%s\n" "$GOOGLE_API_KEY" | ~/.npm-global/bin/openclaw models auth paste-api-key --provider google || echo "⚠️ Échec enregistrement clé Google"
 
           # Utiliser `models set` (et non `config set agents.defaults.model`) :
           # cette commande configure aussi le runtime associé au modèle, ce qui
           # évite que le Gateway retombe sur son défaut openai/* nécessitant
           # le plugin "codex" (non installé/non authentifié ici).
-          ~/.npm-global/bin/openclaw models set mistral/mistral-small-latest 2>/dev/null || true
+          ~/.npm-global/bin/openclaw models set mistral/mistral-small-latest || true
         env:
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
@@ -95,23 +109,19 @@ jobs:
         run: |
           set +e
 
-          # Fonction pour démarrer le Gateway avec vérification
+          # Fonction pour démarrer le Gateway avec vérification.
+          # Appelée UNE SEULE FOIS pour tout le job : changer de modèle entre
+          # tentatives ne nécessite pas de redémarrage ("Change will apply
+          # without restarting the gateway"), et le check de statut par grep
+          # s'est révélé peu fiable (faux "not running" alors que le process
+          # tournait), provoquant des conflits "already owns this state
+          # directory". On ne redémarre donc plus qu'en tout dernier recours,
+          # si l'agent ne peut vraiment plus joindre le Gateway.
           start_gateway() {
             echo "🔧 Démarrage du Gateway..."
-            # `openclaw gateway stop` libère proprement le verrou du state
-            # directory ; un simple pkill peut laisser le process zombie et
-            # provoquer "Another gateway already owns this state directory"
             ~/.npm-global/bin/openclaw gateway stop 2>/dev/null || true
             pkill -f "openclaw gateway" || true
-            for i in $(seq 1 10); do
-              if ~/.npm-global/bin/openclaw gateway status 2>&1 | grep -qi "not running\|stopped"; then
-                break
-              fi
-              sleep 1
-            done
-            sleep 2
-            # Re-vérifier le consentement des plugins à chaque (re)démarrage,
-            # au cas où un restart du Gateway réinitialise l'état
+            sleep 3
             ~/.npm-global/bin/openclaw plugins enable mistral --accept-capabilities 2>/dev/null || true
             nohup ~/.npm-global/bin/openclaw gateway --force --port 18789 --allow-unconfigured > gateway.log 2>&1 &
             echo "⏳ Attente du Gateway (30s)..."
@@ -126,14 +136,15 @@ jobs:
             fi
           }
 
-          # Fonction pour exécuter l'agent avec un modèle donné
+          # Fonction pour exécuter l'agent avec un modèle donné.
+          # Ne touche jamais au Gateway — seulement au modèle par défaut.
           run_agent() {
             local model=$1
             local session_suffix=$2
             echo "======================================"
             echo "Test avec $model pour ${{ matrix.site.url }}"
             echo "======================================"
-            ~/.npm-global/bin/openclaw models set "$model" 2>/dev/null || true
+            ~/.npm-global/bin/openclaw models set "$model" || true
             ~/.npm-global/bin/openclaw agent \
               --session-key "ci:${{ matrix.site.id }}-$session_suffix" \
               --message-file task.md \
@@ -141,49 +152,57 @@ jobs:
             cat output.json
           }
 
-          # Démarrer le Gateway une première fois
+          is_success() {
+            grep -q '"status":"ok"' "$1" || grep -q '"status":"UP"' "$1" || grep -qi '"UP"' "$1"
+          }
+
+          # Le Gateway ne meurt vraiment que si le message d'erreur le confirme
+          # explicitement (ECONNREFUSED / gateway not reachable) — pas sur un
+          # simple échec applicatif (mauvais modèle, clé manquante, etc.)
+          gateway_actually_down() {
+            grep -qi "ECONNREFUSED\|gateway not reachable\|gateway may still be running" "$1"
+          }
+
+          # Démarrage unique du Gateway pour tout le job
           start_gateway || true
 
           # Essai 1 : Mistral
           run_agent "mistral/mistral-small-latest" "mistral1"
 
-          # Vérifier le succès
-          if grep -q '"status":"ok"' output.json || grep -q '"status":"UP"' output.json || grep -qi "up" output.json; then
+          if is_success output.json; then
             echo "✅ Succès avec Mistral"
             echo "agent_failed=false" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          # Si rate limit, attendre et réessayer
-          if grep -q "rate limit" output.json; then
+          # Si le Gateway est vraiment injoignable, un seul redémarrage puis nouvel essai Mistral
+          if gateway_actually_down output.json; then
+            echo "🔄 Gateway injoignable, redémarrage..."
+            start_gateway || true
+            run_agent "mistral/mistral-small-latest" "mistral2"
+            if is_success output.json; then
+              echo "✅ Succès avec Mistral (2e tentative)"
+              echo "agent_failed=false" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+          elif grep -q "rate limit" output.json; then
             echo "⚠️ Rate limit détecté, nouvelle tentative dans 30s..."
             sleep 30
-            # Vérifier que le Gateway est toujours là
-            if ! ~/.npm-global/bin/openclaw gateway status 2>&1 | grep -q "running"; then
-              echo "🔄 Gateway mort, redémarrage..."
-              start_gateway || true
-            fi
             run_agent "mistral/mistral-small-latest" "mistral2"
-            if grep -q '"status":"ok"' output.json || grep -q '"status":"UP"' output.json || grep -qi "up" output.json; then
+            if is_success output.json; then
               echo "✅ Succès avec Mistral (2e tentative)"
               echo "agent_failed=false" >> $GITHUB_OUTPUT
               exit 0
             fi
           fi
 
-          # Si le Gateway est mort, on le redémarre
-          if ! ~/.npm-global/bin/openclaw gateway status 2>&1 | grep -q "running"; then
-            echo "🔄 Gateway mort, redémarrage pour le fallback..."
-            start_gateway || true
-          fi
-
-          # Fallback : Google Gemini
+          # Fallback : Google Gemini (même Gateway, juste un changement de modèle)
           echo "======================================"
           echo "🔁 Fallback sur Google Gemini"
           echo "======================================"
           run_agent "google/gemini-2.5-flash" "gemini1"
 
-          if grep -q '"status":"ok"' output.json || grep -q '"status":"UP"' output.json || grep -qi "up" output.json; then
+          if is_success output.json; then
             echo "✅ Succès avec Google Gemini"
             echo "agent_failed=false" >> $GITHUB_OUTPUT
           else
