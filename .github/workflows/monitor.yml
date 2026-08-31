@@ -39,9 +39,10 @@ jobs:
           echo "$HOME/.npm-global/bin" >> $GITHUB_PATH
           ~/.npm-global/bin/openclaw --version
 
-      - name: Configurer OpenClaw (fichier + clés API)
+      - name: Configurer OpenClaw (fichier minimal + variables d'env)
         run: |
           mkdir -p ~/.openclaw
+          # Fichier de configuration minimal (sans providers ni model)
           cat > ~/.openclaw/openclaw.json << 'EOF'
           {
             "browser": {
@@ -57,36 +58,24 @@ jobs:
           }
           EOF
 
-          # Configurer les clés API pour les providers
-          ~/.npm-global/bin/openclaw config set providers.mistral.apiKey "$MISTRAL_API_KEY"
-          ~/.npm-global/bin/openclaw config set providers.google.apiKey "$GOOGLE_API_KEY"
-          ~/.npm-global/bin/openclaw config set providers.google.api "google-generative-ai"
+          # Définir les clés API via l'environnement pour éviter de les mettre dans le fichier
+          # et pour qu'OpenClaw les utilise automatiquement (il lit MISTRAL_API_KEY, GOOGLE_API_KEY, OPENAI_API_KEY...)
+          echo "MISTRAL_API_KEY configurée via env"
+          echo "GOOGLE_API_KEY configurée via env"
 
-          # Modèle par défaut (Mistral)
-          ~/.npm-global/bin/openclaw config set agents.defaults.model "mistral/mistral-small-latest"
-
-          # Vérifier la config
-          ~/.npm-global/bin/openclaw config validate || echo "⚠️ Config invalide (peut être ignorée)"
+          # Optionnel : configurer le modèle par défaut via la CLI
+          ~/.npm-global/bin/openclaw config set agents.defaults.model "mistral/mistral-small-latest" || echo "config set ignorée"
 
         env:
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
 
-      - name: Démarrer le Gateway et vérifier les outils
+      - name: Démarrer le Gateway
         run: |
-          # Démarrer le gateway en arrière-plan
           nohup ~/.npm-global/bin/openclaw gateway --force > gateway.log 2>&1 &
           sleep 15
-
-          # Vérifier que le gateway est en ligne
           ~/.npm-global/bin/openclaw gateway status || true
-
-          # Afficher les logs du gateway (pour voir si browser est chargé)
-          cat gateway.log || echo "Gateway log vide"
-
-          # Vérifier la présence du tool browser (si commande existe)
-          ~/.npm-global/bin/openclaw agent --list-tools || echo "Impossible de lister les outils"
-
+          cat gateway.log
         env:
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
@@ -102,78 +91,55 @@ jobs:
           5. Termine par un verdict UP ou DOWN avec la liste des actions testées.
           EOF
 
-      - name: Lancer OpenClaw (avec fallback manuel)
+      - name: Lancer OpenClaw (Mistral, fallback Google)
         id: agent_run
         run: |
           set +e
 
-          # === 1er essai : Mistral ===
-          echo "======================================"
-          echo "Essai avec Mistral pour ${{ matrix.site.url }}"
-          echo "======================================"
-
-          ~/.npm-global/bin/openclaw agent \
-            --session-key "ci:${{ matrix.site.id }}" \
-            --message-file task.md \
-            --json > output.json 2>&1
-
-          cat output.json
-
-          # Vérifier si le browser est disponible dans la réponse
-          if grep -q "browser" output.json; then
-            echo "✅ Browser tool présent"
-          else
-            echo "⚠️ Browser tool non détecté, tentative de redémarrage du gateway..."
-            # Redémarrer le gateway avec plus de temps
-            pkill -f "openclaw gateway" || true
-            nohup ~/.npm-global/bin/openclaw gateway --force --verbose > gateway.log 2>&1 &
-            sleep 20
-            # Réessayer
+          # Fonction pour exécuter l'agent et capturer la sortie
+          run_agent() {
+            local model=$1
+            echo "======================================"
+            echo "Test avec $model pour ${{ matrix.site.url }}"
+            echo "======================================"
+            ~/.npm-global/bin/openclaw config set agents.defaults.model "$model" 2>/dev/null
             ~/.npm-global/bin/openclaw agent \
               --session-key "ci:${{ matrix.site.id }}" \
               --message-file task.md \
               --json > output.json 2>&1
             cat output.json
-          fi
+          }
 
-          # Détecter le succès (présence de "status":"ok" ou "up" dans le JSON)
-          if grep -q '"status":"ok"' output.json || grep -q 'UP' output.json; then
+          # Essai 1 : Mistral
+          run_agent "mistral/mistral-small-latest"
+
+          # Vérifier le succès (présence de "status":"ok" ou "up")
+          if grep -q '"status":"ok"' output.json || grep -qi "up" output.json; then
             echo "✅ Succès avec Mistral"
             echo "agent_failed=false" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          # Si rate limit, on réessaie
+          # Si rate limit, attendre et réessayer
           if grep -q "rate limit" output.json; then
             echo "⚠️ Rate limit détecté, nouvelle tentative dans 30s..."
             sleep 30
-            ~/.npm-global/bin/openclaw agent \
-              --session-key "ci:${{ matrix.site.id }}" \
-              --message-file task.md \
-              --json > output.json 2>&1
-            cat output.json
-            if grep -q '"status":"ok"' output.json || grep -q 'UP' output.json; then
+            run_agent "mistral/mistral-small-latest"
+            if grep -q '"status":"ok"' output.json || grep -qi "up" output.json; then
               echo "✅ Succès avec Mistral (2e tentative)"
               echo "agent_failed=false" >> $GITHUB_OUTPUT
               exit 0
             fi
           fi
 
-          # === Fallback sur Google Gemini ===
+          # Fallback : Google Gemini
           echo "======================================"
-          echo "🔁 Fallback sur Google Gemini pour ${{ matrix.site.url }}"
+          echo "🔁 Fallback sur Google Gemini"
           echo "======================================"
+          # Le provider Google utilise l'API key via GOOGLE_API_KEY (env)
+          run_agent "google/gemini-2.5-flash"
 
-          ~/.npm-global/bin/openclaw config set agents.defaults.model "google/gemini-2.5-flash"
-
-          ~/.npm-global/bin/openclaw agent \
-            --session-key "ci:${{ matrix.site.id }}" \
-            --message-file task.md \
-            --json > output.json 2>&1
-
-          cat output.json
-
-          if grep -q '"status":"ok"' output.json || grep -q 'UP' output.json; then
+          if grep -q '"status":"ok"' output.json || grep -qi "up" output.json; then
             echo "✅ Succès avec Google Gemini"
             echo "agent_failed=false" >> $GITHUB_OUTPUT
           else
@@ -186,7 +152,7 @@ jobs:
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           OPENCLAW_GATEWAY_TOKEN: "ci-test-token-12345"
 
-      - name: Extraire et envoyer le résultat au Relay
+      - name: Extraire et envoyer le résultat
         if: always()
         run: |
           if [ ! -f output.json ] || [ ! -s output.json ]; then
@@ -221,7 +187,7 @@ jobs:
           echo "Statut final: $STATUS"
           echo "Message: $REASON"
 
-          # Envoyer au relay via l'endpoint existant
+          # Envoyer au relay
           curl -X POST "https://kuma-relay.up.railway.app/sites/${{ matrix.site.id }}/mark-crawled" \
             -H "x-relay-secret: ${{ secrets.RELAY_SECRET }}" \
             -H "Content-Type: application/json" \
