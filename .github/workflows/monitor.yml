@@ -39,9 +39,10 @@ jobs:
           echo "$HOME/.npm-global/bin" >> $GITHUB_PATH
           ~/.npm-global/bin/openclaw --version
 
-      - name: Créer le fichier de configuration OpenClaw (structure valide)
+      - name: Générer une configuration OpenClaw valide
         run: |
           mkdir -p ~/.openclaw
+          # On utilise la configuration minimale valide
           cat > ~/.openclaw/openclaw.json << 'EOF'
           {
             "browser": {
@@ -53,21 +54,13 @@ jobs:
               "google": {
                 "api": "google-generative-ai"
               }
-            },
-            "agents": {
-              "defaults": {
-                "model": "mistral/mistral-small-latest"
-              }
-            },
-            "gateway": {
-              "auth": {
-                "token": "ci-test-token-12345"
-              }
             }
           }
           EOF
-          # Valider la config
-          ~/.npm-global/bin/openclaw config validate || echo "Config invalide, mais on continue"
+          echo "Contenu du fichier de configuration :"
+          cat ~/.openclaw/openclaw.json
+          echo "Validation :"
+          ~/.npm-global/bin/openclaw config validate || echo "Validation échouée, on continue"
 
       - name: Démarrer le Gateway
         run: |
@@ -102,12 +95,19 @@ jobs:
             --session-key "ci:${{ matrix.site.id }}" \
             --message-file task.md \
             --json > output.json 2>&1
+
+          # Afficher le contenu de output.json pour debug
+          echo "Contenu de output.json :"
           cat output.json
 
-          if [ $? -eq 0 ]; then
+          if grep -q "rate limit\|429" output.json; then
+            echo "⚠️ Rate limit détecté (Mistral), on va réessayer plus tard"
+          elif grep -q "success\|UP\|DOWN" output.json; then
             echo "✅ Succès avec Mistral"
             echo "agent_failed=false" >> $GITHUB_OUTPUT
             exit 0
+          else
+            echo "❌ Échec Mistral, on passe au fallback"
           fi
 
           # === 2e essai : Mistral (rate limit temporaire) ===
@@ -119,9 +119,11 @@ jobs:
             --session-key "ci:${{ matrix.site.id }}" \
             --message-file task.md \
             --json > output.json 2>&1
+
+          echo "Contenu de output.json :"
           cat output.json
 
-          if [ $? -eq 0 ]; then
+          if grep -q "success\|UP\|DOWN" output.json; then
             echo "✅ Succès avec Mistral (2e tentative)"
             echo "agent_failed=false" >> $GITHUB_OUTPUT
             exit 0
@@ -132,16 +134,18 @@ jobs:
           echo "🔁 Fallback forcé sur Google Gemini pour ${{ matrix.site.url }}"
           echo "======================================"
 
-          # Changer le modèle primaire
-          ~/.npm-global/bin/openclaw config set agents.defaults.model "google/gemini-2.5-flash"
+          # Changer le modèle primaire (si cette commande est supportée)
+          ~/.npm-global/bin/openclaw config set agents.defaults.model "google/gemini-2.5-flash" || echo "Impossible de changer le modèle, on continue"
 
           ~/.npm-global/bin/openclaw agent \
             --session-key "ci:${{ matrix.site.id }}" \
             --message-file task.md \
             --json > output.json 2>&1
+
+          echo "Contenu de output.json :"
           cat output.json
 
-          if [ $? -eq 0 ]; then
+          if grep -q "success\|UP\|DOWN" output.json; then
             echo "✅ Succès avec Google Gemini"
             echo "agent_failed=false" >> $GITHUB_OUTPUT
           else
@@ -164,12 +168,21 @@ jobs:
             STATUS="ERROR"
             REASON="Agent execution failed after all attempts"
           else
-            STATUS=$(jq -r '.result.payloads[0].status // "UNKNOWN"' output.json)
-            REASON=$(jq -r '.result.payloads[0].text' output.json | head -c 300)
+            # Utiliser grep pour extraire le statut (moins fragile que jq)
+            if grep -q '"status": "UP"' output.json; then
+              STATUS="UP"
+            elif grep -q '"status": "DOWN"' output.json; then
+              STATUS="DOWN"
+            else
+              STATUS="UNKNOWN"
+            fi
+            # Récupérer le message de 200 caractères
+            REASON=$(grep -o '"text": "[^"]*"' output.json | head -1 | cut -d'"' -f4 | head -c 300)
+            if [ -z "$REASON" ]; then
+              REASON="No text found in output"
+            fi
           fi
 
-          # Utiliser l'endpoint existant /mark-crawled ou créer /report
-          # On envoie avec un body contenant le statut
           curl -X POST "https://kuma-relay.up.railway.app/sites/${{ matrix.site.id }}/mark-crawled" \
             -H "x-relay-secret: ${{ secrets.RELAY_SECRET }}" \
             -H "Content-Type: application/json" \
