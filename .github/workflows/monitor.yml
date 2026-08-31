@@ -31,39 +31,19 @@ jobs:
         site: ${{ fromJson(needs.fetch-sites.outputs.sites) }}
 
     steps:
-
-      # ============================================================
-      # CHECKOUT
-      # ============================================================
-
       - name: Checkout du code
         uses: actions/checkout@v4
 
-      # ============================================================
-      # PLAYWRIGHT
-      # ============================================================
-
       - name: Installer Playwright
-        run: |
-          npx playwright install --with-deps chromium
-
-      # ============================================================
-      # OPENCLAW
-      # ============================================================
+        run: npx playwright install --with-deps chromium
 
       - name: Installer OpenClaw
         run: |
           curl -fsSL https://openclaw.ai/install.sh | bash
-
           echo "$HOME/.npm-global/bin" >> "$GITHUB_PATH"
-
           ~/.npm-global/bin/openclaw --version
 
-      # ============================================================
-      # CONFIGURATION OPENCLAW + OPENROUTER
-      # ============================================================
-
-      - name: Configurer OpenClaw
+      - name: Configurer OpenClaw (fichier minimal)
         run: |
           mkdir -p ~/.openclaw
 
@@ -74,30 +54,26 @@ jobs:
               "headless": true,
               "noSandbox": true
             },
-
             "gateway": {
               "mode": "local",
               "auth": {
                 "token": "ci-test-token-12345"
               }
             },
-
             "models": {
               "providers": {
                 "openrouter": {
                   "api": "openai-completions",
-                  "baseUrl": "https://openrouter.ai/api/v1"
-                }
-              }
-            },
-
-            "agents": {
-              "defaults": {
-                "model": {
-                  "primary": "openrouter/free",
-                  "fallbacks": [
-                    "openrouter/minimax/minimax-m3:free",
-                    "openrouter/z-ai/glm-5.2:free"
+                  "baseUrl": "https://openrouter.ai/api/v1",
+                  "models": [
+                    {
+                      "id": "minimax/minimax-m3:free",
+                      "name": "minimax/minimax-m3:free"
+                    },
+                    {
+                      "id": "z-ai/glm-5.2:free",
+                      "name": "z-ai/glm-5.2:free"
+                    }
                   ]
                 }
               }
@@ -106,7 +82,7 @@ jobs:
           EOF
 
           echo "======================================"
-          echo "Configuration OpenClaw"
+          echo "Configuration OpenClaw / OpenRouter"
           echo "======================================"
 
           cat ~/.openclaw/openclaw.json
@@ -117,83 +93,42 @@ jobs:
 
           printf "%s\n" "$OPENROUTER_API_KEY" | \
             ~/.npm-global/bin/openclaw models auth paste-api-key \
-            --provider openrouter || {
-              echo "⚠️ Impossible d'enregistrer la clé OpenRouter"
-              exit 1
-            }
+            --provider openrouter || \
+            echo "⚠️ Échec enregistrement clé OpenRouter"
 
           echo "======================================"
           echo "Configuration du modèle principal"
           echo "======================================"
 
-          ~/.npm-global/bin/openclaw models set openrouter/free
-
-          echo "======================================"
-          echo "Modèles configurés"
-          echo "======================================"
-
-          ~/.npm-global/bin/openclaw models status || true
+          ~/.npm-global/bin/openclaw models set \
+            openrouter/minimax/minimax-m3:free || true
 
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-
-      # ============================================================
-      # GENERATION DE LA TACHE
-      # ============================================================
 
       - name: Générer la tâche
         run: |
           cat > task.md << 'EOF'
           Va sur ${{ matrix.site.url }} avec l'outil browser.
 
-          Tu dois effectuer un monitoring autonome du site comme un humain.
+          1. Explore le site comme un humain : scroll, observe la structure.
 
-          1. Ouvre le site.
+          2. Identifie toi-même les 2 ou 3 actions les plus importantes de ce site.
 
-          2. Explore le site :
-             - observe la structure ;
-             - fais défiler la page ;
-             - identifie les éléments importants ;
-             - vérifie que les éléments visibles fonctionnent.
+          3. Teste chacune de ces actions et vérifie le résultat attendu.
 
-          3. Identifie toi-même les 2 ou 3 actions les plus importantes
-             de ce site.
+          4. Si une action t'amène sur une NOUVELLE URL (navigation, clic sur un
+             lien, soumission de formulaire, etc.), traite cette URL comme une
+             page à part entière à surveiller : note son statut individuellement,
+             pas seulement l'action qui y a mené.
 
-          Exemples :
-             - navigation vers une page importante ;
-             - clic sur un bouton ;
-             - recherche ;
-             - ouverture d'un menu ;
-             - soumission d'un formulaire ;
-             - accès à une page de contact ;
-             - accès à une page produit/service.
+          5. Si erreur JS, page blanche, ou action qui ne fait rien, prends une
+             capture d'écran et note-le.
 
-          4. Teste chacune de ces actions et vérifie le résultat attendu.
-
-          5. Si une action entraîne une NOUVELLE URL :
-             - considère cette URL comme une page indépendante ;
-             - vérifie son fonctionnement ;
-             - note son statut individuellement.
-
-          6. Si tu observes :
-             - erreur JavaScript ;
-             - page blanche ;
-             - bouton qui ne fonctionne pas ;
-             - navigation bloquée ;
-             - contenu qui ne charge pas ;
-             - erreur HTTP ;
-             - formulaire qui ne fonctionne pas ;
-
-             alors prends une capture d'écran si l'outil browser le permet
-             et note précisément le problème.
-
-          7. Ne considère pas automatiquement le site comme DOWN simplement
-             parce qu'une fonctionnalité particulière échoue.
-
-          8. À la fin, donne un verdict clair en langage naturel.
-
-          9. Puis termine IMPÉRATIVEMENT ta réponse par un unique bloc
-             JSON respectant exactement cette structure :
+          6. Termine ta réponse par TON VERDICT EN LANGAGE NATUREL COMME AVANT,
+             puis ajoute IMPÉRATIVEMENT à la toute fin, dans un bloc de code
+             ```json, un objet structuré au format EXACT suivant (rien d'autre
+             dans ce bloc, pas de commentaire) :
 
           ```json
           {
@@ -209,43 +144,41 @@ jobs:
           }
           ```
 
-          RÈGLES DU JSON :
+          - "overall_status" et chaque "status" de page valent uniquement
+            "UP" ou "DOWN" (majuscules, rien d'autre).
 
-          - "overall_status" vaut uniquement "UP" ou "DOWN".
-          - "status" vaut uniquement "UP" ou "DOWN".
-          - "pages" doit contenir l'URL de départ.
-          - "pages" doit également contenir chaque URL distincte atteinte.
-          - Inclus également les URLs ayant retourné une erreur.
-          - "http_code" doit être le code HTTP observé si disponible.
-          - Si le code HTTP n'est pas déterminable, utilise null.
-          - "note" doit être courte et descriptive.
-          - Ne mets aucun commentaire dans le JSON.
-          - Le bloc JSON doit être le DERNIER élément de ta réponse.
+          - Inclus une entrée "pages" pour l'URL de départ ET pour chaque
+            URL distincte atteinte pendant l'exploration (y compris les
+            404 ou erreurs).
+
+          - "http_code" est le code HTTP observé si tu as pu le déterminer,
+            sinon null.
           EOF
 
-      # ============================================================
-      # GATEWAY
-      # ============================================================
-
-      - name: Lancer OpenClaw avec Gateway persistent
+      - name: Lancer OpenClaw (avec Gateway persistent)
         id: agent_run
         run: |
           set +e
 
-          echo "======================================"
-          echo "Démarrage du Gateway OpenClaw"
-          echo "======================================"
+          # Liste des modèles OpenRouter gratuits à essayer, dans l'ordre.
+          # Les IDs correspondent aux modèles OpenRouter actuellement
+          # référencés avec le suffixe :free.
+          OPENROUTER_FALLBACK_MODELS=(
+            "openrouter/minimax/minimax-m3:free"
+            "openrouter/z-ai/glm-5.2:free"
+          )
 
+          # Fonction pour démarrer le Gateway avec vérification.
+          # Appelée UNE SEULE FOIS pour tout le job : changer de modèle entre
+          # tentatives ne nécessite pas de redémarrage.
           start_gateway() {
-            echo "🔧 Arrêt d'une éventuelle ancienne instance..."
+            echo "🔧 Démarrage du Gateway..."
 
             ~/.npm-global/bin/openclaw gateway stop 2>/dev/null || true
 
-            pkill -f "openclaw gateway" 2>/dev/null || true
+            pkill -f "openclaw gateway" || true
 
             sleep 3
-
-            echo "🚀 Démarrage du Gateway..."
 
             nohup ~/.npm-global/bin/openclaw gateway \
               --force \
@@ -253,103 +186,228 @@ jobs:
               --allow-unconfigured \
               > gateway.log 2>&1 &
 
-            echo "⏳ Attente du Gateway..."
+            echo "⏳ Attente du Gateway (30s)..."
 
             sleep 30
 
-            if ~/.npm-global/bin/openclaw gateway status 2>&1 | grep -qi "running"; then
+            if ~/.npm-global/bin/openclaw gateway status 2>&1 | grep -q "running"; then
               echo "✅ Gateway opérationnel"
               return 0
+            else
+              echo "❌ Gateway non disponible"
+              cat gateway.log
+              return 1
             fi
-
-            echo "⚠️ Le statut du Gateway n'est pas confirmé."
-
-            echo "===== gateway.log ====="
-            cat gateway.log
-            echo "======================="
-
-            return 1
           }
 
-          start_gateway
-
-          echo "======================================"
-          echo "Modèle principal"
-          echo "======================================"
-
-          ~/.npm-global/bin/openclaw models set openrouter/free
-
-          echo "======================================"
-          echo "Lancement de l'agent"
-          echo "======================================"
-
-          ~/.npm-global/bin/openclaw agent \
-            --session-key "ci:${{ matrix.site.id }}" \
-            --message-file task.md \
-            --json > output.json 2>&1
-
-          AGENT_EXIT=$?
-
-          echo "======================================"
-          echo "Résultat OpenClaw"
-          echo "======================================"
-
-          cat output.json
-
-          if [ $AGENT_EXIT -eq 0 ]; then
-            echo "agent_failed=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "⚠️ OpenClaw a retourné le code $AGENT_EXIT"
-
-            echo "agent_failed=true" >> "$GITHUB_OUTPUT"
-          fi
-
-          # Si le Gateway est explicitement devenu inaccessible,
-          # on effectue une seule nouvelle tentative.
-
-          if grep -qiE \
-            "ECONNREFUSED|gateway not reachable|gateway may still be running" \
-            output.json; then
+          # Fonction pour exécuter l'agent avec un modèle donné.
+          # Ne touche jamais au Gateway — seulement au modèle par défaut.
+          run_agent() {
+            local model=$1
+            local session_suffix=$2
 
             echo "======================================"
-            echo "🔄 Gateway injoignable"
+            echo "Test avec $model pour ${{ matrix.site.url }}"
             echo "======================================"
 
-            start_gateway
-
-            echo "🔁 Nouvelle tentative..."
+            ~/.npm-global/bin/openclaw models set "$model" || true
 
             ~/.npm-global/bin/openclaw agent \
-              --session-key "ci:${{ matrix.site.id }}-retry" \
+              --session-key "ci:${{ matrix.site.id }}-$session_suffix" \
               --message-file task.md \
               --json > output.json 2>&1
 
-            RETRY_EXIT=$?
-
             cat output.json
+          }
 
-            if [ $RETRY_EXIT -eq 0 ]; then
+          is_success() {
+            local status
+
+            status=$(jq -r \
+              '[.. | .status? // empty] |
+               map(select(type == "string")) |
+               first // empty' \
+              "$1" 2>/dev/null)
+
+            echo "$status" | grep -qiE '^(up|ok)$'
+          }
+
+          # Erreur indiquant que le Gateway est réellement inaccessible.
+          gateway_actually_down() {
+            grep -qi \
+              "ECONNREFUSED\|gateway not reachable\|gateway may still be running" \
+              "$1"
+          }
+
+          # Erreur d'authentification OpenRouter.
+          auth_error() {
+            grep -qi \
+              "401\|unauthorized\|authentication\|invalid api key\|no api key" \
+              "$1"
+          }
+
+          # Rate limit / quota.
+          rate_limit() {
+            grep -qi \
+              "429\|rate limit\|too many requests\|quota\|resource exhausted" \
+              "$1"
+          }
+
+          # Modèle indisponible.
+          model_not_found() {
+            grep -qi \
+              "model was not found\|model_not_found\|model.*not.*found\|unknown model" \
+              "$1"
+          }
+
+          # Démarrage unique du Gateway pour tout le job.
+          start_gateway || true
+
+          # ============================================================
+          # ESSAI 1 : MINIMAX M3 FREE
+          # ============================================================
+
+          run_agent \
+            "openrouter/minimax/minimax-m3:free" \
+            "minimax1"
+
+          if is_success output.json; then
+            echo "✅ Succès avec MiniMax M3"
+            echo "agent_failed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # ============================================================
+          # GATEWAY INJOIGNABLE
+          # ============================================================
+
+          if gateway_actually_down output.json; then
+
+            echo "🔄 Gateway injoignable, redémarrage..."
+
+            start_gateway || true
+
+            run_agent \
+              "openrouter/minimax/minimax-m3:free" \
+              "minimax2"
+
+            if is_success output.json; then
+              echo "✅ Succès avec MiniMax M3 (2e tentative)"
               echo "agent_failed=false" >> "$GITHUB_OUTPUT"
-            else
-              echo "agent_failed=true" >> "$GITHUB_OUTPUT"
+              exit 0
             fi
+
+          elif rate_limit output.json; then
+
+            echo "⚠️ Rate limit détecté, nouvelle tentative dans 30s..."
+
+            sleep 30
+
+            run_agent \
+              "openrouter/minimax/minimax-m3:free" \
+              "minimax2"
+
+            if is_success output.json; then
+              echo "✅ Succès avec MiniMax M3 (2e tentative)"
+              echo "agent_failed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          # ============================================================
+          # FALLBACK OPENROUTER
+          # ============================================================
+
+          openrouter_success=false
+          attempt_num=1
+
+          for model in "${OPENROUTER_FALLBACK_MODELS[@]}"; do
+
+            echo "======================================"
+            echo "🔁 Fallback OpenRouter ($attempt_num/${#OPENROUTER_FALLBACK_MODELS[@]})"
+            echo "Modèle : $model"
+            echo "======================================"
+
+            # Le premier modèle a déjà été testé.
+            if [ "$model" = "openrouter/minimax/minimax-m3:free" ] && [ "$attempt_num" -eq 1 ]; then
+              attempt_num=$((attempt_num + 1))
+              continue
+            fi
+
+            run_agent \
+              "$model" \
+              "fallback$attempt_num"
+
+            if is_success output.json; then
+
+              echo "✅ Succès avec $model"
+
+              openrouter_success=true
+
+              break
+
+            fi
+
+            if auth_error output.json; then
+
+              echo "🛑 Erreur d'authentification OpenRouter."
+
+              break
+
+            elif model_not_found output.json; then
+
+              echo "⚠️ $model introuvable côté OpenRouter."
+
+              echo "➡️ Passage au modèle suivant."
+
+            elif rate_limit output.json; then
+
+              echo "⚠️ Rate limit sur $model."
+
+              echo "➡️ Passage au modèle suivant après 15s."
+
+              sleep 15
+
+            elif gateway_actually_down output.json; then
+
+              echo "🔄 Gateway injoignable."
+
+              start_gateway || true
+
+            else
+
+              echo "⚠️ Échec avec $model."
+
+              echo "➡️ Passage au modèle suivant."
+            fi
+
+            attempt_num=$((attempt_num + 1))
+
+            if [ $attempt_num -le ${#OPENROUTER_FALLBACK_MODELS[@]} ]; then
+              sleep 8
+            fi
+
+          done
+
+          if [ "$openrouter_success" = true ]; then
+
+            echo "agent_failed=false" >> "$GITHUB_OUTPUT"
+
+          else
+
+            echo "❌ Échec final : aucun modèle OpenRouter gratuit n'a fonctionné"
+
+            echo "agent_failed=true" >> "$GITHUB_OUTPUT"
+
           fi
 
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           OPENCLAW_GATEWAY_TOKEN: "ci-test-token-12345"
 
-      # ============================================================
-      # EXTRACTION DU RESULTAT
-      # ============================================================
-
       - name: Extraire et envoyer le résultat
         if: always()
         run: |
-
-          echo "======================================"
-          echo "Extraction du résultat"
-          echo "======================================"
 
           if [ ! -f output.json ] || [ ! -s output.json ]; then
 
@@ -359,28 +417,18 @@ jobs:
           elif [ "${{ steps.agent_run.outputs.agent_failed }}" == "true" ]; then
 
             STATUS="ERROR"
-            REASON="Agent execution failed"
+            REASON="Agent execution failed after all attempts"
 
           else
 
-            # ------------------------------------------------------
-            # Récupération du texte final
-            # ------------------------------------------------------
+            # 1) Texte final de l'agent.
+            AGENT_TEXT=$(jq -r \
+              '[.. | .text? // empty] |
+               map(select(type == "string")) |
+               first // ""' \
+              output.json 2>/dev/null)
 
-            AGENT_TEXT=$(jq -r '
-              [.. | .text? // empty]
-              | map(select(type == "string"))
-              | last // ""
-            ' output.json 2>/dev/null)
-
-            echo "===== Texte agent ====="
-            printf '%s\n' "$AGENT_TEXT"
-            echo "======================="
-
-            # ------------------------------------------------------
-            # Extraction du dernier bloc JSON
-            # ------------------------------------------------------
-
+            # 2) Extraire le dernier bloc ```json ... ```
             PAGES_JSON=$(printf '%s' "$AGENT_TEXT" | awk '
               /```json/ {
                 capture=1
@@ -405,71 +453,62 @@ jobs:
               }
             ')
 
-            echo "===== JSON détecté ====="
-            printf '%s\n' "$PAGES_JSON"
-            echo "========================"
+            if echo "$PAGES_JSON" | \
+              jq -e '.overall_status and .pages' \
+              > /dev/null 2>&1; then
 
-            # ------------------------------------------------------
-            # Validation du JSON
-            # ------------------------------------------------------
+              # Structure demandée trouvée.
+              STATUS=$(echo "$PAGES_JSON" | \
+                jq -r '.overall_status // "UNKNOWN"')
 
-            if echo "$PAGES_JSON" | jq -e '
-              (.overall_status == "UP" or .overall_status == "DOWN")
-              and (.pages | type == "array")
-            ' > /dev/null 2>&1; then
-
-              echo "✅ JSON structuré valide"
-
-              STATUS=$(echo "$PAGES_JSON" | jq -r '.overall_status')
-
-              REASON=$(echo "$PAGES_JSON" | jq -c '.pages')
+              REASON=$(echo "$PAGES_JSON" | \
+                jq -c '.pages')
 
               echo "$PAGES_JSON" > pages.json
 
-              PAGE_COUNT=$(echo "$PAGES_JSON" | jq '.pages | length')
+              echo "📄 $(echo "$PAGES_JSON" | \
+                jq '.pages | length') page(s) rapportée(s) :"
 
-              echo "📄 $PAGE_COUNT page(s) rapportée(s)"
-
-              echo "$PAGES_JSON" | jq -r '
-                .pages[]
-                | "  - \(.url) → \(.status) (http=\(.http_code // "n/a")) : \(.note // "")"
-              '
+              echo "$PAGES_JSON" | \
+                jq -r \
+                '.pages[] |
+                "  - \(.url) → \(.status) (http=\(.http_code // "n/a")) : \(.note // "")"'
 
             else
 
-              echo "⚠️ JSON structuré introuvable ou invalide"
+              # Repli si le bloc JSON n'est pas présent.
+              echo "⚠️ Bloc JSON structuré introuvable"
 
-              # ----------------------------------------------------
-              # Fallback extraction
-              # ----------------------------------------------------
+              STATUS=$(jq -r \
+                '[.. | .status? // empty] |
+                 map(select(type == "string")) |
+                 first // "UNKNOWN"' \
+                output.json 2>/dev/null)
 
-              STATUS=$(jq -r '
-                [.. | .status? // empty]
-                | map(select(type == "string"))
-                | map(ascii_upcase)
-                | map(select(. == "UP" or . == "DOWN"))
-                | first // "UNKNOWN"
-              ' output.json 2>/dev/null)
+              REASON=$(jq -r \
+                '[.. | .text? // empty] |
+                 map(select(type == "string")) |
+                 first // ""' \
+                output.json 2>/dev/null |
+                head -c 300)
 
-              REASON=$(jq -r '
-                [.. | .text? // empty]
-                | map(select(type == "string"))
-                | last // ""
-              ' output.json 2>/dev/null | head -c 500)
+              if [ -z "$STATUS" ] || [ "$STATUS" == "null" ]; then
 
-              if [ "$STATUS" == "UNKNOWN" ]; then
+                if grep -qi "up" output.json; then
 
-                if grep -qi "UP" output.json; then
                   STATUS="UP"
-                  REASON="Site appears operational"
+                  REASON="Site appears operational (extracted from text)"
 
-                elif grep -qi "DOWN" output.json; then
+                elif grep -qi "down" output.json; then
+
                   STATUS="DOWN"
-                  REASON="Site appears unavailable"
+                  REASON="Site appears down (extracted from text)"
 
                 else
+
                   STATUS="UNKNOWN"
-                  REASON="No status indicator found"
+                  REASON="No status indicator found in output"
+
                 fi
 
               fi
@@ -478,18 +517,8 @@ jobs:
 
           fi
 
-          # ========================================================
-          # AFFICHAGE
-          # ========================================================
-
-          echo "======================================"
-          echo "Statut final : $STATUS"
-          echo "Message      : $REASON"
-          echo "======================================"
-
-          # ========================================================
-          # ENVOI AU RELAY
-          # ========================================================
+          echo "Statut final: $STATUS"
+          echo "Message: $REASON"
 
           jq -n \
             --arg status "$STATUS" \
@@ -499,20 +528,15 @@ jobs:
               message: $message
             }' |
           curl \
-            --fail-with-body \
             -X POST \
             "https://kuma-relay.up.railway.app/sites/${{ matrix.site.id }}/mark-crawled" \
             -H "x-relay-secret: ${{ secrets.RELAY_SECRET }}" \
             -H "Content-Type: application/json" \
             -d @- \
-            || echo "⚠️ Relay report failed"
+            || echo "Relay report failed"
 
         env:
           RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
-
-      # ============================================================
-      # ARTEFACTS
-      # ============================================================
 
       - name: Upload des artefacts
         if: always()
