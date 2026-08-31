@@ -58,7 +58,7 @@ jobs:
             "models": {
               "providers": {
                 "mistral": {
-                  "api": "openai",
+                  "api": "openai-completions",
                   "baseUrl": "https://api.mistral.ai/v1",
                   "models": [
                     { "id": "mistral-small-latest", "name": "mistral-small-latest" }
