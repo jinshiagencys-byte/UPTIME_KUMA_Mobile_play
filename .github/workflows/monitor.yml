@@ -216,6 +216,15 @@ jobs:
             grep -qi "model was not found\|Check the model id\|model_not_found" "$1"
           }
 
+          # Quota épuisé au niveau du compte/clé API (429 / RESOURCE_EXHAUSTED).
+          # Sur le tier gratuit Google, le quota est PARTAGÉ entre tous les
+          # modèles Gemini : inutile de changer de modèle dans ce cas, il
+          # faut arrêter la boucle Gemini plutôt que de gaspiller les
+          # tentatives restantes (et risquer d'aggraver un quota par minute).
+          quota_exhausted() {
+            grep -qi "RESOURCE_EXHAUSTED\|exceeded your current quota\|code=429\|(429)" "$1"
+          }
+
           # Le Gateway ne meurt vraiment que si le message d'erreur le confirme
           # explicitement (ECONNREFUSED / gateway not reachable) — pas sur un
           # simple échec applicatif (mauvais modèle, clé manquante, etc.)
@@ -274,7 +283,12 @@ jobs:
               break
             fi
 
-            if grep -q "rate limit" output.json; then
+            if quota_exhausted output.json; then
+              echo "🛑 Quota Google épuisé (429/RESOURCE_EXHAUSTED) — ce quota est"
+              echo "   partagé entre tous les modèles Gemini, inutile d'essayer"
+              echo "   les modèles restants. Arrêt du fallback Gemini."
+              break
+            elif grep -q "rate limit" output.json; then
               echo "⚠️ Rate limit sur $model, on passe au suivant après 15s..."
               sleep 15
             elif model_not_found output.json; then
