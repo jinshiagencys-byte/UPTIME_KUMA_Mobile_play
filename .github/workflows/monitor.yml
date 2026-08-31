@@ -1,3 +1,4 @@
+````yaml
 name: OpenClaw - Monitoring Autonome Multi-Sites
 
 on:
@@ -10,6 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       sites: ${{ steps.get-sites.outputs.sites }}
+
     steps:
       - name: Récupérer les sites actifs
         id: get-sites
@@ -20,28 +22,51 @@ jobs:
   autonomous-test:
     needs: fetch-sites
     runs-on: ubuntu-latest
+
     strategy:
       fail-fast: false
       max-parallel: 1
+
       matrix:
         site: ${{ fromJson(needs.fetch-sites.outputs.sites) }}
 
     steps:
+
+      # ============================================================
+      # CHECKOUT
+      # ============================================================
+
       - name: Checkout du code
         uses: actions/checkout@v4
 
+      # ============================================================
+      # PLAYWRIGHT
+      # ============================================================
+
       - name: Installer Playwright
-        run: npx playwright install --with-deps chromium
+        run: |
+          npx playwright install --with-deps chromium
+
+      # ============================================================
+      # OPENCLAW
+      # ============================================================
 
       - name: Installer OpenClaw
         run: |
           curl -fsSL https://openclaw.ai/install.sh | bash
-          echo "$HOME/.npm-global/bin" >> $GITHUB_PATH
+
+          echo "$HOME/.npm-global/bin" >> "$GITHUB_PATH"
+
           ~/.npm-global/bin/openclaw --version
 
-      - name: Configurer OpenClaw (fichier minimal)
+      # ============================================================
+      # CONFIGURATION OPENCLAW + OPENROUTER
+      # ============================================================
+
+      - name: Configurer OpenClaw
         run: |
           mkdir -p ~/.openclaw
+
           cat > ~/.openclaw/openclaw.json << 'EOF'
           {
             "browser": {
@@ -49,27 +74,30 @@ jobs:
               "headless": true,
               "noSandbox": true
             },
+
             "gateway": {
               "mode": "local",
               "auth": {
                 "token": "ci-test-token-12345"
               }
             },
+
             "models": {
               "providers": {
-                "mistral": {
+                "openrouter": {
                   "api": "openai-completions",
-                  "baseUrl": "https://api.mistral.ai/v1",
-                  "models": [
-                    { "id": "mistral-small-latest", "name": "mistral-small-latest" }
-                  ]
-                },
-                "google": {
-                  "api": "google-generative-ai",
-                  "baseUrl": "https://generativelanguage.googleapis.com",
-                  "models": [
-                    { "id": "gemini-3.1-flash", "name": "gemini-3.1-flash" },
-                    { "id": "gemini-3.1-pro", "name": "gemini-3.1-pro" }
+                  "baseUrl": "https://openrouter.ai/api/v1"
+                }
+              }
+            },
+
+            "agents": {
+              "defaults": {
+                "model": {
+                  "primary": "openrouter/free",
+                  "fallbacks": [
+                    "openrouter/minimax/minimax-m3:free",
+                    "openrouter/z-ai/glm-5.2:free"
                   ]
                 }
               }
@@ -77,334 +105,425 @@ jobs:
           }
           EOF
 
-          # Consentement de capacités requis pour que le plugin mistral
-          # se charge correctement au démarrage du Gateway (sinon "Plugin
-          # mistral requires capability consent" et le Gateway ne démarre pas)
-          ~/.npm-global/bin/openclaw plugins install mistral --accept-capabilities 2>/dev/null || true
-          ~/.npm-global/bin/openclaw plugins enable mistral --accept-capabilities 2>/dev/null || true
+          echo "======================================"
+          echo "Configuration OpenClaw"
+          echo "======================================"
 
-          # Enregistrer les clés API dans le auth store d'OpenClaw : les
-          # variables d'env seules ne sont PAS reprises automatiquement par
-          # tous les providers (vu en CI : "No API key found for provider").
-          printf "%s\n" "$MISTRAL_API_KEY" | ~/.npm-global/bin/openclaw models auth paste-api-key --provider mistral || echo "⚠️ Échec enregistrement clé Mistral"
-          printf "%s\n" "$GOOGLE_API_KEY" | ~/.npm-global/bin/openclaw models auth paste-api-key --provider google || echo "⚠️ Échec enregistrement clé Google"
+          cat ~/.openclaw/openclaw.json
 
-          # Utiliser `models set` (et non `config set agents.defaults.model`) :
-          # cette commande configure aussi le runtime associé au modèle, ce qui
-          # évite que le Gateway retombe sur son défaut openai/* nécessitant
-          # le plugin "codex" (non installé/non authentifié ici).
-          ~/.npm-global/bin/openclaw models set mistral/mistral-small-latest || true
+          echo "======================================"
+          echo "Enregistrement de la clé OpenRouter"
+          echo "======================================"
+
+          printf "%s\n" "$OPENROUTER_API_KEY" | \
+            ~/.npm-global/bin/openclaw models auth paste-api-key \
+            --provider openrouter || {
+              echo "⚠️ Impossible d'enregistrer la clé OpenRouter"
+              exit 1
+            }
+
+          echo "======================================"
+          echo "Configuration du modèle principal"
+          echo "======================================"
+
+          ~/.npm-global/bin/openclaw models set openrouter/free
+
+          echo "======================================"
+          echo "Modèles configurés"
+          echo "======================================"
+
+          ~/.npm-global/bin/openclaw models status || true
+
         env:
-          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
-          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+
+      # ============================================================
+      # GENERATION DE LA TACHE
+      # ============================================================
 
       - name: Générer la tâche
         run: |
           cat > task.md << 'EOF'
           Va sur ${{ matrix.site.url }} avec l'outil browser.
-          1. Explore le site comme un humain : scroll, observe la structure.
-          2. Identifie toi-même les 2 ou 3 actions les plus importantes de ce site.
-          3. Teste chacune de ces actions et vérifie le résultat attendu.
-          4. Si une action t'amène sur une NOUVELLE URL (navigation, clic sur un
-             lien, soumission de formulaire, etc.), traite cette URL comme une
-             page à part entière à surveiller : note son statut individuellement,
-             pas seulement l'action qui y a mené.
-          5. Si erreur JS, page blanche, ou action qui ne fait rien, prends une
-             capture d'écran et note-le.
-          6. Termine ta réponse par TON VERDICT EN LANGAGE NATUREL COMME AVANT,
-             puis ajoute IMPÉRATIVEMENT à la toute fin, dans un bloc de code
-             ```json, un objet structuré au format EXACT suivant (rien d'autre
-             dans ce bloc, pas de commentaire) :
 
-             ```json
-             {
-               "overall_status": "UP",
-               "pages": [
-                 {
-                   "url": "URL exacte visitée",
-                   "status": "UP",
-                   "http_code": 200,
-                   "note": "brève explication en une phrase"
-                 }
-               ]
-             }
-             ```
+          Tu dois effectuer un monitoring autonome du site comme un humain.
 
-             - "overall_status" et chaque "status" de page valent uniquement
-               "UP" ou "DOWN" (majuscules, rien d'autre).
-             - Inclus une entrée "pages" pour l'URL de départ ET pour chaque
-               URL distincte atteinte pendant l'exploration (y compris les
-               404 ou erreurs).
-             - "http_code" est le code HTTP observé si tu as pu le déterminer,
-               sinon null.
+          1. Ouvre le site.
+
+          2. Explore le site :
+             - observe la structure ;
+             - fais défiler la page ;
+             - identifie les éléments importants ;
+             - vérifie que les éléments visibles fonctionnent.
+
+          3. Identifie toi-même les 2 ou 3 actions les plus importantes
+             de ce site.
+
+          Exemples :
+             - navigation vers une page importante ;
+             - clic sur un bouton ;
+             - recherche ;
+             - ouverture d'un menu ;
+             - soumission d'un formulaire ;
+             - accès à une page de contact ;
+             - accès à une page produit/service.
+
+          4. Teste chacune de ces actions et vérifie le résultat attendu.
+
+          5. Si une action entraîne une NOUVELLE URL :
+             - considère cette URL comme une page indépendante ;
+             - vérifie son fonctionnement ;
+             - note son statut individuellement.
+
+          6. Si tu observes :
+             - erreur JavaScript ;
+             - page blanche ;
+             - bouton qui ne fonctionne pas ;
+             - navigation bloquée ;
+             - contenu qui ne charge pas ;
+             - erreur HTTP ;
+             - formulaire qui ne fonctionne pas ;
+
+             alors prends une capture d'écran si l'outil browser le permet
+             et note précisément le problème.
+
+          7. Ne considère pas automatiquement le site comme DOWN simplement
+             parce qu'une fonctionnalité particulière échoue.
+
+          8. À la fin, donne un verdict clair en langage naturel.
+
+          9. Puis termine IMPÉRATIVEMENT ta réponse par un unique bloc
+             JSON respectant exactement cette structure :
+
+          ```json
+          {
+            "overall_status": "UP",
+            "pages": [
+              {
+                "url": "URL exacte visitée",
+                "status": "UP",
+                "http_code": 200,
+                "note": "brève explication en une phrase"
+              }
+            ]
+          }
+          ```
+
+          RÈGLES DU JSON :
+
+          - "overall_status" vaut uniquement "UP" ou "DOWN".
+          - "status" vaut uniquement "UP" ou "DOWN".
+          - "pages" doit contenir l'URL de départ.
+          - "pages" doit également contenir chaque URL distincte atteinte.
+          - Inclus également les URLs ayant retourné une erreur.
+          - "http_code" doit être le code HTTP observé si disponible.
+          - Si le code HTTP n'est pas déterminable, utilise null.
+          - "note" doit être courte et descriptive.
+          - Ne mets aucun commentaire dans le JSON.
+          - Le bloc JSON doit être le DERNIER élément de ta réponse.
           EOF
 
-      - name: Lancer OpenClaw (avec Gateway persistent)
+      # ============================================================
+      # GATEWAY
+      # ============================================================
+
+      - name: Lancer OpenClaw avec Gateway persistent
         id: agent_run
         run: |
           set +e
 
-          # Liste des modèles Gemini à essayer en fallback, dans l'ordre.
-          # Si un ID est renommé/déprécié côté Google, on passe simplement
-          # au suivant sans bloquer tout le job.
-          GEMINI_FALLBACK_MODELS=(
-            "google/gemini-3.1-flash"
-            "google/gemini-3.1-pro"
-          )
+          echo "======================================"
+          echo "Démarrage du Gateway OpenClaw"
+          echo "======================================"
 
-          # Fonction pour démarrer le Gateway avec vérification.
-          # Appelée UNE SEULE FOIS pour tout le job : changer de modèle entre
-          # tentatives ne nécessite pas de redémarrage ("Change will apply
-          # without restarting the gateway"), et le check de statut par grep
-          # s'est révélé peu fiable (faux "not running" alors que le process
-          # tournait), provoquant des conflits "already owns this state
-          # directory". On ne redémarre donc plus qu'en tout dernier recours,
-          # si l'agent ne peut vraiment plus joindre le Gateway.
           start_gateway() {
-            echo "🔧 Démarrage du Gateway..."
+            echo "🔧 Arrêt d'une éventuelle ancienne instance..."
+
             ~/.npm-global/bin/openclaw gateway stop 2>/dev/null || true
-            pkill -f "openclaw gateway" || true
+
+            pkill -f "openclaw gateway" 2>/dev/null || true
+
             sleep 3
-            ~/.npm-global/bin/openclaw plugins enable mistral --accept-capabilities 2>/dev/null || true
-            nohup ~/.npm-global/bin/openclaw gateway --force --port 18789 --allow-unconfigured > gateway.log 2>&1 &
-            echo "⏳ Attente du Gateway (30s)..."
+
+            echo "🚀 Démarrage du Gateway..."
+
+            nohup ~/.npm-global/bin/openclaw gateway \
+              --force \
+              --port 18789 \
+              --allow-unconfigured \
+              > gateway.log 2>&1 &
+
+            echo "⏳ Attente du Gateway..."
+
             sleep 30
-            if ~/.npm-global/bin/openclaw gateway status 2>&1 | grep -q "running"; then
+
+            if ~/.npm-global/bin/openclaw gateway status 2>&1 | grep -qi "running"; then
               echo "✅ Gateway opérationnel"
               return 0
-            else
-              echo "❌ Gateway non disponible"
-              cat gateway.log
-              return 1
             fi
+
+            echo "⚠️ Le statut du Gateway n'est pas confirmé."
+
+            echo "===== gateway.log ====="
+            cat gateway.log
+            echo "======================="
+
+            return 1
           }
 
-          # Fonction pour exécuter l'agent avec un modèle donné.
-          # Ne touche jamais au Gateway — seulement au modèle par défaut.
-          run_agent() {
-            local model=$1
-            local session_suffix=$2
+          start_gateway
+
+          echo "======================================"
+          echo "Modèle principal"
+          echo "======================================"
+
+          ~/.npm-global/bin/openclaw models set openrouter/free
+
+          echo "======================================"
+          echo "Lancement de l'agent"
+          echo "======================================"
+
+          ~/.npm-global/bin/openclaw agent \
+            --session-key "ci:${{ matrix.site.id }}" \
+            --message-file task.md \
+            --json > output.json 2>&1
+
+          AGENT_EXIT=$?
+
+          echo "======================================"
+          echo "Résultat OpenClaw"
+          echo "======================================"
+
+          cat output.json
+
+          if [ $AGENT_EXIT -eq 0 ]; then
+            echo "agent_failed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "⚠️ OpenClaw a retourné le code $AGENT_EXIT"
+
+            echo "agent_failed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Si le Gateway est explicitement devenu inaccessible,
+          # on effectue une seule nouvelle tentative.
+
+          if grep -qiE \
+            "ECONNREFUSED|gateway not reachable|gateway may still be running" \
+            output.json; then
+
             echo "======================================"
-            echo "Test avec $model pour ${{ matrix.site.url }}"
+            echo "🔄 Gateway injoignable"
             echo "======================================"
-            ~/.npm-global/bin/openclaw models set "$model" || true
+
+            start_gateway
+
+            echo "🔁 Nouvelle tentative..."
+
             ~/.npm-global/bin/openclaw agent \
-              --session-key "ci:${{ matrix.site.id }}-$session_suffix" \
+              --session-key "ci:${{ matrix.site.id }}-retry" \
               --message-file task.md \
               --json > output.json 2>&1
+
+            RETRY_EXIT=$?
+
             cat output.json
-          }
 
-          is_success() {
-            # Utilise jq pour trouver n'importe quel champ "status" à
-            # n'importe quelle profondeur (le JSON de sortie est indenté et
-            # sa structure peut varier — un grep sur une forme compacte
-            # ratait les succès réels et déclenchait un fallback inutile)
-            local status
-            status=$(jq -r '[.. | .status? // empty] | map(select(type == "string")) | first // empty' "$1" 2>/dev/null)
-            echo "$status" | grep -qiE '^(up|ok)$'
-          }
-
-          # "modèle introuvable" (renommé/déprécié côté provider) : pas la
-          # peine de réessayer le même ID, on passe directement au suivant
-          # dans GEMINI_FALLBACK_MODELS.
-          model_not_found() {
-            grep -qi "model was not found\|Check the model id\|model_not_found" "$1"
-          }
-
-          # Le Gateway OpenClaw a son propre disjoncteur : après quelques
-          # échecs rapprochés sur un provider, il le met en "cooldown" et
-          # bloque tout appel suivant pendant un court délai, quel que soit
-          # le modèle — le message réutilise parfois "model_not_found" par
-          # erreur. Dans ce cas, changer de modèle ne sert à rien : il faut
-          # arrêter la boucle et laisser le temps au cooldown de retomber.
-          provider_cooldown() {
-            grep -qi "in cooldown\|Auth profile.*temporarily unavailable" "$1"
-          }
-
-          # Quota épuisé au niveau du compte/clé API (429 / RESOURCE_EXHAUSTED).
-          # Sur le tier gratuit Google, le quota est PARTAGÉ entre tous les
-          # modèles Gemini : inutile de changer de modèle dans ce cas, il
-          # faut arrêter la boucle Gemini plutôt que de gaspiller les
-          # tentatives restantes (et risquer d'aggraver un quota par minute).
-          quota_exhausted() {
-            grep -qi "RESOURCE_EXHAUSTED\|exceeded your current quota\|code=429\|(429)" "$1"
-          }
-
-          # Le Gateway ne meurt vraiment que si le message d'erreur le confirme
-          # explicitement (ECONNREFUSED / gateway not reachable) — pas sur un
-          # simple échec applicatif (mauvais modèle, clé manquante, etc.)
-          gateway_actually_down() {
-            grep -qi "ECONNREFUSED\|gateway not reachable\|gateway may still be running" "$1"
-          }
-
-          # Démarrage unique du Gateway pour tout le job
-          start_gateway || true
-
-          # Essai 1 : Mistral
-          run_agent "mistral/mistral-small-latest" "mistral1"
-
-          if is_success output.json; then
-            echo "✅ Succès avec Mistral"
-            echo "agent_failed=false" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          # Si le Gateway est vraiment injoignable, un seul redémarrage puis nouvel essai Mistral
-          if gateway_actually_down output.json; then
-            echo "🔄 Gateway injoignable, redémarrage..."
-            start_gateway || true
-            run_agent "mistral/mistral-small-latest" "mistral2"
-            if is_success output.json; then
-              echo "✅ Succès avec Mistral (2e tentative)"
-              echo "agent_failed=false" >> $GITHUB_OUTPUT
-              exit 0
-            fi
-          elif grep -q "rate limit" output.json; then
-            echo "⚠️ Rate limit détecté, nouvelle tentative dans 30s..."
-            sleep 30
-            run_agent "mistral/mistral-small-latest" "mistral2"
-            if is_success output.json; then
-              echo "✅ Succès avec Mistral (2e tentative)"
-              echo "agent_failed=false" >> $GITHUB_OUTPUT
-              exit 0
-            fi
-          fi
-
-          # Fallback : Google Gemini — on essaie plusieurs IDs de modèle
-          # à la suite (même Gateway, juste un changement de modèle) pour
-          # maximiser les chances si un ID a été renommé/déprécié ou est
-          # temporairement en rate limit.
-          gemini_success=false
-          attempt_num=1
-          for model in "${GEMINI_FALLBACK_MODELS[@]}"; do
-            echo "======================================"
-            echo "🔁 Fallback Gemini ($attempt_num/${#GEMINI_FALLBACK_MODELS[@]}) : $model"
-            echo "======================================"
-            run_agent "$model" "gemini$attempt_num"
-
-            if is_success output.json; then
-              echo "✅ Succès avec $model"
-              gemini_success=true
-              break
-            fi
-
-            if quota_exhausted output.json; then
-              echo "🛑 Quota Google épuisé (429/RESOURCE_EXHAUSTED) — ce quota est"
-              echo "   partagé entre tous les modèles Gemini, inutile d'essayer"
-              echo "   les modèles restants. Arrêt du fallback Gemini."
-              break
-            elif provider_cooldown output.json; then
-              echo "🛑 Provider google en cooldown côté Gateway — changer de"
-              echo "   modèle ne débloquera rien tant que le cooldown n'est"
-              echo "   pas retombé. Arrêt du fallback Gemini pour ce run."
-              break
-            elif grep -q "rate limit" output.json; then
-              echo "⚠️ Rate limit sur $model, on passe au suivant après 15s..."
-              sleep 15
-            elif model_not_found output.json; then
-              echo "⚠️ $model introuvable côté provider, on passe au suivant..."
-            elif gateway_actually_down output.json; then
-              echo "🔄 Gateway injoignable, redémarrage avant de continuer..."
-              start_gateway || true
+            if [ $RETRY_EXIT -eq 0 ]; then
+              echo "agent_failed=false" >> "$GITHUB_OUTPUT"
             else
-              echo "⚠️ Échec avec $model (raison non catégorisée), on passe au suivant..."
+              echo "agent_failed=true" >> "$GITHUB_OUTPUT"
             fi
-
-            attempt_num=$((attempt_num + 1))
-
-            # Petite pause entre deux tentatives Gemini pour ne pas déclencher
-            # le disjoncteur "provider cooldown" du Gateway en cas d'appels
-            # trop rapprochés.
-            if [ $attempt_num -le ${#GEMINI_FALLBACK_MODELS[@]} ]; then
-              sleep 8
-            fi
-          done
-
-          if [ "$gemini_success" = true ]; then
-            echo "agent_failed=false" >> $GITHUB_OUTPUT
-          else
-            echo "❌ Échec final : aucun modèle Mistral ni Gemini n'a fonctionné"
-            echo "agent_failed=true" >> $GITHUB_OUTPUT
           fi
 
         env:
-          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
-          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           OPENCLAW_GATEWAY_TOKEN: "ci-test-token-12345"
+
+      # ============================================================
+      # EXTRACTION DU RESULTAT
+      # ============================================================
 
       - name: Extraire et envoyer le résultat
         if: always()
         run: |
+
+          echo "======================================"
+          echo "Extraction du résultat"
+          echo "======================================"
+
           if [ ! -f output.json ] || [ ! -s output.json ]; then
+
             STATUS="ERROR"
             REASON="Agent output missing or empty"
-          elif [ "${{ steps.agent_run.outputs.agent_failed }}" == "true" ]; then
-            STATUS="ERROR"
-            REASON="Agent execution failed after all attempts"
-          else
-            # 1) Texte final de l'agent (peut contenir plusieurs blocs de code,
-            # on prend le dernier bloc ```json — c'est celui qu'on a demandé
-            # en toute fin du prompt).
-            AGENT_TEXT=$(jq -r '[.. | .text? // empty] | map(select(type == "string")) | first // ""' output.json 2>/dev/null)
 
-            # 2) Extraire le dernier bloc ```json ... ``` du texte de l'agent
+          elif [ "${{ steps.agent_run.outputs.agent_failed }}" == "true" ]; then
+
+            STATUS="ERROR"
+            REASON="Agent execution failed"
+
+          else
+
+            # ------------------------------------------------------
+            # Récupération du texte final
+            # ------------------------------------------------------
+
+            AGENT_TEXT=$(jq -r '
+              [.. | .text? // empty]
+              | map(select(type == "string"))
+              | last // ""
+            ' output.json 2>/dev/null)
+
+            echo "===== Texte agent ====="
+            printf '%s\n' "$AGENT_TEXT"
+            echo "======================="
+
+            # ------------------------------------------------------
+            # Extraction du dernier bloc JSON
+            # ------------------------------------------------------
+
             PAGES_JSON=$(printf '%s' "$AGENT_TEXT" | awk '
-              /```json/ { capture=1; buf=""; next }
-              /```/ { if (capture) { last=buf; capture=0 } ; next }
-              capture { buf = buf $0 "\n" }
-              END { printf "%s", last }
+              /```json/ {
+                capture=1
+                buf=""
+                next
+              }
+
+              /```/ {
+                if (capture) {
+                  last=buf
+                  capture=0
+                }
+                next
+              }
+
+              capture {
+                buf = buf $0 "\n"
+              }
+
+              END {
+                printf "%s", last
+              }
             ')
 
-            if echo "$PAGES_JSON" | jq -e '.overall_status and .pages' > /dev/null 2>&1; then
-              # Structure demandée trouvée : c'est la source de vérité
-              STATUS=$(echo "$PAGES_JSON" | jq -r '.overall_status // "UNKNOWN"')
+            echo "===== JSON détecté ====="
+            printf '%s\n' "$PAGES_JSON"
+            echo "========================"
+
+            # ------------------------------------------------------
+            # Validation du JSON
+            # ------------------------------------------------------
+
+            if echo "$PAGES_JSON" | jq -e '
+              (.overall_status == "UP" or .overall_status == "DOWN")
+              and (.pages | type == "array")
+            ' > /dev/null 2>&1; then
+
+              echo "✅ JSON structuré valide"
+
+              STATUS=$(echo "$PAGES_JSON" | jq -r '.overall_status')
+
               REASON=$(echo "$PAGES_JSON" | jq -c '.pages')
+
               echo "$PAGES_JSON" > pages.json
-              echo "📄 $(echo "$PAGES_JSON" | jq '.pages | length') page(s) rapportée(s) :"
-              echo "$PAGES_JSON" | jq -r '.pages[] | "  - \(.url) → \(.status) (http=\(.http_code // "n/a")) : \(.note // "")"'
+
+              PAGE_COUNT=$(echo "$PAGES_JSON" | jq '.pages | length')
+
+              echo "📄 $PAGE_COUNT page(s) rapportée(s)"
+
+              echo "$PAGES_JSON" | jq -r '
+                .pages[]
+                | "  - \(.url) → \(.status) (http=\(.http_code // "n/a")) : \(.note // "")"
+              '
+
             else
-              # Repli : l'agent n'a pas produit le bloc JSON structuré demandé
-              # (peut arriver selon le modèle) — on retombe sur la recherche
-              # récursive d'un statut global, comme avant.
-              echo "⚠️ Bloc JSON structuré introuvable, repli sur l'ancienne extraction"
-              STATUS=$(jq -r '[.. | .status? // empty] | map(select(type == "string")) | first // "UNKNOWN"' output.json 2>/dev/null)
-              REASON=$(jq -r '[.. | .text? // empty] | map(select(type == "string")) | first // ""' output.json 2>/dev/null | head -c 300)
-              if [ -z "$STATUS" ] || [ "$STATUS" == "null" ]; then
-                if grep -qi "up" output.json; then
+
+              echo "⚠️ JSON structuré introuvable ou invalide"
+
+              # ----------------------------------------------------
+              # Fallback extraction
+              # ----------------------------------------------------
+
+              STATUS=$(jq -r '
+                [.. | .status? // empty]
+                | map(select(type == "string"))
+                | map(ascii_upcase)
+                | map(select(. == "UP" or . == "DOWN"))
+                | first // "UNKNOWN"
+              ' output.json 2>/dev/null)
+
+              REASON=$(jq -r '
+                [.. | .text? // empty]
+                | map(select(type == "string"))
+                | last // ""
+              ' output.json 2>/dev/null | head -c 500)
+
+              if [ "$STATUS" == "UNKNOWN" ]; then
+
+                if grep -qi "UP" output.json; then
                   STATUS="UP"
-                  REASON="Site appears operational (extracted from text)"
-                elif grep -qi "down" output.json; then
+                  REASON="Site appears operational"
+
+                elif grep -qi "DOWN" output.json; then
                   STATUS="DOWN"
-                  REASON="Site appears down (extracted from text)"
+                  REASON="Site appears unavailable"
+
                 else
                   STATUS="UNKNOWN"
-                  REASON="No status indicator found in output"
+                  REASON="No status indicator found"
                 fi
+
               fi
+
             fi
+
           fi
 
-          echo "Statut final: $STATUS"
-          echo "Message: $REASON"
+          # ========================================================
+          # AFFICHAGE
+          # ========================================================
 
-          jq -n --arg status "$STATUS" --arg message "$REASON" '{status: $status, message: $message}' | \
-          curl -X POST "https://kuma-relay.up.railway.app/sites/${{ matrix.site.id }}/mark-crawled" \
+          echo "======================================"
+          echo "Statut final : $STATUS"
+          echo "Message      : $REASON"
+          echo "======================================"
+
+          # ========================================================
+          # ENVOI AU RELAY
+          # ========================================================
+
+          jq -n \
+            --arg status "$STATUS" \
+            --arg message "$REASON" \
+            '{
+              status: $status,
+              message: $message
+            }' |
+          curl \
+            --fail-with-body \
+            -X POST \
+            "https://kuma-relay.up.railway.app/sites/${{ matrix.site.id }}/mark-crawled" \
             -H "x-relay-secret: ${{ secrets.RELAY_SECRET }}" \
             -H "Content-Type: application/json" \
             -d @- \
-            || echo "Relay report failed"
+            || echo "⚠️ Relay report failed"
 
         env:
           RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
 
+      # ============================================================
+      # ARTEFACTS
+      # ============================================================
+
       - name: Upload des artefacts
         if: always()
         uses: actions/upload-artifact@v4
+
         with:
           name: openclaw-${{ matrix.site.id }}
+
           path: |
             gateway.log
             output.json
             pages.json
             ~/.openclaw/workspace/screenshots/
+````
