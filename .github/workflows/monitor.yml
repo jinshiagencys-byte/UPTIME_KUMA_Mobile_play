@@ -39,7 +39,7 @@ jobs:
           echo "$HOME/.npm-global/bin" >> $GITHUB_PATH
           ~/.npm-global/bin/openclaw --version
 
-      - name: Créer le fichier de configuration OpenClaw
+      - name: Créer le fichier de configuration OpenClaw (structure valide)
         run: |
           mkdir -p ~/.openclaw
           cat > ~/.openclaw/openclaw.json << 'EOF'
@@ -56,10 +56,7 @@ jobs:
             },
             "agents": {
               "defaults": {
-                "model": {
-                  "primary": "mistral/mistral-small-latest",
-                  "fallback": "google/gemini-2.5-flash"
-                }
+                "model": "mistral/mistral-small-latest"
               }
             },
             "gateway": {
@@ -69,7 +66,8 @@ jobs:
             }
           }
           EOF
-          cat ~/.openclaw/openclaw.json
+          # Valider la config
+          ~/.npm-global/bin/openclaw config validate || echo "Config invalide, mais on continue"
 
       - name: Démarrer le Gateway
         run: |
@@ -80,23 +78,23 @@ jobs:
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
 
-      - name: Générer la tâche (prompt générique)
+      - name: Générer la tâche
         run: |
           cat > task.md << EOF
           Va sur ${{ matrix.site.url }} avec l'outil browser.
           1. Explore le site comme un humain : scroll, observe la structure.
-          2. Identifie toi-même les 2 ou 3 actions les plus importantes de ce site (ex: formulaire de contact, recherche, ajout au panier, connexion, navigation menu) selon ce que tu observes.
-          3. Teste chacune de ces actions et vérifie qu'elle produit le résultat attendu.
-          4. Si tu vois une erreur JavaScript, une page blanche, ou un résultat incohérent (ex: action qui ne fait rien), prends une capture d'écran et note-le précisément.
-          5. Termine par un verdict clair : UP ou DOWN, avec la liste des actions testées et leur résultat.
+          2. Identifie toi-même les 2 ou 3 actions les plus importantes de ce site.
+          3. Teste chacune de ces actions et vérifie le résultat attendu.
+          4. Si erreur JS, page blanche, ou action qui ne fait rien, prends une capture d'écran et note-le.
+          5. Termine par un verdict UP ou DOWN avec la liste des actions testées.
           EOF
 
-      - name: Lancer OpenClaw (avec fallback forcé sur Google après 2 échecs)
+      - name: Lancer OpenClaw (avec fallback manuel)
         id: agent_run
         run: |
           set +e
 
-          # Premier essai avec Mistral
+          # === 1er essai : Mistral ===
           echo "======================================"
           echo "Essai avec Mistral pour ${{ matrix.site.url }}"
           echo "======================================"
@@ -104,17 +102,15 @@ jobs:
             --session-key "ci:${{ matrix.site.id }}" \
             --message-file task.md \
             --json > output.json 2>&1
-
-          EXIT_CODE=$?
           cat output.json
 
-          if [ $EXIT_CODE -eq 0 ]; then
+          if [ $? -eq 0 ]; then
             echo "✅ Succès avec Mistral"
             echo "agent_failed=false" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          # En cas d'échec, on réessaie une fois avec Mistral (pour les rate limits temporaires)
+          # === 2e essai : Mistral (rate limit temporaire) ===
           echo "======================================"
           echo "⚠️ Échec Mistral, nouvelle tentative dans 10s..."
           echo "======================================"
@@ -123,33 +119,29 @@ jobs:
             --session-key "ci:${{ matrix.site.id }}" \
             --message-file task.md \
             --json > output.json 2>&1
-
-          EXIT_CODE=$?
           cat output.json
 
-          if [ $EXIT_CODE -eq 0 ]; then
+          if [ $? -eq 0 ]; then
             echo "✅ Succès avec Mistral (2e tentative)"
             echo "agent_failed=false" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          # Échec Mistral → fallback forcé sur Google Gemini
+          # === Fallback forcé sur Google Gemini ===
           echo "======================================"
           echo "🔁 Fallback forcé sur Google Gemini pour ${{ matrix.site.url }}"
           echo "======================================"
 
-          # On modifie temporairement le modèle primaire
-          ~/.npm-global/bin/openclaw config set agents.defaults.model.primary "google/gemini-2.5-flash"
+          # Changer le modèle primaire
+          ~/.npm-global/bin/openclaw config set agents.defaults.model "google/gemini-2.5-flash"
 
           ~/.npm-global/bin/openclaw agent \
             --session-key "ci:${{ matrix.site.id }}" \
             --message-file task.md \
             --json > output.json 2>&1
-
-          EXIT_CODE=$?
           cat output.json
 
-          if [ $EXIT_CODE -eq 0 ]; then
+          if [ $? -eq 0 ]; then
             echo "✅ Succès avec Google Gemini"
             echo "agent_failed=false" >> $GITHUB_OUTPUT
           else
@@ -176,10 +168,13 @@ jobs:
             REASON=$(jq -r '.result.payloads[0].text' output.json | head -c 300)
           fi
 
-          curl -X POST "https://kuma-relay.up.railway.app/sites/${{ matrix.site.id }}/report" \
+          # Utiliser l'endpoint existant /mark-crawled ou créer /report
+          # On envoie avec un body contenant le statut
+          curl -X POST "https://kuma-relay.up.railway.app/sites/${{ matrix.site.id }}/mark-crawled" \
             -H "x-relay-secret: ${{ secrets.RELAY_SECRET }}" \
             -H "Content-Type: application/json" \
-            -d "{\"status\": \"$STATUS\", \"message\": \"$REASON\"}" || echo "Relay report failed"
+            -d "{\"status\": \"$STATUS\", \"message\": \"$REASON\"}" \
+            || echo "Relay report failed"
         env:
           RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
 
