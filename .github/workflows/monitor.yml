@@ -64,9 +64,20 @@ jobs:
           ~/.npm-global/bin/openclaw plugins install mistral --accept-capabilities 2>/dev/null || true
           ~/.npm-global/bin/openclaw plugins enable mistral --accept-capabilities 2>/dev/null || true
 
-          ~/.npm-global/bin/openclaw config set agents.defaults.model "mistral/mistral-small-latest" 2>/dev/null || true
+          # Enregistrer les clés API dans le auth store d'OpenClaw : les
+          # variables d'env seules ne sont PAS reprises automatiquement par
+          # tous les providers (vu en CI : "No API key found for provider").
+          printf "%s\n" "$MISTRAL_API_KEY" | ~/.npm-global/bin/openclaw models auth paste-api-key --provider mistral 2>/dev/null || true
+          printf "%s\n" "$GOOGLE_API_KEY" | ~/.npm-global/bin/openclaw models auth paste-api-key --provider google 2>/dev/null || true
+
+          # Utiliser `models set` (et non `config set agents.defaults.model`) :
+          # cette commande configure aussi le runtime associé au modèle, ce qui
+          # évite que le Gateway retombe sur son défaut openai/* nécessitant
+          # le plugin "codex" (non installé/non authentifié ici).
+          ~/.npm-global/bin/openclaw models set mistral/mistral-small-latest 2>/dev/null || true
         env:
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
 
       - name: Générer la tâche
         run: |
@@ -87,7 +98,17 @@ jobs:
           # Fonction pour démarrer le Gateway avec vérification
           start_gateway() {
             echo "🔧 Démarrage du Gateway..."
+            # `openclaw gateway stop` libère proprement le verrou du state
+            # directory ; un simple pkill peut laisser le process zombie et
+            # provoquer "Another gateway already owns this state directory"
+            ~/.npm-global/bin/openclaw gateway stop 2>/dev/null || true
             pkill -f "openclaw gateway" || true
+            for i in $(seq 1 10); do
+              if ~/.npm-global/bin/openclaw gateway status 2>&1 | grep -qi "not running\|stopped"; then
+                break
+              fi
+              sleep 1
+            done
             sleep 2
             # Re-vérifier le consentement des plugins à chaque (re)démarrage,
             # au cas où un restart du Gateway réinitialise l'état
@@ -112,7 +133,7 @@ jobs:
             echo "======================================"
             echo "Test avec $model pour ${{ matrix.site.url }}"
             echo "======================================"
-            ~/.npm-global/bin/openclaw config set agents.defaults.model "$model" 2>/dev/null || true
+            ~/.npm-global/bin/openclaw models set "$model" 2>/dev/null || true
             ~/.npm-global/bin/openclaw agent \
               --session-key "ci:${{ matrix.site.id }}-$session_suffix" \
               --message-file task.md \
