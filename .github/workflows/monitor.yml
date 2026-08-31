@@ -68,8 +68,6 @@ jobs:
                   "api": "google-generative-ai",
                   "baseUrl": "https://generativelanguage.googleapis.com",
                   "models": [
-                    { "id": "gemini-2.5-flash", "name": "gemini-2.5-flash" },
-                    { "id": "gemini-2.5-pro", "name": "gemini-2.5-pro" },
                     { "id": "gemini-3.1-flash", "name": "gemini-3.1-flash" },
                     { "id": "gemini-3.1-pro", "name": "gemini-3.1-pro" }
                   ]
@@ -150,8 +148,6 @@ jobs:
           # Si un ID est renommé/déprécié côté Google, on passe simplement
           # au suivant sans bloquer tout le job.
           GEMINI_FALLBACK_MODELS=(
-            "google/gemini-2.5-flash"
-            "google/gemini-2.5-pro"
             "google/gemini-3.1-flash"
             "google/gemini-3.1-pro"
           )
@@ -214,6 +210,16 @@ jobs:
           # dans GEMINI_FALLBACK_MODELS.
           model_not_found() {
             grep -qi "model was not found\|Check the model id\|model_not_found" "$1"
+          }
+
+          # Le Gateway OpenClaw a son propre disjoncteur : après quelques
+          # échecs rapprochés sur un provider, il le met en "cooldown" et
+          # bloque tout appel suivant pendant un court délai, quel que soit
+          # le modèle — le message réutilise parfois "model_not_found" par
+          # erreur. Dans ce cas, changer de modèle ne sert à rien : il faut
+          # arrêter la boucle et laisser le temps au cooldown de retomber.
+          provider_cooldown() {
+            grep -qi "in cooldown\|Auth profile.*temporarily unavailable" "$1"
           }
 
           # Quota épuisé au niveau du compte/clé API (429 / RESOURCE_EXHAUSTED).
@@ -288,6 +294,11 @@ jobs:
               echo "   partagé entre tous les modèles Gemini, inutile d'essayer"
               echo "   les modèles restants. Arrêt du fallback Gemini."
               break
+            elif provider_cooldown output.json; then
+              echo "🛑 Provider google en cooldown côté Gateway — changer de"
+              echo "   modèle ne débloquera rien tant que le cooldown n'est"
+              echo "   pas retombé. Arrêt du fallback Gemini pour ce run."
+              break
             elif grep -q "rate limit" output.json; then
               echo "⚠️ Rate limit sur $model, on passe au suivant après 15s..."
               sleep 15
@@ -301,6 +312,13 @@ jobs:
             fi
 
             attempt_num=$((attempt_num + 1))
+
+            # Petite pause entre deux tentatives Gemini pour ne pas déclencher
+            # le disjoncteur "provider cooldown" du Gateway en cas d'appels
+            # trop rapprochés.
+            if [ $attempt_num -le ${#GEMINI_FALLBACK_MODELS[@]} ]; then
+              sleep 8
+            fi
           done
 
           if [ "$gemini_success" = true ]; then
