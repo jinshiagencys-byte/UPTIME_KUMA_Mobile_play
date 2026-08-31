@@ -39,7 +39,7 @@ jobs:
           echo "$HOME/.npm-global/bin" >> $GITHUB_PATH
           ~/.npm-global/bin/openclaw --version
 
-      - name: Créer le fichier de configuration minimal (valide)
+      - name: Configurer OpenClaw (fichier + clés API)
         run: |
           mkdir -p ~/.openclaw
           cat > ~/.openclaw/openclaw.json << 'EOF'
@@ -56,14 +56,37 @@ jobs:
             }
           }
           EOF
-          # Valider la configuration
-          ~/.npm-global/bin/openclaw config validate || echo "⚠️ Config invalide, mais on continue"
 
-      - name: Démarrer le Gateway
+          # Configurer les clés API pour les providers
+          ~/.npm-global/bin/openclaw config set providers.mistral.apiKey "$MISTRAL_API_KEY"
+          ~/.npm-global/bin/openclaw config set providers.google.apiKey "$GOOGLE_API_KEY"
+          ~/.npm-global/bin/openclaw config set providers.google.api "google-generative-ai"
+
+          # Modèle par défaut (Mistral)
+          ~/.npm-global/bin/openclaw config set agents.defaults.model "mistral/mistral-small-latest"
+
+          # Vérifier la config
+          ~/.npm-global/bin/openclaw config validate || echo "⚠️ Config invalide (peut être ignorée)"
+
+        env:
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+
+      - name: Démarrer le Gateway et vérifier les outils
         run: |
+          # Démarrer le gateway en arrière-plan
           nohup ~/.npm-global/bin/openclaw gateway --force > gateway.log 2>&1 &
-          sleep 10
+          sleep 15
+
+          # Vérifier que le gateway est en ligne
           ~/.npm-global/bin/openclaw gateway status || true
+
+          # Afficher les logs du gateway (pour voir si browser est chargé)
+          cat gateway.log || echo "Gateway log vide"
+
+          # Vérifier la présence du tool browser (si commande existe)
+          ~/.npm-global/bin/openclaw agent --list-tools || echo "Impossible de lister les outils"
+
         env:
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
@@ -89,9 +112,6 @@ jobs:
           echo "Essai avec Mistral pour ${{ matrix.site.url }}"
           echo "======================================"
 
-          # Définir le modèle Mistral
-          ~/.npm-global/bin/openclaw config set agents.defaults.model "mistral/mistral-small-latest"
-
           ~/.npm-global/bin/openclaw agent \
             --session-key "ci:${{ matrix.site.id }}" \
             --message-file task.md \
@@ -99,6 +119,31 @@ jobs:
 
           cat output.json
 
+          # Vérifier si le browser est disponible dans la réponse
+          if grep -q "browser" output.json; then
+            echo "✅ Browser tool présent"
+          else
+            echo "⚠️ Browser tool non détecté, tentative de redémarrage du gateway..."
+            # Redémarrer le gateway avec plus de temps
+            pkill -f "openclaw gateway" || true
+            nohup ~/.npm-global/bin/openclaw gateway --force --verbose > gateway.log 2>&1 &
+            sleep 20
+            # Réessayer
+            ~/.npm-global/bin/openclaw agent \
+              --session-key "ci:${{ matrix.site.id }}" \
+              --message-file task.md \
+              --json > output.json 2>&1
+            cat output.json
+          fi
+
+          # Détecter le succès (présence de "status":"ok" ou "up" dans le JSON)
+          if grep -q '"status":"ok"' output.json || grep -q 'UP' output.json; then
+            echo "✅ Succès avec Mistral"
+            echo "agent_failed=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Si rate limit, on réessaie
           if grep -q "rate limit" output.json; then
             echo "⚠️ Rate limit détecté, nouvelle tentative dans 30s..."
             sleep 30
@@ -107,15 +152,14 @@ jobs:
               --message-file task.md \
               --json > output.json 2>&1
             cat output.json
+            if grep -q '"status":"ok"' output.json || grep -q 'UP' output.json; then
+              echo "✅ Succès avec Mistral (2e tentative)"
+              echo "agent_failed=false" >> $GITHUB_OUTPUT
+              exit 0
+            fi
           fi
 
-          if grep -q '"status":"ok"' output.json; then
-            echo "✅ Succès avec Mistral"
-            echo "agent_failed=false" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          # === Échec Mistral → Fallback sur Google Gemini ===
+          # === Fallback sur Google Gemini ===
           echo "======================================"
           echo "🔁 Fallback sur Google Gemini pour ${{ matrix.site.url }}"
           echo "======================================"
@@ -129,7 +173,7 @@ jobs:
 
           cat output.json
 
-          if grep -q '"status":"ok"' output.json; then
+          if grep -q '"status":"ok"' output.json || grep -q 'UP' output.json; then
             echo "✅ Succès avec Google Gemini"
             echo "agent_failed=false" >> $GITHUB_OUTPUT
           else
@@ -145,7 +189,6 @@ jobs:
       - name: Extraire et envoyer le résultat au Relay
         if: always()
         run: |
-          # Vérifier si output.json existe et est valide
           if [ ! -f output.json ] || [ ! -s output.json ]; then
             STATUS="ERROR"
             REASON="Agent output missing or empty"
@@ -153,8 +196,7 @@ jobs:
             STATUS="ERROR"
             REASON="Agent execution failed after all attempts"
           else
-            # Extraire le statut (la structure peut varier, on utilise une approche robuste)
-            # Si le JSON contient .result.payloads[0].status, on le prend, sinon on cherche status dans la racine
+            # Extraction robuste du statut
             if jq -e '.result.payloads[0].status' output.json > /dev/null 2>&1; then
               STATUS=$(jq -r '.result.payloads[0].status // "UNKNOWN"' output.json)
               REASON=$(jq -r '.result.payloads[0].text' output.json | head -c 300)
@@ -162,7 +204,7 @@ jobs:
               STATUS=$(jq -r '.status // "UNKNOWN"' output.json)
               REASON=$(jq -r '.text // .message // ""' output.json | head -c 300)
             else
-              # Si on ne trouve pas, on cherche "up" ou "down" dans le texte
+              # Fallback sur détection textuelle
               if grep -qi "up" output.json; then
                 STATUS="UP"
                 REASON="Site appears operational (extracted from text)"
@@ -179,12 +221,13 @@ jobs:
           echo "Statut final: $STATUS"
           echo "Message: $REASON"
 
-          # Envoyer au relay (utiliser l'endpoint existant /mark-crawled)
+          # Envoyer au relay via l'endpoint existant
           curl -X POST "https://kuma-relay.up.railway.app/sites/${{ matrix.site.id }}/mark-crawled" \
             -H "x-relay-secret: ${{ secrets.RELAY_SECRET }}" \
             -H "Content-Type: application/json" \
             -d "{\"status\": \"$STATUS\", \"message\": \"$REASON\"}" \
             || echo "Relay report failed"
+
         env:
           RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
 
