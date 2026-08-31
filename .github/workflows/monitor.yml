@@ -98,105 +98,65 @@ jobs:
       - name: Générer la tâche
         run: |
           cat > task.md << 'EOF'
-          Va sur ${{ matrix.site.url }} avec l'outil browser.
+          Va sur ${{ matrix.site.url }} avec l'outil browser. Explore comme un
+          humain (scroll, structure) et détecte le type de site.
 
-          1. Explore le site comme un humain : scroll, observe la structure,
-             identifie le type de site (vitrine, e-commerce, SaaS avec compte
-             utilisateur, blog, etc.).
+          VÉRIFICATION CRITIQUE avant tout le reste : le contenu affiché
+          correspond-il vraiment au site attendu, ou est-ce une page par
+          défaut d'hébergeur/registrar (ex: "o2switch", "It works!", page de
+          parking de domaine, message DNS/SSL non configuré) ? Si le frontend
+          affiche des sections censées recevoir des données du backend
+          (liste de produits, résultats, profil, prix, etc.) mais qu'elles
+          restent vides, bloquées en chargement, ou affichent une erreur/
+          "undefined"/"null" à la place des vraies données, c'est un backend
+          en panne : DOWN, même si la page HTTP répond 200.
 
-          2. Identifie toi-même les 2 ou 3 actions les plus importantes de ce
-             site ET adapte-les au type de site détecté :
+          Choisis 2-3 actions à tester selon le type détecté :
+          - E-commerce : ajoute un produit au panier, VÉRIFIE qu'il apparaît
+            bien dans le panier (nom/qté/prix) — ces données viennent du
+            backend, vérifie qu'elles sont réelles et pas un état vide/figé.
+          - Compte utilisateur : inscris-toi avec des données fictives
+            (test+ci-<horodatage>@example.com), puis connecte-toi avec ces
+            identifiants. Si compte existant seulement, teste juste qu'un
+            login invalide donne une erreur propre (pas de vraie connexion).
+          - Formulaire de contact : soumets-le en indiquant "TEST AUTOMATISÉ"
+            dans le message.
+          - Recherche : vérifie que des résultats s'affichent réellement.
+          - Sinon : les 2-3 actions les plus représentatives du site.
 
-             - SITE E-COMMERCE (boutique en ligne) : va sur une fiche produit,
-               clique sur "Ajouter au panier" (ou équivalent), puis retourne
-               sur la page panier et VÉRIFIE que l'article y apparaît
-               effectivement (nom, quantité, prix cohérents). Teste aussi le
-               retrait d'un article du panier si possible. Ne va JAMAIS
-               jusqu'au paiement réel : arrête-toi avant toute étape de
-               paiement/soumission de commande finale (pas de vraie carte
-               bancaire, pas de commande réellement passée).
+          Vérifie le résultat RÉEL de chaque action (pas juste "la page
+          charge"). Toute nouvelle URL atteinte (clic, form, etc.) = une page
+          distincte à noter individuellement. Repère aussi images cassées,
+          erreurs JS console, liens morts du menu/footer si le temps le
+          permet. Capture d'écran si erreur/page blanche/action sans effet.
 
-             - SITE AVEC COMPTE UTILISATEUR (inscription/connexion requise) :
-               effectue le parcours d'inscription complet avec des données
-               de test clairement fictives (email du type
-               test+ci-<horodatage>@example.com, mot de passe robuste
-               généré), jusqu'à la confirmation de création de compte ou
-               l'email de vérification. Teste ensuite la connexion avec ces
-               mêmes identifiants. Si un compte existe déjà et que tu ne
-               peux pas en créer un nouveau sans risque (ex: paiement requis,
-               validation manuelle), teste au moins que le formulaire de
-               connexion réagit correctement à des identifiants invalides
-               (message d'erreur approprié) sans t'authentifier réellement
-               sur un compte qui ne t'appartient pas.
+          Termine par ton verdict en langage naturel (type de site + parcours
+          testés, en précisant si le contenu venait bien du backend ou si
+          c'était un placeholder/backend en panne), puis ce bloc JSON exact
+          en toute fin (rien d'autre dedans) :
 
-             - FORMULAIRE DE CONTACT : remplis-le avec des données de test
-               clairement identifiables comme telles (mentionne "TEST
-               AUTOMATISÉ - ignorer" dans le message) et vérifie qu'il
-               accepte la soumission sans erreur.
-
-             - BARRE DE RECHERCHE : effectue une recherche avec un terme
-               pertinent au site et vérifie que des résultats s'affichent
-               réellement (pas seulement que la page ne plante pas).
-
-             - Si aucun de ces cas ne s'applique, choisis les 2-3 actions les
-               plus représentatives de l'usage principal du site.
-
-          3. Teste chacune de ces actions et vérifie le résultat RÉEL attendu
-             (pas juste "la page charge" — vérifie que le contenu/effet
-             attendu est bien présent : l'article dans le panier, le résultat
-             de recherche affiché, le message de confirmation, etc.).
-
-          4. Si une action t'amène sur une NOUVELLE URL (navigation, clic sur
-             un lien, soumission de formulaire, etc.), traite cette URL comme
-             une page à part entière à surveiller : note son statut
-             individuellement, pas seulement l'action qui y a mené.
-
-          5. Vérifie aussi, si le temps le permet : que les images principales
-             se chargent (pas d'icône d'image cassée), qu'il n'y a pas
-             d'erreur JavaScript visible dans la console, et que les liens
-             de navigation principaux (menu, footer) ne renvoient pas de 404.
-
-          6. Si erreur JS, page blanche, ou action qui ne fait rien, prends
-             une capture d'écran et note-le.
-
-          7. Termine ta réponse par TON VERDICT EN LANGAGE NATUREL, en
-             précisant explicitement le type de site détecté et les parcours
-             réellement testés (ex: "site e-commerce, parcours ajout au
-             panier testé avec succès").
-
-          8. Ajoute IMPÉRATIVEMENT à la toute fin, dans un bloc de code
-             ```json, un objet structuré au format EXACT suivant (rien
-             d'autre dans ce bloc, pas de commentaire) :
-
-             ```json
-             {
-               "overall_status": "UP",
-               "site_type": "ecommerce",
-               "pages": [
-                 {
-                   "url": "URL exacte visitée",
-                   "status": "UP",
-                   "http_code": 200,
-                   "action_tested": "brève description de l'action testée sur cette page, ou null si simple navigation",
-                   "note": "brève explication en une phrase"
-                 }
-               ]
-             }
-             ```
-
-             - "overall_status" et chaque "status" de page valent uniquement
-               "UP" ou "DOWN" (majuscules, rien d'autre).
-             - "site_type" vaut "ecommerce", "auth" (compte requis), "vitrine",
-               "blog", ou "autre" selon ce que tu as détecté.
-             - Inclus une entrée "pages" pour l'URL de départ ET pour chaque
-               URL distincte atteinte pendant l'exploration (y compris les
-               404 ou erreurs).
-             - "http_code" est le code HTTP observé si tu as pu le déterminer,
-               sinon null.
-             - Un parcours métier qui échoue (ex: article absent du panier
-               après ajout, résultat de recherche vide, formulaire qui ne
-               soumet rien) doit faire passer la page concernée en "DOWN",
-               même si le code HTTP est 200.
+          ```json
+          {
+            "overall_status": "UP",
+            "site_type": "ecommerce",
+            "pages": [
+              {
+                "url": "URL exacte",
+                "status": "UP",
+                "http_code": 200,
+                "action_tested": "action testée ou null",
+                "note": "explication en une phrase"
+              }
+            ]
+          }
+          ```
+          Règles : status/overall_status = "UP" ou "DOWN" uniquement.
+          site_type = ecommerce|auth|vitrine|blog|autre. Une entrée par page
+          visitée (départ + chaque URL distincte, y compris erreurs/404). Un
+          parcours métier qui échoue (panier vide après ajout, recherche sans
+          résultat, form qui ne soumet rien) = DOWN même si HTTP 200. Une page
+          par défaut d'hébergeur ou des données backend manquantes/vides
+          alors qu'elles sont attendues = DOWN même si HTTP 200.
           EOF
 
       - name: Lancer OpenClaw (avec Gateway persistent)
