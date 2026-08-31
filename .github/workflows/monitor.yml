@@ -56,7 +56,16 @@ jobs:
             }
           }
           EOF
+
+          # Consentement de capacités requis pour que le plugin mistral
+          # se charge correctement au démarrage du Gateway (sinon "Plugin
+          # mistral requires capability consent" et le Gateway ne démarre pas)
+          ~/.npm-global/bin/openclaw plugins install mistral --accept-capabilities 2>/dev/null || true
+          ~/.npm-global/bin/openclaw plugins enable mistral --accept-capabilities 2>/dev/null || true
+
           ~/.npm-global/bin/openclaw config set agents.defaults.model "mistral/mistral-small-latest" 2>/dev/null || true
+        env:
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
 
       - name: Générer la tâche
         run: |
@@ -79,6 +88,9 @@ jobs:
             echo "🔧 Démarrage du Gateway..."
             pkill -f "openclaw gateway" || true
             sleep 2
+            # Re-vérifier le consentement des plugins à chaque (re)démarrage,
+            # au cas où un restart du Gateway réinitialise l'état
+            ~/.npm-global/bin/openclaw plugins enable mistral --accept-capabilities 2>/dev/null || true
             nohup ~/.npm-global/bin/openclaw gateway --force --port 18789 > gateway.log 2>&1 &
             echo "⏳ Attente du Gateway (30s)..."
             sleep 30
