@@ -58,13 +58,15 @@ jobs:
             "models": {
               "providers": {
                 "mistral": {
+                  "api": "openai",
+                  "baseUrl": "https://api.mistral.ai/v1",
                   "models": [
                     { "id": "mistral-small-latest", "name": "mistral-small-latest" }
                   ]
                 },
                 "google": {
                   "models": [
-                    { "id": "gemini-2.5-flash", "name": "gemini-2.5-flash" }
+                    { "id": "gemini-2.5-pro", "name": "gemini-2.5-pro" }
                   ]
                 }
               }
@@ -206,7 +208,7 @@ jobs:
           echo "======================================"
           echo "🔁 Fallback sur Google Gemini"
           echo "======================================"
-          run_agent "google/gemini-2.5-flash" "gemini1"
+          run_agent "google/gemini-2.5-pro" "gemini1"
 
           if is_success output.json; then
             echo "✅ Succès avec Google Gemini"
