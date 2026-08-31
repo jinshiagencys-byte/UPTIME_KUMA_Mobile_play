@@ -56,33 +56,7 @@ jobs:
             }
           }
           EOF
-          # Forcer le modèle par défaut
           ~/.npm-global/bin/openclaw config set agents.defaults.model "mistral/mistral-small-latest" 2>/dev/null || true
-
-      - name: Démarrer le Gateway et vérifier
-        id: gateway_start
-        run: |
-          # Nettoyer les éventuels processus résiduels
-          pkill -f "openclaw gateway" || true
-          sleep 2
-
-          # Démarrer le gateway
-          nohup ~/.npm-global/bin/openclaw gateway --force --port 18789 > gateway.log 2>&1 &
-          echo "Attente du démarrage du Gateway..."
-          sleep 15
-
-          # Vérifier qu'il répond
-          if ~/.npm-global/bin/openclaw gateway status 2>&1 | grep -q "running"; then
-            echo "✅ Gateway opérationnel"
-            echo "gateway_ok=true" >> $GITHUB_OUTPUT
-          else
-            echo "❌ Gateway non disponible"
-            echo "gateway_ok=false" >> $GITHUB_OUTPUT
-            cat gateway.log
-          fi
-        env:
-          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
-          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
 
       - name: Générer la tâche
         run: |
@@ -95,101 +69,92 @@ jobs:
           5. Termine par un verdict UP ou DOWN avec la liste des actions testées.
           EOF
 
-      - name: Lancer OpenClaw (Mistral)
-        id: agent_mistral
+      - name: Lancer OpenClaw (avec Gateway persistent)
+        id: agent_run
         run: |
           set +e
 
-          echo "======================================"
-          echo "Essai avec Mistral pour ${{ matrix.site.url }}"
-          echo "======================================"
+          # Fonction pour démarrer le Gateway avec vérification
+          start_gateway() {
+            echo "🔧 Démarrage du Gateway..."
+            pkill -f "openclaw gateway" || true
+            sleep 2
+            nohup ~/.npm-global/bin/openclaw gateway --force --port 18789 > gateway.log 2>&1 &
+            echo "⏳ Attente du Gateway (30s)..."
+            sleep 30
+            if ~/.npm-global/bin/openclaw gateway status 2>&1 | grep -q "running"; then
+              echo "✅ Gateway opérationnel"
+              return 0
+            else
+              echo "❌ Gateway non disponible"
+              cat gateway.log
+              return 1
+            fi
+          }
 
-          ~/.npm-global/bin/openclaw agent \
-            --session-key "ci:${{ matrix.site.id }}-mistral" \
-            --message-file task.md \
-            --json > output.json 2>&1
+          # Fonction pour exécuter l'agent avec un modèle donné
+          run_agent() {
+            local model=$1
+            local session_suffix=$2
+            echo "======================================"
+            echo "Test avec $model pour ${{ matrix.site.url }}"
+            echo "======================================"
+            ~/.npm-global/bin/openclaw config set agents.defaults.model "$model" 2>/dev/null || true
+            ~/.npm-global/bin/openclaw agent \
+              --session-key "ci:${{ matrix.site.id }}-$session_suffix" \
+              --message-file task.md \
+              --json > output.json 2>&1
+            cat output.json
+          }
 
-          cat output.json
+          # Démarrer le Gateway une première fois
+          start_gateway || true
+
+          # Essai 1 : Mistral
+          run_agent "mistral/mistral-small-latest" "mistral1"
 
           # Vérifier le succès
           if grep -q '"status":"ok"' output.json || grep -q '"status":"UP"' output.json || grep -qi "up" output.json; then
             echo "✅ Succès avec Mistral"
             echo "agent_failed=false" >> $GITHUB_OUTPUT
-            echo "used_model=mistral" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          # Si rate limit, attendre et réessayer une fois
+          # Si rate limit, attendre et réessayer
           if grep -q "rate limit" output.json; then
             echo "⚠️ Rate limit détecté, nouvelle tentative dans 30s..."
             sleep 30
-            ~/.npm-global/bin/openclaw agent \
-              --session-key "ci:${{ matrix.site.id }}-mistral-retry" \
-              --message-file task.md \
-              --json > output.json 2>&1
-            cat output.json
+            # Vérifier que le Gateway est toujours là
+            if ! ~/.npm-global/bin/openclaw gateway status 2>&1 | grep -q "running"; then
+              echo "🔄 Gateway mort, redémarrage..."
+              start_gateway || true
+            fi
+            run_agent "mistral/mistral-small-latest" "mistral2"
             if grep -q '"status":"ok"' output.json || grep -q '"status":"UP"' output.json || grep -qi "up" output.json; then
               echo "✅ Succès avec Mistral (2e tentative)"
               echo "agent_failed=false" >> $GITHUB_OUTPUT
-              echo "used_model=mistral" >> $GITHUB_OUTPUT
               exit 0
             fi
           fi
 
-          # Échec Mistral, on passe au fallback
-          echo "❌ Échec de Mistral, fallback sur Google"
-          echo "agent_failed=true" >> $GITHUB_OUTPUT
-
-        env:
-          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
-          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-          OPENCLAW_GATEWAY_TOKEN: "ci-test-token-12345"
-
-      - name: Relancer le Gateway si nécessaire (avant fallback)
-        if: steps.agent_mistral.outputs.agent_failed == 'true'
-        run: |
-          echo "🔄 Relance du Gateway pour le fallback..."
-          pkill -f "openclaw gateway" || true
-          sleep 2
-          nohup ~/.npm-global/bin/openclaw gateway --force --port 18789 > gateway_fallback.log 2>&1 &
-          sleep 15
-          if ~/.npm-global/bin/openclaw gateway status 2>&1 | grep -q "running"; then
-            echo "✅ Gateway relancé avec succès"
-          else
-            echo "❌ Échec du redémarrage du gateway"
-            cat gateway_fallback.log
+          # Si le Gateway est mort, on le redémarre
+          if ! ~/.npm-global/bin/openclaw gateway status 2>&1 | grep -q "running"; then
+            echo "🔄 Gateway mort, redémarrage pour le fallback..."
+            start_gateway || true
           fi
-        env:
-          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
-          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
 
-      - name: Fallback sur Google Gemini
-        if: steps.agent_mistral.outputs.agent_failed == 'true'
-        run: |
-          set +e
-
+          # Fallback : Google Gemini
           echo "======================================"
-          echo "🔁 Fallback sur Google Gemini pour ${{ matrix.site.url }}"
+          echo "🔁 Fallback sur Google Gemini"
           echo "======================================"
+          run_agent "google/gemini-2.5-flash" "gemini1"
 
-          ~/.npm-global/bin/openclaw config set agents.defaults.model "google/gemini-2.5-flash" 2>/dev/null || true
-
-          ~/.npm-global/bin/openclaw agent \
-            --session-key "ci:${{ matrix.site.id }}-gemini" \
-            --message-file task.md \
-            --json > output_fallback.json 2>&1
-
-          cat output_fallback.json
-
-          if grep -q '"status":"ok"' output_fallback.json || grep -q '"status":"UP"' output_fallback.json || grep -qi "up" output_fallback.json; then
+          if grep -q '"status":"ok"' output.json || grep -q '"status":"UP"' output.json || grep -qi "up" output.json; then
             echo "✅ Succès avec Google Gemini"
             echo "agent_failed=false" >> $GITHUB_OUTPUT
-            echo "used_model=google-gemini" >> $GITHUB_OUTPUT
-            cp output_fallback.json output.json
           else
             echo "❌ Échec final avec Google Gemini"
             echo "agent_failed=true" >> $GITHUB_OUTPUT
-            cp output_fallback.json output.json
           fi
 
         env:
@@ -200,48 +165,36 @@ jobs:
       - name: Extraire et envoyer le résultat
         if: always()
         run: |
-          # Déterminer le fichier de sortie final
-          if [ -f output.json ]; then
-            FINAL_OUTPUT="output.json"
-          elif [ -f output_fallback.json ]; then
-            FINAL_OUTPUT="output_fallback.json"
-          else
-            echo "Aucun output.json trouvé"
+          if [ ! -f output.json ] || [ ! -s output.json ]; then
             STATUS="ERROR"
-            REASON="No output file found"
-            curl -X POST "https://kuma-relay.up.railway.app/sites/${{ matrix.site.id }}/mark-crawled" \
-              -H "x-relay-secret: ${{ secrets.RELAY_SECRET }}" \
-              -H "Content-Type: application/json" \
-              -d "{\"status\": \"$STATUS\", \"message\": \"$REASON\"}" \
-              || echo "Relay report failed"
-            exit 0
-          fi
-
-          # Extraire le statut
-          if jq -e '.result.payloads[0].status' "$FINAL_OUTPUT" > /dev/null 2>&1; then
-            STATUS=$(jq -r '.result.payloads[0].status // "UNKNOWN"' "$FINAL_OUTPUT")
-            REASON=$(jq -r '.result.payloads[0].text' "$FINAL_OUTPUT" | head -c 300)
-          elif jq -e '.status' "$FINAL_OUTPUT" > /dev/null 2>&1; then
-            STATUS=$(jq -r '.status // "UNKNOWN"' "$FINAL_OUTPUT")
-            REASON=$(jq -r '.text // .message // ""' "$FINAL_OUTPUT" | head -c 300)
+            REASON="Agent output missing or empty"
+          elif [ "${{ steps.agent_run.outputs.agent_failed }}" == "true" ]; then
+            STATUS="ERROR"
+            REASON="Agent execution failed after all attempts"
           else
-            # Fallback sur détection textuelle
-            if grep -qi "up" "$FINAL_OUTPUT"; then
-              STATUS="UP"
-              REASON="Site appears operational (extracted from text)"
-            elif grep -qi "down" "$FINAL_OUTPUT"; then
-              STATUS="DOWN"
-              REASON="Site appears down (extracted from text)"
+            if jq -e '.result.payloads[0].status' output.json > /dev/null 2>&1; then
+              STATUS=$(jq -r '.result.payloads[0].status // "UNKNOWN"' output.json)
+              REASON=$(jq -r '.result.payloads[0].text' output.json | head -c 300)
+            elif jq -e '.status' output.json > /dev/null 2>&1; then
+              STATUS=$(jq -r '.status // "UNKNOWN"' output.json)
+              REASON=$(jq -r '.text // .message // ""' output.json | head -c 300)
             else
-              STATUS="UNKNOWN"
-              REASON="No status indicator found in output"
+              if grep -qi "up" output.json; then
+                STATUS="UP"
+                REASON="Site appears operational (extracted from text)"
+              elif grep -qi "down" output.json; then
+                STATUS="DOWN"
+                REASON="Site appears down (extracted from text)"
+              else
+                STATUS="UNKNOWN"
+                REASON="No status indicator found in output"
+              fi
             fi
           fi
 
           echo "Statut final: $STATUS"
           echo "Message: $REASON"
 
-          # Envoyer au relay
           curl -X POST "https://kuma-relay.up.railway.app/sites/${{ matrix.site.id }}/mark-crawled" \
             -H "x-relay-secret: ${{ secrets.RELAY_SECRET }}" \
             -H "Content-Type: application/json" \
@@ -258,7 +211,5 @@ jobs:
           name: openclaw-${{ matrix.site.id }}
           path: |
             gateway.log
-            gateway_fallback.log
             output.json
-            output_fallback.json
             ~/.openclaw/workspace/screenshots/
