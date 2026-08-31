@@ -50,6 +50,7 @@ jobs:
               "noSandbox": true
             },
             "gateway": {
+              "mode": "local",
               "auth": {
                 "token": "ci-test-token-12345"
               }
@@ -91,7 +92,7 @@ jobs:
             # Re-vérifier le consentement des plugins à chaque (re)démarrage,
             # au cas où un restart du Gateway réinitialise l'état
             ~/.npm-global/bin/openclaw plugins enable mistral --accept-capabilities 2>/dev/null || true
-            nohup ~/.npm-global/bin/openclaw gateway --force --port 18789 > gateway.log 2>&1 &
+            nohup ~/.npm-global/bin/openclaw gateway --force --port 18789 --allow-unconfigured > gateway.log 2>&1 &
             echo "⏳ Attente du Gateway (30s)..."
             sleep 30
             if ~/.npm-global/bin/openclaw gateway status 2>&1 | grep -q "running"; then
