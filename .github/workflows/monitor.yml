@@ -70,9 +70,6 @@ jobs:
           }
           EOF
           cat ~/.openclaw/openclaw.json
-        env:
-          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
-          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
 
       - name: Démarrer le Gateway
         run: |
@@ -94,48 +91,69 @@ jobs:
           5. Termine par un verdict clair : UP ou DOWN, avec la liste des actions testées et leur résultat.
           EOF
 
-      - name: Lancer OpenClaw (avec retry en cas de 429)
+      - name: Lancer OpenClaw (avec fallback forcé sur Google après 2 échecs)
         id: agent_run
         run: |
           set +e
-          MAX_RETRIES=3
-          RETRY_DELAY=30
-          ATTEMPT=0
-          SUCCESS=false
 
-          while [ $ATTEMPT -lt $MAX_RETRIES ]; do
-            ATTEMPT=$((ATTEMPT+1))
-            echo "======================================"
-            echo "Tentative $ATTEMPT/$MAX_RETRIES pour ${{ matrix.site.url }}"
-            echo "======================================"
+          # Premier essai avec Mistral
+          echo "======================================"
+          echo "Essai avec Mistral pour ${{ matrix.site.url }}"
+          echo "======================================"
+          ~/.npm-global/bin/openclaw agent \
+            --session-key "ci:${{ matrix.site.id }}" \
+            --message-file task.md \
+            --json > output.json 2>&1
 
-            ~/.npm-global/bin/openclaw agent \
-              --session-key "ci:${{ matrix.site.id }}" \
-              --message-file task.md \
-              --json > output.json 2>&1
+          EXIT_CODE=$?
+          cat output.json
 
-            EXIT_CODE=$?
+          if [ $EXIT_CODE -eq 0 ]; then
+            echo "✅ Succès avec Mistral"
+            echo "agent_failed=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
 
-            if grep -q "rate limit\|429" output.json 2>/dev/null; then
-              echo "⚠️ Rate limit détecté, nouvelle tentative dans ${RETRY_DELAY}s..."
-              sleep $RETRY_DELAY
-              continue
-            fi
+          # En cas d'échec, on réessaie une fois avec Mistral (pour les rate limits temporaires)
+          echo "======================================"
+          echo "⚠️ Échec Mistral, nouvelle tentative dans 10s..."
+          echo "======================================"
+          sleep 10
+          ~/.npm-global/bin/openclaw agent \
+            --session-key "ci:${{ matrix.site.id }}" \
+            --message-file task.md \
+            --json > output.json 2>&1
 
-            if [ $EXIT_CODE -eq 0 ]; then
-              echo "✅ Agent réussi pour ${{ matrix.site.url }}"
-              SUCCESS=true
-              break
-            else
-              echo "❌ Échec de l'agent (code $EXIT_CODE), nouvelle tentative dans 5s..."
-              sleep 5
-            fi
-          done
+          EXIT_CODE=$?
+          cat output.json
 
-          if [ "$SUCCESS" = true ]; then
+          if [ $EXIT_CODE -eq 0 ]; then
+            echo "✅ Succès avec Mistral (2e tentative)"
+            echo "agent_failed=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Échec Mistral → fallback forcé sur Google Gemini
+          echo "======================================"
+          echo "🔁 Fallback forcé sur Google Gemini pour ${{ matrix.site.url }}"
+          echo "======================================"
+
+          # On modifie temporairement le modèle primaire
+          ~/.npm-global/bin/openclaw config set agents.defaults.model.primary "google/gemini-2.5-flash"
+
+          ~/.npm-global/bin/openclaw agent \
+            --session-key "ci:${{ matrix.site.id }}" \
+            --message-file task.md \
+            --json > output.json 2>&1
+
+          EXIT_CODE=$?
+          cat output.json
+
+          if [ $EXIT_CODE -eq 0 ]; then
+            echo "✅ Succès avec Google Gemini"
             echo "agent_failed=false" >> $GITHUB_OUTPUT
           else
-            echo "❌ Échec final de l'agent pour ${{ matrix.site.url }}"
+            echo "❌ Échec final avec Google Gemini"
             echo "agent_failed=true" >> $GITHUB_OUTPUT
           fi
 
@@ -152,7 +170,7 @@ jobs:
             REASON="Agent did not produce output.json"
           elif [ "${{ steps.agent_run.outputs.agent_failed }}" == "true" ]; then
             STATUS="ERROR"
-            REASON="Agent execution failed after retries"
+            REASON="Agent execution failed after all attempts"
           else
             STATUS=$(jq -r '.result.payloads[0].status // "UNKNOWN"' output.json)
             REASON=$(jq -r '.result.payloads[0].text' output.json | head -c 300)
