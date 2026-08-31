@@ -99,28 +99,85 @@ jobs:
         run: |
           cat > task.md << 'EOF'
           Va sur ${{ matrix.site.url }} avec l'outil browser.
-          1. Explore le site comme un humain : scroll, observe la structure.
-          2. Identifie toi-même les 2 ou 3 actions les plus importantes de ce site.
-          3. Teste chacune de ces actions et vérifie le résultat attendu.
-          4. Si une action t'amène sur une NOUVELLE URL (navigation, clic sur un
-             lien, soumission de formulaire, etc.), traite cette URL comme une
-             page à part entière à surveiller : note son statut individuellement,
-             pas seulement l'action qui y a mené.
-          5. Si erreur JS, page blanche, ou action qui ne fait rien, prends une
-             capture d'écran et note-le.
-          6. Termine ta réponse par TON VERDICT EN LANGAGE NATUREL COMME AVANT,
-             puis ajoute IMPÉRATIVEMENT à la toute fin, dans un bloc de code
-             ```json, un objet structuré au format EXACT suivant (rien d'autre
-             dans ce bloc, pas de commentaire) :
+
+          1. Explore le site comme un humain : scroll, observe la structure,
+             identifie le type de site (vitrine, e-commerce, SaaS avec compte
+             utilisateur, blog, etc.).
+
+          2. Identifie toi-même les 2 ou 3 actions les plus importantes de ce
+             site ET adapte-les au type de site détecté :
+
+             - SITE E-COMMERCE (boutique en ligne) : va sur une fiche produit,
+               clique sur "Ajouter au panier" (ou équivalent), puis retourne
+               sur la page panier et VÉRIFIE que l'article y apparaît
+               effectivement (nom, quantité, prix cohérents). Teste aussi le
+               retrait d'un article du panier si possible. Ne va JAMAIS
+               jusqu'au paiement réel : arrête-toi avant toute étape de
+               paiement/soumission de commande finale (pas de vraie carte
+               bancaire, pas de commande réellement passée).
+
+             - SITE AVEC COMPTE UTILISATEUR (inscription/connexion requise) :
+               effectue le parcours d'inscription complet avec des données
+               de test clairement fictives (email du type
+               test+ci-<horodatage>@example.com, mot de passe robuste
+               généré), jusqu'à la confirmation de création de compte ou
+               l'email de vérification. Teste ensuite la connexion avec ces
+               mêmes identifiants. Si un compte existe déjà et que tu ne
+               peux pas en créer un nouveau sans risque (ex: paiement requis,
+               validation manuelle), teste au moins que le formulaire de
+               connexion réagit correctement à des identifiants invalides
+               (message d'erreur approprié) sans t'authentifier réellement
+               sur un compte qui ne t'appartient pas.
+
+             - FORMULAIRE DE CONTACT : remplis-le avec des données de test
+               clairement identifiables comme telles (mentionne "TEST
+               AUTOMATISÉ - ignorer" dans le message) et vérifie qu'il
+               accepte la soumission sans erreur.
+
+             - BARRE DE RECHERCHE : effectue une recherche avec un terme
+               pertinent au site et vérifie que des résultats s'affichent
+               réellement (pas seulement que la page ne plante pas).
+
+             - Si aucun de ces cas ne s'applique, choisis les 2-3 actions les
+               plus représentatives de l'usage principal du site.
+
+          3. Teste chacune de ces actions et vérifie le résultat RÉEL attendu
+             (pas juste "la page charge" — vérifie que le contenu/effet
+             attendu est bien présent : l'article dans le panier, le résultat
+             de recherche affiché, le message de confirmation, etc.).
+
+          4. Si une action t'amène sur une NOUVELLE URL (navigation, clic sur
+             un lien, soumission de formulaire, etc.), traite cette URL comme
+             une page à part entière à surveiller : note son statut
+             individuellement, pas seulement l'action qui y a mené.
+
+          5. Vérifie aussi, si le temps le permet : que les images principales
+             se chargent (pas d'icône d'image cassée), qu'il n'y a pas
+             d'erreur JavaScript visible dans la console, et que les liens
+             de navigation principaux (menu, footer) ne renvoient pas de 404.
+
+          6. Si erreur JS, page blanche, ou action qui ne fait rien, prends
+             une capture d'écran et note-le.
+
+          7. Termine ta réponse par TON VERDICT EN LANGAGE NATUREL, en
+             précisant explicitement le type de site détecté et les parcours
+             réellement testés (ex: "site e-commerce, parcours ajout au
+             panier testé avec succès").
+
+          8. Ajoute IMPÉRATIVEMENT à la toute fin, dans un bloc de code
+             ```json, un objet structuré au format EXACT suivant (rien
+             d'autre dans ce bloc, pas de commentaire) :
 
              ```json
              {
                "overall_status": "UP",
+               "site_type": "ecommerce",
                "pages": [
                  {
                    "url": "URL exacte visitée",
                    "status": "UP",
                    "http_code": 200,
+                   "action_tested": "brève description de l'action testée sur cette page, ou null si simple navigation",
                    "note": "brève explication en une phrase"
                  }
                ]
@@ -129,11 +186,17 @@ jobs:
 
              - "overall_status" et chaque "status" de page valent uniquement
                "UP" ou "DOWN" (majuscules, rien d'autre).
+             - "site_type" vaut "ecommerce", "auth" (compte requis), "vitrine",
+               "blog", ou "autre" selon ce que tu as détecté.
              - Inclus une entrée "pages" pour l'URL de départ ET pour chaque
                URL distincte atteinte pendant l'exploration (y compris les
                404 ou erreurs).
              - "http_code" est le code HTTP observé si tu as pu le déterminer,
                sinon null.
+             - Un parcours métier qui échoue (ex: article absent du panier
+               après ajout, résultat de recherche vide, formulaire qui ne
+               soumet rien) doit faire passer la page concernée en "DOWN",
+               même si le code HTTP est 200.
           EOF
 
       - name: Lancer OpenClaw (avec Gateway persistent)
@@ -223,7 +286,7 @@ jobs:
               echo "agent_failed=false" >> $GITHUB_OUTPUT
               exit 0
             fi
-          elif grep -q "rate limit" output.json; then
+          elif grep -qi "rate limit" output.json; then
             echo "⚠️ Rate limit détecté, nouvelle tentative dans 30s..."
             sleep 30
             run_agent "mistral/mistral-small-latest" "mistral2"
@@ -279,10 +342,12 @@ jobs:
             if echo "$PAGES_JSON" | jq -e '.overall_status and .pages' > /dev/null 2>&1; then
               # Structure demandée trouvée : c'est la source de vérité
               STATUS=$(echo "$PAGES_JSON" | jq -r '.overall_status // "UNKNOWN"')
+              SITE_TYPE=$(echo "$PAGES_JSON" | jq -r '.site_type // "non détecté"')
               REASON=$(echo "$PAGES_JSON" | jq -c '.pages')
               echo "$PAGES_JSON" > pages.json
+              echo "🏷️ Type de site détecté : $SITE_TYPE"
               echo "📄 $(echo "$PAGES_JSON" | jq '.pages | length') page(s) rapportée(s) :"
-              echo "$PAGES_JSON" | jq -r '.pages[] | "  - \(.url) → \(.status) (http=\(.http_code // "n/a")) : \(.note // "")"'
+              echo "$PAGES_JSON" | jq -r '.pages[] | "  - \(.url) → \(.status) (http=\(.http_code // "n/a")) : \(.action_tested // "navigation simple") — \(.note // "")"'
             else
               # Repli : l'agent n'a pas produit le bloc JSON structuré demandé
               # (peut arriver selon le modèle) — on retombe sur la recherche
