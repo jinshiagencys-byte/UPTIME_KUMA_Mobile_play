@@ -153,7 +153,13 @@ jobs:
           }
 
           is_success() {
-            grep -q '"status":"ok"' "$1" || grep -q '"status":"UP"' "$1" || grep -qi '"UP"' "$1"
+            # Utilise jq pour trouver n'importe quel champ "status" à
+            # n'importe quelle profondeur (le JSON de sortie est indenté et
+            # sa structure peut varier — un grep sur une forme compacte
+            # ratait les succès réels et déclenchait un fallback inutile)
+            local status
+            status=$(jq -r '[.. | .status? // empty] | map(select(type == "string")) | first // empty' "$1" 2>/dev/null)
+            echo "$status" | grep -qiE '^(up|ok)$'
           }
 
           # Le Gateway ne meurt vraiment que si le message d'erreur le confirme
@@ -225,13 +231,12 @@ jobs:
             STATUS="ERROR"
             REASON="Agent execution failed after all attempts"
           else
-            if jq -e '.result.payloads[0].status' output.json > /dev/null 2>&1; then
-              STATUS=$(jq -r '.result.payloads[0].status // "UNKNOWN"' output.json)
-              REASON=$(jq -r '.result.payloads[0].text' output.json | head -c 300)
-            elif jq -e '.status' output.json > /dev/null 2>&1; then
-              STATUS=$(jq -r '.status // "UNKNOWN"' output.json)
-              REASON=$(jq -r '.text // .message // ""' output.json | head -c 300)
-            else
+            # Recherche récursive du champ "status" à n'importe quelle
+            # profondeur, plus fiable que des chemins jq fixes (`.result.
+            # payloads[0].status`) quand la structure de sortie varie.
+            STATUS=$(jq -r '[.. | .status? // empty] | map(select(type == "string")) | first // "UNKNOWN"' output.json 2>/dev/null)
+            REASON=$(jq -r '[.. | .text? // empty] | map(select(type == "string")) | first // ""' output.json 2>/dev/null | head -c 300)
+            if [ -z "$STATUS" ] || [ "$STATUS" == "null" ]; then
               if grep -qi "up" output.json; then
                 STATUS="UP"
                 REASON="Site appears operational (extracted from text)"
