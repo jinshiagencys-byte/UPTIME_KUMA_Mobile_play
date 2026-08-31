@@ -87,6 +87,15 @@ jobs:
           cat ~/.openclaw/openclaw.json
 
           echo "======================================"
+          echo "Désactivation des plugins non nécessaires"
+          echo "======================================"
+
+          # Perplexity n'est pas utilisé dans ce workflow.
+          # Sa demande de capability consent empêchait le Gateway
+          # de démarrer.
+          ~/.npm-global/bin/openclaw plugins disable perplexity 2>/dev/null || true
+
+          echo "======================================"
           echo "Enregistrement de la clé OpenRouter"
           echo "======================================"
 
@@ -101,6 +110,12 @@ jobs:
 
           ~/.npm-global/bin/openclaw models set \
             openrouter/minimax/minimax-m3:free || true
+
+          echo "======================================"
+          echo "Plugins actifs"
+          echo "======================================"
+
+          ~/.npm-global/bin/openclaw plugins list --enabled || true
 
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
@@ -159,25 +174,32 @@ jobs:
         run: |
           set +e
 
-          # Liste des modèles OpenRouter gratuits à essayer, dans l'ordre.
-          # Les IDs correspondent aux modèles OpenRouter actuellement
-          # référencés avec le suffixe :free.
+          # ============================================================
+          # MODELES OPENROUTER GRATUITS
+          # ============================================================
+
           OPENROUTER_FALLBACK_MODELS=(
             "openrouter/minimax/minimax-m3:free"
             "openrouter/z-ai/glm-5.2:free"
           )
 
-          # Fonction pour démarrer le Gateway avec vérification.
-          # Appelée UNE SEULE FOIS pour tout le job : changer de modèle entre
-          # tentatives ne nécessite pas de redémarrage.
+          # ============================================================
+          # DEMARRAGE DU GATEWAY
+          # ============================================================
+
           start_gateway() {
             echo "🔧 Démarrage du Gateway..."
 
             ~/.npm-global/bin/openclaw gateway stop 2>/dev/null || true
 
-            pkill -f "openclaw gateway" || true
+            pkill -f "openclaw gateway" 2>/dev/null || true
 
             sleep 3
+
+            # Vérification supplémentaire :
+            # Perplexity ne doit pas bloquer le Gateway.
+            ~/.npm-global/bin/openclaw plugins disable perplexity \
+              2>/dev/null || true
 
             nohup ~/.npm-global/bin/openclaw gateway \
               --force \
@@ -185,22 +207,36 @@ jobs:
               --allow-unconfigured \
               > gateway.log 2>&1 &
 
+            GATEWAY_PID=$!
+
+            echo "Gateway PID: $GATEWAY_PID"
+
             echo "⏳ Attente du Gateway (30s)..."
 
             sleep 30
 
-            if ~/.npm-global/bin/openclaw gateway status 2>&1 | grep -q "running"; then
+            if ~/.npm-global/bin/openclaw gateway status 2>&1 | grep -qi "running"; then
               echo "✅ Gateway opérationnel"
               return 0
-            else
-              echo "❌ Gateway non disponible"
-              cat gateway.log
-              return 1
             fi
+
+            echo "❌ Gateway non disponible"
+
+            echo "======================================"
+            echo "gateway.log"
+            echo "======================================"
+
+            cat gateway.log
+
+            echo "======================================"
+
+            return 1
           }
 
-          # Fonction pour exécuter l'agent avec un modèle donné.
-          # Ne touche jamais au Gateway — seulement au modèle par défaut.
+          # ============================================================
+          # EXECUTION AGENT
+          # ============================================================
+
           run_agent() {
             local model=$1
             local session_suffix=$2
@@ -219,6 +255,10 @@ jobs:
             cat output.json
           }
 
+          # ============================================================
+          # DETECTION SUCCES
+          # ============================================================
+
           is_success() {
             local status
 
@@ -231,39 +271,54 @@ jobs:
             echo "$status" | grep -qiE '^(up|ok)$'
           }
 
-          # Erreur indiquant que le Gateway est réellement inaccessible.
+          # ============================================================
+          # DETECTION GATEWAY
+          # ============================================================
+
           gateway_actually_down() {
             grep -qi \
               "ECONNREFUSED\|gateway not reachable\|gateway may still be running" \
               "$1"
           }
 
-          # Erreur d'authentification OpenRouter.
+          # ============================================================
+          # DETECTION AUTH OPENROUTER
+          # ============================================================
+
           auth_error() {
             grep -qi \
               "401\|unauthorized\|authentication\|invalid api key\|no api key" \
               "$1"
           }
 
-          # Rate limit / quota.
+          # ============================================================
+          # DETECTION RATE LIMIT
+          # ============================================================
+
           rate_limit() {
             grep -qi \
               "429\|rate limit\|too many requests\|quota\|resource exhausted" \
               "$1"
           }
 
-          # Modèle indisponible.
+          # ============================================================
+          # DETECTION MODELE INTROUVABLE
+          # ============================================================
+
           model_not_found() {
             grep -qi \
               "model was not found\|model_not_found\|model.*not.*found\|unknown model" \
               "$1"
           }
 
-          # Démarrage unique du Gateway pour tout le job.
+          # ============================================================
+          # GATEWAY
+          # ============================================================
+
           start_gateway || true
 
           # ============================================================
-          # ESSAI 1 : MINIMAX M3 FREE
+          # ESSAI 1 : MINIMAX
           # ============================================================
 
           run_agent \
@@ -271,9 +326,13 @@ jobs:
             "minimax1"
 
           if is_success output.json; then
+
             echo "✅ Succès avec MiniMax M3"
+
             echo "agent_failed=false" >> "$GITHUB_OUTPUT"
+
             exit 0
+
           fi
 
           # ============================================================
@@ -291,9 +350,13 @@ jobs:
               "minimax2"
 
             if is_success output.json; then
+
               echo "✅ Succès avec MiniMax M3 (2e tentative)"
+
               echo "agent_failed=false" >> "$GITHUB_OUTPUT"
+
               exit 0
+
             fi
 
           elif rate_limit output.json; then
@@ -307,98 +370,68 @@ jobs:
               "minimax2"
 
             if is_success output.json; then
+
               echo "✅ Succès avec MiniMax M3 (2e tentative)"
+
               echo "agent_failed=false" >> "$GITHUB_OUTPUT"
+
               exit 0
+
             fi
+
           fi
 
           # ============================================================
-          # FALLBACK OPENROUTER
+          # FALLBACK GLM
           # ============================================================
 
-          openrouter_success=false
-          attempt_num=1
+          echo "======================================"
+          echo "🔁 Fallback OpenRouter"
+          echo "======================================"
 
-          for model in "${OPENROUTER_FALLBACK_MODELS[@]}"; do
+          run_agent \
+            "openrouter/z-ai/glm-5.2:free" \
+            "glm1"
 
-            echo "======================================"
-            echo "🔁 Fallback OpenRouter ($attempt_num/${#OPENROUTER_FALLBACK_MODELS[@]})"
-            echo "Modèle : $model"
-            echo "======================================"
+          if is_success output.json; then
 
-            # Le premier modèle a déjà été testé.
-            if [ "$model" = "openrouter/minimax/minimax-m3:free" ] && [ "$attempt_num" -eq 1 ]; then
-              attempt_num=$((attempt_num + 1))
-              continue
-            fi
-
-            run_agent \
-              "$model" \
-              "fallback$attempt_num"
-
-            if is_success output.json; then
-
-              echo "✅ Succès avec $model"
-
-              openrouter_success=true
-
-              break
-
-            fi
-
-            if auth_error output.json; then
-
-              echo "🛑 Erreur d'authentification OpenRouter."
-
-              break
-
-            elif model_not_found output.json; then
-
-              echo "⚠️ $model introuvable côté OpenRouter."
-
-              echo "➡️ Passage au modèle suivant."
-
-            elif rate_limit output.json; then
-
-              echo "⚠️ Rate limit sur $model."
-
-              echo "➡️ Passage au modèle suivant après 15s."
-
-              sleep 15
-
-            elif gateway_actually_down output.json; then
-
-              echo "🔄 Gateway injoignable."
-
-              start_gateway || true
-
-            else
-
-              echo "⚠️ Échec avec $model."
-
-              echo "➡️ Passage au modèle suivant."
-            fi
-
-            attempt_num=$((attempt_num + 1))
-
-            if [ $attempt_num -le ${#OPENROUTER_FALLBACK_MODELS[@]} ]; then
-              sleep 8
-            fi
-
-          done
-
-          if [ "$openrouter_success" = true ]; then
+            echo "✅ Succès avec GLM 5.2"
 
             echo "agent_failed=false" >> "$GITHUB_OUTPUT"
 
-          else
-
-            echo "❌ Échec final : aucun modèle OpenRouter gratuit n'a fonctionné"
-
-            echo "agent_failed=true" >> "$GITHUB_OUTPUT"
+            exit 0
 
           fi
+
+          # ============================================================
+          # DIAGNOSTIC FINAL
+          # ============================================================
+
+          if auth_error output.json; then
+
+            echo "🛑 Erreur d'authentification OpenRouter."
+
+          elif model_not_found output.json; then
+
+            echo "🛑 Modèle OpenRouter introuvable."
+
+          elif rate_limit output.json; then
+
+            echo "🛑 Rate limit / quota OpenRouter."
+
+          elif gateway_actually_down output.json; then
+
+            echo "🛑 Gateway OpenClaw inaccessible."
+
+          else
+
+            echo "🛑 Échec OpenClaw non catégorisé."
+
+          fi
+
+          echo "❌ Échec final : aucun modèle OpenRouter gratuit n'a fonctionné"
+
+          echo "agent_failed=true" >> "$GITHUB_OUTPUT"
 
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
@@ -420,14 +453,20 @@ jobs:
 
           else
 
-            # 1) Texte final de l'agent.
+            # ============================================================
+            # TEXTE FINAL DE L'AGENT
+            # ============================================================
+
             AGENT_TEXT=$(jq -r \
               '[.. | .text? // empty] |
                map(select(type == "string")) |
                first // ""' \
               output.json 2>/dev/null)
 
-            # 2) Extraire le dernier bloc ```json ... ```
+            # ============================================================
+            # EXTRACTION DU DERNIER BLOC JSON
+            # ============================================================
+
             PAGES_JSON=$(printf '%s' "$AGENT_TEXT" | awk '
               /```json/ {
                 capture=1
@@ -452,11 +491,14 @@ jobs:
               }
             ')
 
+            # ============================================================
+            # VALIDATION
+            # ============================================================
+
             if echo "$PAGES_JSON" | \
               jq -e '.overall_status and .pages' \
               > /dev/null 2>&1; then
 
-              # Structure demandée trouvée.
               STATUS=$(echo "$PAGES_JSON" | \
                 jq -r '.overall_status // "UNKNOWN"')
 
@@ -475,8 +517,7 @@ jobs:
 
             else
 
-              # Repli si le bloc JSON n'est pas présent.
-              echo "⚠️ Bloc JSON structuré introuvable"
+              echo "⚠️ Bloc JSON structuré introuvable, repli sur l'ancienne extraction"
 
               STATUS=$(jq -r \
                 '[.. | .status? // empty] |
@@ -518,6 +559,10 @@ jobs:
 
           echo "Statut final: $STATUS"
           echo "Message: $REASON"
+
+          # ============================================================
+          # ENVOI AU RELAY
+          # ============================================================
 
           jq -n \
             --arg status "$STATUS" \
