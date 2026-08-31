@@ -102,8 +102,38 @@ jobs:
           1. Explore le site comme un humain : scroll, observe la structure.
           2. Identifie toi-même les 2 ou 3 actions les plus importantes de ce site.
           3. Teste chacune de ces actions et vérifie le résultat attendu.
-          4. Si erreur JS, page blanche, ou action qui ne fait rien, prends une capture d'écran et note-le.
-          5. Termine par un verdict UP ou DOWN avec la liste des actions testées.
+          4. Si une action t'amène sur une NOUVELLE URL (navigation, clic sur un
+             lien, soumission de formulaire, etc.), traite cette URL comme une
+             page à part entière à surveiller : note son statut individuellement,
+             pas seulement l'action qui y a mené.
+          5. Si erreur JS, page blanche, ou action qui ne fait rien, prends une
+             capture d'écran et note-le.
+          6. Termine ta réponse par TON VERDICT EN LANGAGE NATUREL COMME AVANT,
+             puis ajoute IMPÉRATIVEMENT à la toute fin, dans un bloc de code
+             ```json, un objet structuré au format EXACT suivant (rien d'autre
+             dans ce bloc, pas de commentaire) :
+
+             ```json
+             {
+               "overall_status": "UP",
+               "pages": [
+                 {
+                   "url": "URL exacte visitée",
+                   "status": "UP",
+                   "http_code": 200,
+                   "note": "brève explication en une phrase"
+                 }
+               ]
+             }
+             ```
+
+             - "overall_status" et chaque "status" de page valent uniquement
+               "UP" ou "DOWN" (majuscules, rien d'autre).
+             - Inclus une entrée "pages" pour l'URL de départ ET pour chaque
+               URL distincte atteinte pendant l'exploration (y compris les
+               404 ou erreurs).
+             - "http_code" est le code HTTP observé si tu as pu le déterminer,
+               sinon null.
           EOF
 
       - name: Lancer OpenClaw (avec Gateway persistent)
@@ -233,21 +263,44 @@ jobs:
             STATUS="ERROR"
             REASON="Agent execution failed after all attempts"
           else
-            # Recherche récursive du champ "status" à n'importe quelle
-            # profondeur, plus fiable que des chemins jq fixes (`.result.
-            # payloads[0].status`) quand la structure de sortie varie.
-            STATUS=$(jq -r '[.. | .status? // empty] | map(select(type == "string")) | first // "UNKNOWN"' output.json 2>/dev/null)
-            REASON=$(jq -r '[.. | .text? // empty] | map(select(type == "string")) | first // ""' output.json 2>/dev/null | head -c 300)
-            if [ -z "$STATUS" ] || [ "$STATUS" == "null" ]; then
-              if grep -qi "up" output.json; then
-                STATUS="UP"
-                REASON="Site appears operational (extracted from text)"
-              elif grep -qi "down" output.json; then
-                STATUS="DOWN"
-                REASON="Site appears down (extracted from text)"
-              else
-                STATUS="UNKNOWN"
-                REASON="No status indicator found in output"
+            # 1) Texte final de l'agent (peut contenir plusieurs blocs de code,
+            # on prend le dernier bloc ```json — c'est celui qu'on a demandé
+            # en toute fin du prompt).
+            AGENT_TEXT=$(jq -r '[.. | .text? // empty] | map(select(type == "string")) | first // ""' output.json 2>/dev/null)
+
+            # 2) Extraire le dernier bloc ```json ... ``` du texte de l'agent
+            PAGES_JSON=$(printf '%s' "$AGENT_TEXT" | awk '
+              /```json/ { capture=1; buf=""; next }
+              /```/ { if (capture) { last=buf; capture=0 } ; next }
+              capture { buf = buf $0 "\n" }
+              END { printf "%s", last }
+            ')
+
+            if echo "$PAGES_JSON" | jq -e '.overall_status and .pages' > /dev/null 2>&1; then
+              # Structure demandée trouvée : c'est la source de vérité
+              STATUS=$(echo "$PAGES_JSON" | jq -r '.overall_status // "UNKNOWN"')
+              REASON=$(echo "$PAGES_JSON" | jq -c '.pages')
+              echo "$PAGES_JSON" > pages.json
+              echo "📄 $(echo "$PAGES_JSON" | jq '.pages | length') page(s) rapportée(s) :"
+              echo "$PAGES_JSON" | jq -r '.pages[] | "  - \(.url) → \(.status) (http=\(.http_code // "n/a")) : \(.note // "")"'
+            else
+              # Repli : l'agent n'a pas produit le bloc JSON structuré demandé
+              # (peut arriver selon le modèle) — on retombe sur la recherche
+              # récursive d'un statut global, comme avant.
+              echo "⚠️ Bloc JSON structuré introuvable, repli sur l'ancienne extraction"
+              STATUS=$(jq -r '[.. | .status? // empty] | map(select(type == "string")) | first // "UNKNOWN"' output.json 2>/dev/null)
+              REASON=$(jq -r '[.. | .text? // empty] | map(select(type == "string")) | first // ""' output.json 2>/dev/null | head -c 300)
+              if [ -z "$STATUS" ] || [ "$STATUS" == "null" ]; then
+                if grep -qi "up" output.json; then
+                  STATUS="UP"
+                  REASON="Site appears operational (extracted from text)"
+                elif grep -qi "down" output.json; then
+                  STATUS="DOWN"
+                  REASON="Site appears down (extracted from text)"
+                else
+                  STATUS="UNKNOWN"
+                  REASON="No status indicator found in output"
+                fi
               fi
             fi
           fi
@@ -255,10 +308,11 @@ jobs:
           echo "Statut final: $STATUS"
           echo "Message: $REASON"
 
+          jq -n --arg status "$STATUS" --arg message "$REASON" '{status: $status, message: $message}' | \
           curl -X POST "https://kuma-relay.up.railway.app/sites/${{ matrix.site.id }}/mark-crawled" \
             -H "x-relay-secret: ${{ secrets.RELAY_SECRET }}" \
             -H "Content-Type: application/json" \
-            -d "{\"status\": \"$STATUS\", \"message\": \"$REASON\"}" \
+            -d @- \
             || echo "Relay report failed"
 
         env:
@@ -272,4 +326,5 @@ jobs:
           path: |
             gateway.log
             output.json
+            pages.json
             ~/.openclaw/workspace/screenshots/
