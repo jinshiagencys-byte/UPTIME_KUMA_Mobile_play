@@ -1,3 +1,4 @@
+````yaml
 name: OpenClaw - Monitoring Autonome Multi-Sites
 
 on:
@@ -8,6 +9,7 @@ on:
 jobs:
   fetch-sites:
     runs-on: ubuntu-latest
+
     outputs:
       sites: ${{ steps.get-sites.outputs.sites }}
 
@@ -30,21 +32,30 @@ jobs:
         site: ${{ fromJson(needs.fetch-sites.outputs.sites) }}
 
     steps:
+
       - name: Checkout du code
         uses: actions/checkout@v4
 
       - name: Installer Playwright
-        run: npx playwright install --with-deps chromium
+        run: |
+          npx playwright install --with-deps chromium
 
       - name: Installer OpenClaw
         run: |
           curl -fsSL https://openclaw.ai/install.sh | bash
+
           echo "$HOME/.npm-global/bin" >> "$GITHUB_PATH"
+
           ~/.npm-global/bin/openclaw --version
 
-      - name: Configurer OpenClaw (fichier minimal)
+      - name: Configurer OpenClaw / OpenRouter
         run: |
+
           mkdir -p ~/.openclaw
+
+          echo "======================================"
+          echo "Configuration OpenClaw / OpenRouter"
+          echo "======================================"
 
           cat > ~/.openclaw/openclaw.json << 'EOF'
           {
@@ -76,23 +87,24 @@ jobs:
                   ]
                 }
               }
+            },
+            "plugins": {
+              "entries": {
+                "perplexity": {
+                  "enabled": false
+                }
+              }
             }
           }
           EOF
 
-          echo "======================================"
-          echo "Configuration OpenClaw / OpenRouter"
-          echo "======================================"
-
+          echo "Configuration créée :"
           cat ~/.openclaw/openclaw.json
 
           echo "======================================"
-          echo "Désactivation des plugins non nécessaires"
+          echo "Désactivation Perplexity"
           echo "======================================"
 
-          # Perplexity n'est pas utilisé dans ce workflow.
-          # Sa demande de capability consent empêchait le Gateway
-          # de démarrer.
           ~/.npm-global/bin/openclaw plugins disable perplexity 2>/dev/null || true
 
           echo "======================================"
@@ -112,10 +124,10 @@ jobs:
             openrouter/minimax/minimax-m3:free || true
 
           echo "======================================"
-          echo "Plugins actifs"
+          echo "Vérification de la configuration"
           echo "======================================"
 
-          ~/.npm-global/bin/openclaw plugins list --enabled || true
+          ~/.npm-global/bin/openclaw config get plugins.entries.perplexity.enabled 2>/dev/null || true
 
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
@@ -132,17 +144,17 @@ jobs:
           3. Teste chacune de ces actions et vérifie le résultat attendu.
 
           4. Si une action t'amène sur une NOUVELLE URL (navigation, clic sur un
-             lien, soumission de formulaire, etc.), traite cette URL comme une
-             page à part entière à surveiller : note son statut individuellement,
-             pas seulement l'action qui y a mené.
+          lien, soumission de formulaire, etc.), traite cette URL comme une
+          page à part entière à surveiller : note son statut individuellement,
+          pas seulement l'action qui y a mené.
 
           5. Si erreur JS, page blanche, ou action qui ne fait rien, prends une
-             capture d'écran et note-le.
+          capture d'écran et note-le.
 
           6. Termine ta réponse par TON VERDICT EN LANGAGE NATUREL COMME AVANT,
-             puis ajoute IMPÉRATIVEMENT à la toute fin, dans un bloc de code
-             ```json, un objet structuré au format EXACT suivant (rien d'autre
-             dans ce bloc, pas de commentaire) :
+          puis ajoute IMPÉRATIVEMENT à la toute fin, dans un bloc de code
+          ```json
+          un objet structuré au format EXACT suivant :
 
           ```json
           {
@@ -159,19 +171,20 @@ jobs:
           ```
 
           - "overall_status" et chaque "status" de page valent uniquement
-            "UP" ou "DOWN" (majuscules, rien d'autre).
+          "UP" ou "DOWN" (majuscules, rien d'autre).
 
           - Inclus une entrée "pages" pour l'URL de départ ET pour chaque
-            URL distincte atteinte pendant l'exploration (y compris les
-            404 ou erreurs).
+          URL distincte atteinte pendant l'exploration (y compris les
+          404 ou erreurs).
 
           - "http_code" est le code HTTP observé si tu as pu le déterminer,
-            sinon null.
+          sinon null.
           EOF
 
-      - name: Lancer OpenClaw (avec Gateway persistent)
+      - name: Lancer OpenClaw avec Gateway
         id: agent_run
         run: |
+
           set +e
 
           # ============================================================
@@ -184,22 +197,82 @@ jobs:
           )
 
           # ============================================================
+          # DESACTIVATION DEFINITIVE DE PERPLEXITY
+          # ============================================================
+
+          disable_unneeded_plugins() {
+
+            echo "======================================"
+            echo "Désactivation des plugins inutiles"
+            echo "======================================"
+
+            ~/.npm-global/bin/openclaw plugins disable perplexity \
+              2>/dev/null || true
+
+            # Réécrit explicitement la configuration.
+            # Cela évite que le Gateway recharge Perplexity
+            # comme plugin actif.
+
+            node << 'NODE'
+          const fs = require("fs");
+
+          const path = process.env.HOME + "/.openclaw/openclaw.json";
+
+          let config = {};
+
+          if (fs.existsSync(path)) {
+            config = JSON.parse(fs.readFileSync(path, "utf8"));
+          }
+
+          config.plugins = config.plugins || {};
+          config.plugins.entries = config.plugins.entries || {};
+
+          config.plugins.entries.perplexity = {
+            enabled: false
+          };
+
+          fs.writeFileSync(
+            path,
+            JSON.stringify(config, null, 2) + "\n"
+          );
+
+          console.log("Perplexity forcé à enabled=false");
+          NODE
+
+            echo "Configuration finale :"
+
+            jq '.plugins.entries.perplexity' \
+              ~/.openclaw/openclaw.json \
+              2>/dev/null || true
+          }
+
+          # ============================================================
           # DEMARRAGE DU GATEWAY
           # ============================================================
 
           start_gateway() {
-            echo "🔧 Démarrage du Gateway..."
 
-            ~/.npm-global/bin/openclaw gateway stop 2>/dev/null || true
+            echo "======================================"
+            echo "Démarrage du Gateway"
+            echo "======================================"
 
-            pkill -f "openclaw gateway" 2>/dev/null || true
+            disable_unneeded_plugins
+
+            ~/.npm-global/bin/openclaw gateway stop \
+              2>/dev/null || true
+
+            sleep 2
+
+            # Nettoyage uniquement des processus Gateway existants.
+            pkill -f "openclaw gateway" \
+              2>/dev/null || true
 
             sleep 3
 
-            # Vérification supplémentaire :
-            # Perplexity ne doit pas bloquer le Gateway.
-            ~/.npm-global/bin/openclaw plugins disable perplexity \
-              2>/dev/null || true
+            # Dernière vérification avant démarrage.
+            disable_unneeded_plugins
+
+            echo "Lancement du Gateway..."
 
             nohup ~/.npm-global/bin/openclaw gateway \
               --force \
@@ -211,22 +284,45 @@ jobs:
 
             echo "Gateway PID: $GATEWAY_PID"
 
-            echo "⏳ Attente du Gateway (30s)..."
+            echo "⏳ Attente du Gateway..."
 
-            sleep 30
+            for i in $(seq 1 30); do
 
-            if ~/.npm-global/bin/openclaw gateway status 2>&1 | grep -qi "running"; then
-              echo "✅ Gateway opérationnel"
-              return 0
-            fi
+              sleep 1
 
-            echo "❌ Gateway non disponible"
+              if ~/.npm-global/bin/openclaw gateway status \
+                2>/dev/null | grep -qi "running"; then
+
+                echo "✅ Gateway opérationnel"
+
+                return 0
+
+              fi
+
+              # Vérifie également si le processus existe toujours.
+              if ! kill -0 "$GATEWAY_PID" 2>/dev/null; then
+
+                echo "❌ Le processus Gateway s'est arrêté."
+
+                echo "======================================"
+                echo "gateway.log"
+                echo "======================================"
+
+                cat gateway.log 2>/dev/null || true
+
+                return 1
+
+              fi
+
+            done
+
+            echo "❌ Gateway non disponible après 30 secondes"
 
             echo "======================================"
             echo "gateway.log"
             echo "======================================"
 
-            cat gateway.log
+            cat gateway.log 2>/dev/null || true
 
             echo "======================================"
 
@@ -238,11 +334,13 @@ jobs:
           # ============================================================
 
           run_agent() {
-            local model=$1
-            local session_suffix=$2
+
+            local model="$1"
+            local session_suffix="$2"
 
             echo "======================================"
-            echo "Test avec $model pour ${{ matrix.site.url }}"
+            echo "Test avec $model"
+            echo "Site : ${{ matrix.site.url }}"
             echo "======================================"
 
             ~/.npm-global/bin/openclaw models set "$model" || true
@@ -260,13 +358,16 @@ jobs:
           # ============================================================
 
           is_success() {
+
             local status
 
             status=$(jq -r \
               '[.. | .status? // empty] |
-               map(select(type == "string")) |
-               first // empty' \
-              "$1" 2>/dev/null)
+              map(select(type == "string")) |
+              first // empty' \
+              output.json 2>/dev/null)
+
+            echo "Statut détecté : $status"
 
             echo "$status" | grep -qiE '^(up|ok)$'
           }
@@ -276,29 +377,21 @@ jobs:
           # ============================================================
 
           gateway_actually_down() {
+
             grep -qi \
-              "ECONNREFUSED\|gateway not reachable\|gateway may still be running" \
-              "$1"
+              "ECONNREFUSED\|gateway not reachable\|Gateway not reachable" \
+              output.json 2>/dev/null
           }
 
           # ============================================================
-          # DETECTION AUTH OPENROUTER
+          # DETECTION AUTH
           # ============================================================
 
           auth_error() {
-            grep -qi \
-              "401\|unauthorized\|authentication\|invalid api key\|no api key" \
-              "$1"
-          }
 
-          # ============================================================
-          # DETECTION RATE LIMIT
-          # ============================================================
-
-          rate_limit() {
             grep -qi \
-              "429\|rate limit\|too many requests\|quota\|resource exhausted" \
-              "$1"
+              "401\|unauthorized\|invalid api key\|no api key" \
+              output.json 2>/dev/null
           }
 
           # ============================================================
@@ -306,136 +399,154 @@ jobs:
           # ============================================================
 
           model_not_found() {
+
             grep -qi \
               "model was not found\|model_not_found\|model.*not.*found\|unknown model" \
-              "$1"
+              output.json 2>/dev/null
           }
 
           # ============================================================
-          # GATEWAY
+          # DETECTION RATE LIMIT
           # ============================================================
 
-          start_gateway || true
+          rate_limit() {
+
+            grep -qi \
+              "429\|rate limit\|too many requests\|quota" \
+              output.json 2>/dev/null
+          }
 
           # ============================================================
-          # ESSAI 1 : MINIMAX
+          # DEMARRAGE GATEWAY
           # ============================================================
 
-          run_agent \
-            "openrouter/minimax/minimax-m3:free" \
-            "minimax1"
+          if ! start_gateway; then
 
-          if is_success output.json; then
+            echo "❌ Impossible de démarrer le Gateway."
 
-            echo "✅ Succès avec MiniMax M3"
-
-            echo "agent_failed=false" >> "$GITHUB_OUTPUT"
-
-            exit 0
-
-          fi
-
-          # ============================================================
-          # GATEWAY INJOIGNABLE
-          # ============================================================
-
-          if gateway_actually_down output.json; then
-
-            echo "🔄 Gateway injoignable, redémarrage..."
-
-            start_gateway || true
-
-            run_agent \
-              "openrouter/minimax/minimax-m3:free" \
-              "minimax2"
-
-            if is_success output.json; then
-
-              echo "✅ Succès avec MiniMax M3 (2e tentative)"
-
-              echo "agent_failed=false" >> "$GITHUB_OUTPUT"
-
-              exit 0
-
-            fi
-
-          elif rate_limit output.json; then
-
-            echo "⚠️ Rate limit détecté, nouvelle tentative dans 30s..."
-
-            sleep 30
-
-            run_agent \
-              "openrouter/minimax/minimax-m3:free" \
-              "minimax2"
-
-            if is_success output.json; then
-
-              echo "✅ Succès avec MiniMax M3 (2e tentative)"
-
-              echo "agent_failed=false" >> "$GITHUB_OUTPUT"
-
-              exit 0
-
-            fi
-
-          fi
-
-          # ============================================================
-          # FALLBACK GLM
-          # ============================================================
-
-          echo "======================================"
-          echo "🔁 Fallback OpenRouter"
-          echo "======================================"
-
-          run_agent \
-            "openrouter/z-ai/glm-5.2:free" \
-            "glm1"
-
-          if is_success output.json; then
-
-            echo "✅ Succès avec GLM 5.2"
-
-            echo "agent_failed=false" >> "$GITHUB_OUTPUT"
-
-            exit 0
-
-          fi
-
-          # ============================================================
-          # DIAGNOSTIC FINAL
-          # ============================================================
-
-          if auth_error output.json; then
-
-            echo "🛑 Erreur d'authentification OpenRouter."
-
-          elif model_not_found output.json; then
-
-            echo "🛑 Modèle OpenRouter introuvable."
-
-          elif rate_limit output.json; then
-
-            echo "🛑 Rate limit / quota OpenRouter."
-
-          elif gateway_actually_down output.json; then
-
-            echo "🛑 Gateway OpenClaw inaccessible."
+            echo "agent_failed=true" >> "$GITHUB_OUTPUT"
 
           else
 
-            echo "🛑 Échec OpenClaw non catégorisé."
+            # ==========================================================
+            # ESSAI 1 : MINIMAX
+            # ==========================================================
+
+            run_agent \
+              "openrouter/minimax/minimax-m3:free" \
+              "minimax1"
+
+            if is_success; then
+
+              echo "✅ Succès avec MiniMax"
+
+              echo "agent_failed=false" >> "$GITHUB_OUTPUT"
+
+              exit 0
+
+            fi
+
+            # ==========================================================
+            # SI GATEWAY TOMBE
+            # ==========================================================
+
+            if gateway_actually_down; then
+
+              echo "🔄 Gateway injoignable."
+
+              if start_gateway; then
+
+                run_agent \
+                  "openrouter/minimax/minimax-m3:free" \
+                  "minimax2"
+
+                if is_success; then
+
+                  echo "✅ Succès avec MiniMax après redémarrage"
+
+                  echo "agent_failed=false" >> "$GITHUB_OUTPUT"
+
+                  exit 0
+
+                fi
+
+              fi
+
+            elif rate_limit; then
+
+              echo "⚠️ Rate limit MiniMax."
+
+              sleep 30
+
+              run_agent \
+                "openrouter/minimax/minimax-m3:free" \
+                "minimax2"
+
+              if is_success; then
+
+                echo "✅ Succès avec MiniMax après rate limit"
+
+                echo "agent_failed=false" >> "$GITHUB_OUTPUT"
+
+                exit 0
+
+              fi
+
+            fi
+
+            # ==========================================================
+            # FALLBACK GLM
+            # ==========================================================
+
+            echo "======================================"
+            echo "🔁 Fallback OpenRouter"
+            echo "======================================"
+
+            run_agent \
+              "openrouter/z-ai/glm-5.2:free" \
+              "glm1"
+
+            if is_success; then
+
+              echo "✅ Succès avec GLM"
+
+              echo "agent_failed=false" >> "$GITHUB_OUTPUT"
+
+              exit 0
+
+            fi
+
+            # ==========================================================
+            # DIAGNOSTIC FINAL
+            # ==========================================================
+
+            if auth_error; then
+
+              echo "🛑 Erreur d'authentification OpenRouter."
+
+            elif model_not_found; then
+
+              echo "🛑 Modèle OpenRouter introuvable."
+
+            elif rate_limit; then
+
+              echo "🛑 Rate limit OpenRouter."
+
+            elif gateway_actually_down; then
+
+              echo "🛑 Gateway OpenClaw inaccessible."
+
+            else
+
+              echo "🛑 Erreur OpenClaw non catégorisée."
+
+            fi
+
+            echo "❌ Aucun modèle OpenRouter gratuit n'a fonctionné."
+
+            echo "agent_failed=true" >> "$GITHUB_OUTPUT"
 
           fi
-
-          echo "❌ Échec final : aucun modèle OpenRouter gratuit n'a fonctionné"
-
-          echo "agent_failed=true" >> "$GITHUB_OUTPUT"
-
-        env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          OPENCLAW_GATEWAY_TOKEN: "ci-test-token-12345"
 
       - name: Extraire et envoyer le résultat
         if: always()
@@ -453,19 +564,11 @@ jobs:
 
           else
 
-            # ============================================================
-            # TEXTE FINAL DE L'AGENT
-            # ============================================================
-
             AGENT_TEXT=$(jq -r \
               '[.. | .text? // empty] |
-               map(select(type == "string")) |
-               first // ""' \
+              map(select(type == "string")) |
+              first // ""' \
               output.json 2>/dev/null)
-
-            # ============================================================
-            # EXTRACTION DU DERNIER BLOC JSON
-            # ============================================================
 
             PAGES_JSON=$(printf '%s' "$AGENT_TEXT" | awk '
               /```json/ {
@@ -491,10 +594,6 @@ jobs:
               }
             ')
 
-            # ============================================================
-            # VALIDATION
-            # ============================================================
-
             if echo "$PAGES_JSON" | \
               jq -e '.overall_status and .pages' \
               > /dev/null 2>&1; then
@@ -507,8 +606,7 @@ jobs:
 
               echo "$PAGES_JSON" > pages.json
 
-              echo "📄 $(echo "$PAGES_JSON" | \
-                jq '.pages | length') page(s) rapportée(s) :"
+              echo "📄 Pages rapportées :"
 
               echo "$PAGES_JSON" | \
                 jq -r \
@@ -517,18 +615,18 @@ jobs:
 
             else
 
-              echo "⚠️ Bloc JSON structuré introuvable, repli sur l'ancienne extraction"
+              echo "⚠️ Bloc JSON structuré introuvable."
 
               STATUS=$(jq -r \
                 '[.. | .status? // empty] |
-                 map(select(type == "string")) |
-                 first // "UNKNOWN"' \
+                map(select(type == "string")) |
+                first // "UNKNOWN"' \
                 output.json 2>/dev/null)
 
               REASON=$(jq -r \
                 '[.. | .text? // empty] |
-                 map(select(type == "string")) |
-                 first // ""' \
+                map(select(type == "string")) |
+                first // ""' \
                 output.json 2>/dev/null |
                 head -c 300)
 
@@ -537,12 +635,12 @@ jobs:
                 if grep -qi "up" output.json; then
 
                   STATUS="UP"
-                  REASON="Site appears operational (extracted from text)"
+                  REASON="Site appears operational"
 
                 elif grep -qi "down" output.json; then
 
                   STATUS="DOWN"
-                  REASON="Site appears down (extracted from text)"
+                  REASON="Site appears down"
 
                 else
 
@@ -559,10 +657,6 @@ jobs:
 
           echo "Statut final: $STATUS"
           echo "Message: $REASON"
-
-          # ============================================================
-          # ENVOI AU RELAY
-          # ============================================================
 
           jq -n \
             --arg status "$STATUS" \
@@ -594,3 +688,4 @@ jobs:
             output.json
             pages.json
             ~/.openclaw/workspace/screenshots/
+````
