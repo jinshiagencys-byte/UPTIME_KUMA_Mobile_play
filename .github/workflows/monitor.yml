@@ -68,6 +68,13 @@ jobs:
                   "models": [
                     { "id": "gemini-2.5-pro", "name": "gemini-2.5-pro" }
                   ]
+                },
+                "huggingface": {
+                  "api": "openai-completions",
+                  "baseUrl": "https://router.huggingface.co/v1",
+                  "models": [
+                    { "id": "deepseek-ai/DeepSeek-R1", "name": "deepseek-ai/DeepSeek-R1" }
+                  ]
                 }
               }
             }
@@ -85,6 +92,7 @@ jobs:
           # tous les providers (vu en CI : "No API key found for provider").
           printf "%s\n" "$MISTRAL_API_KEY" | ~/.npm-global/bin/openclaw models auth paste-api-key --provider mistral || echo "⚠️ Échec enregistrement clé Mistral"
           printf "%s\n" "$GOOGLE_API_KEY" | ~/.npm-global/bin/openclaw models auth paste-api-key --provider google || echo "⚠️ Échec enregistrement clé Google"
+          printf "%s\n" "$HF_API_KEY" | ~/.npm-global/bin/openclaw models auth paste-api-key --provider huggingface || echo "⚠️ Échec enregistrement clé HuggingFace"
 
           # Utiliser `models set` (et non `config set agents.defaults.model`) :
           # cette commande configure aussi le runtime associé au modèle, ce qui
@@ -94,6 +102,7 @@ jobs:
         env:
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          HF_API_KEY: ${{ secrets.HF_API_KEY }}
 
       - name: Générer la tâche
         run: |
@@ -257,7 +266,7 @@ jobs:
             fi
           fi
 
-          # Fallback : Google Gemini (même Gateway, juste un changement de modèle)
+          # Fallback 1 : Google Gemini (même Gateway, juste un changement de modèle)
           echo "======================================"
           echo "🔁 Fallback sur Google Gemini"
           echo "======================================"
@@ -266,14 +275,27 @@ jobs:
           if is_success output.json; then
             echo "✅ Succès avec Google Gemini"
             echo "agent_failed=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Fallback 2 : Hugging Face (même Gateway, juste un changement de modèle)
+          echo "======================================"
+          echo "🔁 Fallback sur Hugging Face"
+          echo "======================================"
+          run_agent "huggingface/deepseek-ai/DeepSeek-R1" "hf1"
+
+          if is_success output.json; then
+            echo "✅ Succès avec Hugging Face"
+            echo "agent_failed=false" >> $GITHUB_OUTPUT
           else
-            echo "❌ Échec final avec Google Gemini"
+            echo "❌ Échec final avec Hugging Face"
             echo "agent_failed=true" >> $GITHUB_OUTPUT
           fi
 
         env:
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          HF_API_KEY: ${{ secrets.HF_API_KEY }}
           OPENCLAW_GATEWAY_TOKEN: "ci-test-token-12345"
 
       - name: Extraire et envoyer le résultat
