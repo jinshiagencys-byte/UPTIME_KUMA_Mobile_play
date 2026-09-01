@@ -73,7 +73,7 @@ jobs:
                   "api": "openai-completions",
                   "baseUrl": "https://router.huggingface.co/v1",
                   "models": [
-                    { "id": "deepseek-ai/DeepSeek-R1", "name": "deepseek-ai/DeepSeek-R1" }
+                    { "id": "openai/gpt-oss-120b:cerebras", "name": "openai/gpt-oss-120b:cerebras" }
                   ]
                 }
               }
@@ -282,7 +282,7 @@ jobs:
           echo "======================================"
           echo "🔁 Fallback sur Hugging Face"
           echo "======================================"
-          run_agent "huggingface/deepseek-ai/DeepSeek-R1" "hf1"
+          run_agent "huggingface/openai/gpt-oss-120b:cerebras" "hf1"
 
           if is_success output.json; then
             echo "✅ Succès avec Hugging Face"
