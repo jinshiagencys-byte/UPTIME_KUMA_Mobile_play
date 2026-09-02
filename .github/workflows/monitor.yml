@@ -33,6 +33,13 @@ jobs:
       - name: Installer Playwright
         run: npx playwright install --with-deps chromium
 
+      - name: Mesurer SSL + temps de chargement (avant OpenClaw)
+        run: |
+          node check-metrics.js "${{ matrix.site.id }}" "${{ matrix.site.url }}" || echo "⚠️ Échec mesure métriques (non bloquant)"
+        env:
+          RELAY_URL: https://kuma-relay.up.railway.app
+          RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
+
       - name: Installer OpenClaw
         run: |
           curl -fsSL https://openclaw.ai/install.sh | bash
