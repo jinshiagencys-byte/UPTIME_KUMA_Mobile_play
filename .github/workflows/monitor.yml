@@ -88,23 +88,13 @@ jobs:
           }
           EOF
 
-          # Consentement de capacités requis pour que le plugin mistral
-          # se charge correctement au démarrage du Gateway (sinon "Plugin
-          # mistral requires capability consent" et le Gateway ne démarre pas)
           ~/.npm-global/bin/openclaw plugins install mistral --accept-capabilities 2>/dev/null || true
           ~/.npm-global/bin/openclaw plugins enable mistral --accept-capabilities 2>/dev/null || true
 
-          # Enregistrer les clés API dans le auth store d'OpenClaw : les
-          # variables d'env seules ne sont PAS reprises automatiquement par
-          # tous les providers (vu en CI : "No API key found for provider").
           printf "%s\n" "$MISTRAL_API_KEY" | ~/.npm-global/bin/openclaw models auth paste-api-key --provider mistral || echo "⚠️ Échec enregistrement clé Mistral"
           printf "%s\n" "$GOOGLE_API_KEY" | ~/.npm-global/bin/openclaw models auth paste-api-key --provider google || echo "⚠️ Échec enregistrement clé Google"
           printf "%s\n" "$HF_API_KEY" | ~/.npm-global/bin/openclaw models auth paste-api-key --provider huggingface || echo "⚠️ Échec enregistrement clé HuggingFace"
 
-          # Utiliser `models set` (et non `config set agents.defaults.model`) :
-          # cette commande configure aussi le runtime associé au modèle, ce qui
-          # évite que le Gateway retombe sur son défaut openai/* nécessitant
-          # le plugin "codex" (non installé/non authentifié ici).
           ~/.npm-global/bin/openclaw models set mistral/mistral-small-latest || true
         env:
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
@@ -180,14 +170,6 @@ jobs:
         run: |
           set +e
 
-          # Fonction pour démarrer le Gateway avec vérification.
-          # Appelée UNE SEULE FOIS pour tout le job : changer de modèle entre
-          # tentatives ne nécessite pas de redémarrage ("Change will apply
-          # without restarting the gateway"), et le check de statut par grep
-          # s'est révélé peu fiable (faux "not running" alors que le process
-          # tournait), provoquant des conflits "already owns this state
-          # directory". On ne redémarre donc plus qu'en tout dernier recours,
-          # si l'agent ne peut vraiment plus joindre le Gateway.
           start_gateway() {
             echo "🔧 Démarrage du Gateway..."
             ~/.npm-global/bin/openclaw gateway stop 2>/dev/null || true
@@ -207,8 +189,6 @@ jobs:
             fi
           }
 
-          # Fonction pour exécuter l'agent avec un modèle donné.
-          # Ne touche jamais au Gateway — seulement au modèle par défaut.
           run_agent() {
             local model=$1
             local session_suffix=$2
@@ -224,26 +204,17 @@ jobs:
           }
 
           is_success() {
-            # Utilise jq pour trouver n'importe quel champ "status" à
-            # n'importe quelle profondeur (le JSON de sortie est indenté et
-            # sa structure peut varier — un grep sur une forme compacte
-            # ratait les succès réels et déclenchait un fallback inutile)
             local status
             status=$(jq -r '[.. | .status? // empty] | map(select(type == "string")) | first // empty' "$1" 2>/dev/null)
             echo "$status" | grep -qiE '^(up|ok)$'
           }
 
-          # Le Gateway ne meurt vraiment que si le message d'erreur le confirme
-          # explicitement (ECONNREFUSED / gateway not reachable) — pas sur un
-          # simple échec applicatif (mauvais modèle, clé manquante, etc.)
           gateway_actually_down() {
             grep -qi "ECONNREFUSED\|gateway not reachable\|gateway may still be running" "$1"
           }
 
-          # Démarrage unique du Gateway pour tout le job
           start_gateway || true
 
-          # Essai 1 : Mistral
           run_agent "mistral/mistral-small-latest" "mistral1"
 
           if is_success output.json; then
@@ -252,7 +223,6 @@ jobs:
             exit 0
           fi
 
-          # Si le Gateway est vraiment injoignable, un seul redémarrage puis nouvel essai Mistral
           if gateway_actually_down output.json; then
             echo "🔄 Gateway injoignable, redémarrage..."
             start_gateway || true
@@ -273,7 +243,6 @@ jobs:
             fi
           fi
 
-          # Fallback 1 : Google Gemini (même Gateway, juste un changement de modèle)
           echo "======================================"
           echo "🔁 Fallback sur Google Gemini"
           echo "======================================"
@@ -285,7 +254,6 @@ jobs:
             exit 0
           fi
 
-          # Fallback 2 : Hugging Face (même Gateway, juste un changement de modèle)
           echo "======================================"
           echo "🔁 Fallback sur Hugging Face"
           echo "======================================"
@@ -311,16 +279,13 @@ jobs:
           if [ ! -f output.json ] || [ ! -s output.json ]; then
             STATUS="ERROR"
             REASON="Agent output missing or empty"
+            PAGES_JSON=""
           elif [ "${{ steps.agent_run.outputs.agent_failed }}" == "true" ]; then
             STATUS="ERROR"
             REASON="Agent execution failed after all attempts"
+            PAGES_JSON=""
           else
-            # 1) Texte final de l'agent (peut contenir plusieurs blocs de code,
-            # on prend le dernier bloc ```json — c'est celui qu'on a demandé
-            # en toute fin du prompt).
             AGENT_TEXT=$(jq -r '[.. | .text? // empty] | map(select(type == "string")) | first // ""' output.json 2>/dev/null)
-
-            # 2) Extraire le dernier bloc ```json ... ``` du texte de l'agent
             PAGES_JSON=$(printf '%s' "$AGENT_TEXT" | awk '
               /```json/ { capture=1; buf=""; next }
               /```/ { if (capture) { last=buf; capture=0 } ; next }
@@ -329,7 +294,6 @@ jobs:
             ')
 
             if echo "$PAGES_JSON" | jq -e '.overall_status and .pages' > /dev/null 2>&1; then
-              # Structure demandée trouvée : c'est la source de vérité
               STATUS=$(echo "$PAGES_JSON" | jq -r '.overall_status // "UNKNOWN"')
               SITE_TYPE=$(echo "$PAGES_JSON" | jq -r '.site_type // "non détecté"')
               REASON=$(echo "$PAGES_JSON" | jq -c '.pages')
@@ -338,9 +302,6 @@ jobs:
               echo "📄 $(echo "$PAGES_JSON" | jq '.pages | length') page(s) rapportée(s) :"
               echo "$PAGES_JSON" | jq -r '.pages[] | "  - \(.url) → \(.status) (http=\(.http_code // "n/a")) : \(.action_tested // "navigation simple") — \(.note // "")"'
             else
-              # Repli : l'agent n'a pas produit le bloc JSON structuré demandé
-              # (peut arriver selon le modèle) — on retombe sur la recherche
-              # récursive d'un statut global, comme avant.
               echo "⚠️ Bloc JSON structuré introuvable, repli sur l'ancienne extraction"
               STATUS=$(jq -r '[.. | .status? // empty] | map(select(type == "string")) | first // "UNKNOWN"' output.json 2>/dev/null)
               REASON=$(jq -r '[.. | .text? // empty] | map(select(type == "string")) | first // ""' output.json 2>/dev/null | head -c 300)
@@ -356,18 +317,31 @@ jobs:
                   REASON="No status indicator found in output"
                 fi
               fi
+              PAGES_JSON=""
             fi
           fi
 
           echo "Statut final: $STATUS"
           echo "Message: $REASON"
 
+          if [ -n "$PAGES_JSON" ] && echo "$PAGES_JSON" | jq -e '.pages' > /dev/null 2>&1; then
+            echo "📤 Envoi du rapport pages à /pages-report"
+            echo "$PAGES_JSON" | jq -c '{pages: .pages}' | \
+            curl -X POST "https://kuma-relay.up.railway.app/sites/${{ matrix.site.id }}/pages-report" \
+              -H "x-relay-secret: ${{ secrets.RELAY_SECRET }}" \
+              -H "Content-Type: application/json" \
+              -d @- \
+              || echo "⚠️ Envoi pages-report échoué"
+          else
+            echo "ℹ️ Aucun rapport pages structuré à envoyer"
+          fi
+
           jq -n --arg status "$STATUS" --arg message "$REASON" '{status: $status, message: $message}' | \
           curl -X POST "https://kuma-relay.up.railway.app/sites/${{ matrix.site.id }}/mark-crawled" \
             -H "x-relay-secret: ${{ secrets.RELAY_SECRET }}" \
             -H "Content-Type: application/json" \
             -d @- \
-            || echo "Relay report failed"
+            || echo "⚠️ Envoi mark-crawled échoué"
 
         env:
           RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
