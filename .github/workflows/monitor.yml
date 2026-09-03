@@ -111,9 +111,9 @@ jobs:
           }
           EOF
 
-          ~/.npm-global/bin/openclaw plugins install mistral --accept-capabilities --yes 2>/dev/null || true
-          ~/.npm-global/bin/openclaw plugins enable mistral --accept-capabilities --yes 2>/dev/null || true
-          ~/.npm-global/bin/openclaw plugins enable perplexity --accept-capabilities --yes 2>/dev/null || true
+          ~/.npm-global/bin/openclaw plugins install mistral --accept-capabilities || echo "⚠️ install mistral échoué"
+          ~/.npm-global/bin/openclaw plugins enable mistral --accept-capabilities || echo "⚠️ enable mistral échoué"
+          ~/.npm-global/bin/openclaw plugins registry --refresh || true
 
           printf "%s\n" "$MISTRAL_API_KEY" | ~/.npm-global/bin/openclaw models auth paste-api-key --provider mistral || echo "⚠️ Échec enregistrement clé Mistral"
           printf "%s\n" "$GOOGLE_API_KEY" | ~/.npm-global/bin/openclaw models auth paste-api-key --provider google || echo "⚠️ Échec enregistrement clé Google"
@@ -204,41 +204,34 @@ jobs:
             pkill -f "openclaw gateway" || true
             sleep 3
 
-            # 1) Réparation/convergence AVANT les enables pour éviter que
-            #    le consentement ne soit écrasé par update repair après.
-            echo "🔧 Exécution de update repair (convergence)..."
-            ~/.npm-global/bin/openclaw update repair --yes || echo "⚠️ update repair a échoué (non bloquant)"
+            echo "🔧 Rafraîchissement du registre de plugins..."
+            ~/.npm-global/bin/openclaw plugins registry --refresh || echo "⚠️ registry --refresh échoué (non bloquant)"
 
-            # 2) Désactiver perplexity car il n'est pas utilisé et cause
-            #    des blocages de consentement résiduels.
             echo "🔧 Désactivation de perplexity..."
-            if ! ~/.npm-global/bin/openclaw plugins disable perplexity --yes; then
-              echo "⚠️ Échec de la désactivation de perplexity (non bloquant)"
-              ~/.npm-global/bin/openclaw plugins disable perplexity --yes 2>&1 | tail -20
-            fi
+            ~/.npm-global/bin/openclaw plugins disable perplexity 2>&1 | tail -5 || true
+            ~/.npm-global/bin/openclaw config set plugins.entries.perplexity.enabled false || true
 
-            # 3) Activer mistral avec consentement explicite.
             echo "🔧 Activation de mistral avec consentement..."
-            if ! ~/.npm-global/bin/openclaw plugins enable mistral --accept-capabilities --yes; then
+            if ! ~/.npm-global/bin/openclaw plugins enable mistral --accept-capabilities; then
               echo "❌ Consentement mistral échoué"
-              ~/.npm-global/bin/openclaw plugins enable mistral --accept-capabilities --yes 2>&1 | tail -20
+              ~/.npm-global/bin/openclaw plugins enable mistral --accept-capabilities 2>&1 | tail -20
             fi
 
-            # Optionnel : afficher l'état des plugins pour debug
-            ~/.npm-global/bin/openclaw plugins list --json || echo "⚠️ Impossible de lister les plugins"
+            ~/.npm-global/bin/openclaw plugins list --json | jq -r '.plugins[]? | "\(.id): \(.status)"' | head -20 || true
 
-            # 4) Démarrer le gateway
-            nohup ~/.npm-global/bin/openclaw gateway --force --port 18789 --allow-unconfigured > gateway.log 2>&1 &
-            echo "⏳ Attente du Gateway (30s)..."
-            sleep 30
-            if ~/.npm-global/bin/openclaw gateway status 2>&1 | grep -q "running"; then
-              echo "✅ Gateway opérationnel"
-              return 0
-            else
-              echo "❌ Gateway non disponible"
-              cat gateway.log
-              return 1
-            fi
+            nohup ~/.npm-global/bin/openclaw gateway run --force --port 18789 --allow-unconfigured > gateway.log 2>&1 &
+
+            echo "⏳ Attente du Gateway (polling 60s)..."
+            for i in $(seq 1 30); do
+              if ~/.npm-global/bin/openclaw gateway status 2>&1 | grep -qi "running"; then
+                echo "✅ Gateway opérationnel"
+                return 0
+              fi
+              sleep 2
+            done
+            echo "❌ Gateway non disponible après 60s"
+            tail -50 gateway.log
+            return 1
           }
 
           run_agent() {
