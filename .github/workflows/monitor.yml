@@ -14,37 +14,12 @@ jobs:
       - name: Récupérer les sites actifs
         id: get-sites
         run: |
-          # 👇 CORRIGÉ : curl et jq sont désormais découplés, et chaque
-          # échec possible est explicitement neutralisé avec `|| echo ...`.
-          # Raison : les steps bash de GitHub Actions tournent avec
-          # `set -e -o pipefail` implicite. Avant ce fix, si `/active-sites`
-          # répondait une erreur (500, timeout, JSON sans clé "sites"...),
-          # `jq` échouait avec un code non-nul, `pipefail` faisait remonter
-          # cet échec sur toute la pipe `curl | jq`, et `set -e` arrêtait le
-          # script À CETTE LIGNE — avant même d'atteindre le bloc de
-          # fallback juste en dessous. L'output "sites" du job restait donc
-          # vide/non défini, d'où l'erreur GitHub Actions "Matrix vector
-          # 'site' does not contain any values" (fromJson('') sur un output
-          # jamais écrit).
           RAW=$(curl -s https://kuma-relay.up.railway.app/active-sites || echo "")
-
-          # `.sites[]?` : itération "safe" — si la clé "sites" est absente
-          # ou null (ex: réponse d'erreur du relay), ne lève pas d'erreur
-          # jq, produit juste une liste vide. Le `2>/dev/null || echo ""`
-          # couvre en plus le cas où $RAW n'est même pas du JSON valide
-          # (curl a échoué, réponse HTML d'erreur, etc.) — dans TOUS les
-          # cas d'échec, SITES devient une chaîne vide plutôt que de faire
-          # planter le step.
           SITES=$(echo "$RAW" | jq -c '[.sites[]? | {id: .id, url: .site_url}]' 2>/dev/null || echo "")
-
-          # Si SITES est vide, "[]" ou "null" (API en erreur, aucun site
-          # actif/acquitté, etc.), fournir un fallback pour que la matrice
-          # ne soit jamais vide.
           if [ -z "$SITES" ] || [ "$SITES" == "[]" ] || [ "$SITES" == "null" ]; then
             echo "⚠️ Aucun site exploitable retourné par l'API, utilisation d'une valeur par défaut"
             SITES='[{"id":"test","url":"https://example.com"}]'
           fi
-
           echo "sites=$SITES" >> "$GITHUB_OUTPUT"
           echo "📡 Sites à monitorer: $SITES"
 
@@ -138,15 +113,6 @@ jobs:
 
           ~/.npm-global/bin/openclaw plugins install mistral --accept-capabilities --yes 2>/dev/null || true
           ~/.npm-global/bin/openclaw plugins enable mistral --accept-capabilities --yes 2>/dev/null || true
-
-          # 👇 FIX : le plugin "perplexity" (activé par défaut / résiduel dans
-          # ~/.openclaw) exige un consentement de capacités. Tant qu'il ne l'a
-          # pas reçu, OpenClaw refuse de déclarer le Gateway "ready", même si
-          # on n'utilise pas ce plugin pour les tests (voir doc OpenClaw :
-          # "OpenClaw plugin verification failed; refusing to report the
-          # gateway ready" est un blocage par design de la vérification de
-          # plugin, distinct des échecs de migration d'état). On consent ici
-          # explicitement — --yes contourne aussi tout prompt résiduel en CI.
           ~/.npm-global/bin/openclaw plugins enable perplexity --accept-capabilities --yes 2>/dev/null || true
 
           printf "%s\n" "$MISTRAL_API_KEY" | ~/.npm-global/bin/openclaw models auth paste-api-key --provider mistral || echo "⚠️ Échec enregistrement clé Mistral"
@@ -238,18 +204,30 @@ jobs:
             pkill -f "openclaw gateway" || true
             sleep 3
 
-            # Consentement des capacités pour tous les plugins actifs avant
-            # de (re)démarrer le Gateway. --yes contourne tout prompt résiduel.
-            ~/.npm-global/bin/openclaw plugins enable mistral --accept-capabilities --yes 2>/dev/null || true
-            # 👇 FIX principal : sans ce consentement, le Gateway refuse de
-            # se déclarer "ready" à cause du plugin perplexity, quel que
-            # soit le modèle testé ensuite (Mistral, Gemini, HF...).
-            ~/.npm-global/bin/openclaw plugins enable perplexity --accept-capabilities --yes 2>/dev/null || true
+            # 1) Réparation/convergence AVANT les enables pour éviter que
+            #    le consentement ne soit écrasé par update repair après.
+            echo "🔧 Exécution de update repair (convergence)..."
+            ~/.npm-global/bin/openclaw update repair --yes || echo "⚠️ update repair a échoué (non bloquant)"
 
-            # Filet de sécurité supplémentaire : répare les états de plugin
-            # incohérents avant de tenter le démarrage.
-            ~/.npm-global/bin/openclaw update repair --yes 2>/dev/null || true
+            # 2) Désactiver perplexity car il n'est pas utilisé et cause
+            #    des blocages de consentement résiduels.
+            echo "🔧 Désactivation de perplexity..."
+            if ! ~/.npm-global/bin/openclaw plugins disable perplexity --yes; then
+              echo "⚠️ Échec de la désactivation de perplexity (non bloquant)"
+              ~/.npm-global/bin/openclaw plugins disable perplexity --yes 2>&1 | tail -20
+            fi
 
+            # 3) Activer mistral avec consentement explicite.
+            echo "🔧 Activation de mistral avec consentement..."
+            if ! ~/.npm-global/bin/openclaw plugins enable mistral --accept-capabilities --yes; then
+              echo "❌ Consentement mistral échoué"
+              ~/.npm-global/bin/openclaw plugins enable mistral --accept-capabilities --yes 2>&1 | tail -20
+            fi
+
+            # Optionnel : afficher l'état des plugins pour debug
+            ~/.npm-global/bin/openclaw plugins list --json || echo "⚠️ Impossible de lister les plugins"
+
+            # 4) Démarrer le gateway
             nohup ~/.npm-global/bin/openclaw gateway --force --port 18789 --allow-unconfigured > gateway.log 2>&1 &
             echo "⏳ Attente du Gateway (30s)..."
             sleep 30
@@ -339,12 +317,6 @@ jobs:
             exit 0
           fi
 
-          # 👇 Fallback OpenRouter (modèles gratuits vérifiés via l'API live
-          # openrouter.ai/api/v1/models — pricing=0 ET tool-calling supporté).
-          # On essaie plusieurs modèles gratuits dans l'ordre, car un modèle
-          # "free" individuel peut être temporairement indisponible/rate-
-          # limité (quota partagé entre tous les utilisateurs OpenRouter
-          # gratuits) — openrouter/free (routeur auto) sert de dernier filet.
           echo "======================================"
           echo "🔁 Fallback sur OpenRouter (modèles gratuits)"
           echo "======================================"
@@ -362,11 +334,6 @@ jobs:
             fi
           done
 
-          # 👇 Dernier filet via NVIDIA NIM. Pas un modèle "gratuit" à
-          # proprement parler (crédits d'essai NGC, puis facturation) —
-          # placé en tout dernier recours, après tous les fallbacks
-          # gratuits, pour ne consommer ces crédits qu'en cas d'échec
-          # complet des autres.
           echo "======================================"
           echo "🔁 Fallback sur NVIDIA NIM"
           echo "======================================"
@@ -468,8 +435,6 @@ jobs:
             echo "ℹ️ Pas de pages.json (agent en échec ou pas de bloc structuré), rien à mesurer"
             exit 0
           fi
-          # On exclut la page principale : déjà mesurée avant OpenClaw
-          # (step "Mesurer SSL + temps de chargement (avant OpenClaw)").
           jq -r --arg main "${{ matrix.site.url }}" '.pages[]?.url | select(. != $main)' pages.json | sort -u | while read -r PAGE_URL; do
             [ -z "$PAGE_URL" ] && continue
             echo "📏 Mesure de $PAGE_URL"
