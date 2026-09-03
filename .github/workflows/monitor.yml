@@ -15,7 +15,13 @@ jobs:
         id: get-sites
         run: |
           SITES=$(curl -s https://kuma-relay.up.railway.app/active-sites | jq -c '[.sites[] | {id: .id, url: .site_url}]')
+          # Si SITES est vide ou null, fournir un fallback
+          if [ -z "$SITES" ] || [ "$SITES" == "[]" ] || [ "$SITES" == "null" ]; then
+            echo "⚠️ Aucun site retourné par l'API, utilisation d'une valeur par défaut"
+            SITES='[{"id":"test","url":"https://example.com"}]'
+          fi
           echo "sites=$SITES" >> "$GITHUB_OUTPUT"
+          echo "📡 Sites à monitorer: $SITES"
 
   autonomous-test:
     needs: fetch-sites
