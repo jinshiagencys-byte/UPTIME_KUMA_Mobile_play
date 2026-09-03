@@ -136,8 +136,18 @@ jobs:
           }
           EOF
 
-          ~/.npm-global/bin/openclaw plugins install mistral --accept-capabilities 2>/dev/null || true
-          ~/.npm-global/bin/openclaw plugins enable mistral --accept-capabilities 2>/dev/null || true
+          ~/.npm-global/bin/openclaw plugins install mistral --accept-capabilities --yes 2>/dev/null || true
+          ~/.npm-global/bin/openclaw plugins enable mistral --accept-capabilities --yes 2>/dev/null || true
+
+          # 👇 FIX : le plugin "perplexity" (activé par défaut / résiduel dans
+          # ~/.openclaw) exige un consentement de capacités. Tant qu'il ne l'a
+          # pas reçu, OpenClaw refuse de déclarer le Gateway "ready", même si
+          # on n'utilise pas ce plugin pour les tests (voir doc OpenClaw :
+          # "OpenClaw plugin verification failed; refusing to report the
+          # gateway ready" est un blocage par design de la vérification de
+          # plugin, distinct des échecs de migration d'état). On consent ici
+          # explicitement — --yes contourne aussi tout prompt résiduel en CI.
+          ~/.npm-global/bin/openclaw plugins enable perplexity --accept-capabilities --yes 2>/dev/null || true
 
           printf "%s\n" "$MISTRAL_API_KEY" | ~/.npm-global/bin/openclaw models auth paste-api-key --provider mistral || echo "⚠️ Échec enregistrement clé Mistral"
           printf "%s\n" "$GOOGLE_API_KEY" | ~/.npm-global/bin/openclaw models auth paste-api-key --provider google || echo "⚠️ Échec enregistrement clé Google"
@@ -227,7 +237,19 @@ jobs:
             ~/.npm-global/bin/openclaw gateway stop 2>/dev/null || true
             pkill -f "openclaw gateway" || true
             sleep 3
-            ~/.npm-global/bin/openclaw plugins enable mistral --accept-capabilities 2>/dev/null || true
+
+            # Consentement des capacités pour tous les plugins actifs avant
+            # de (re)démarrer le Gateway. --yes contourne tout prompt résiduel.
+            ~/.npm-global/bin/openclaw plugins enable mistral --accept-capabilities --yes 2>/dev/null || true
+            # 👇 FIX principal : sans ce consentement, le Gateway refuse de
+            # se déclarer "ready" à cause du plugin perplexity, quel que
+            # soit le modèle testé ensuite (Mistral, Gemini, HF...).
+            ~/.npm-global/bin/openclaw plugins enable perplexity --accept-capabilities --yes 2>/dev/null || true
+
+            # Filet de sécurité supplémentaire : répare les états de plugin
+            # incohérents avant de tenter le démarrage.
+            ~/.npm-global/bin/openclaw update repair --yes 2>/dev/null || true
+
             nohup ~/.npm-global/bin/openclaw gateway --force --port 18789 --allow-unconfigured > gateway.log 2>&1 &
             echo "⏳ Attente du Gateway (30s)..."
             sleep 30
@@ -262,7 +284,7 @@ jobs:
           }
 
           gateway_actually_down() {
-            grep -qi "ECONNREFUSED\|gateway not reachable\|gateway may still be running" "$1"
+            grep -qi "ECONNREFUSED\|gateway not reachable\|gateway may still be running\|plugin verification failed" "$1"
           }
 
           start_gateway || true
@@ -317,13 +339,12 @@ jobs:
             exit 0
           fi
 
-          # 👇 NOUVEAU : fallback OpenRouter (modèles gratuits vérifiés
-          # via l'API live openrouter.ai/api/v1/models — pricing=0 ET
-          # tool-calling supporté). On essaie plusieurs modèles gratuits
-          # dans l'ordre, car un modèle "free" individuel peut être
-          # temporairement indisponible/rate-limité (quota partagé entre
-          # tous les utilisateurs OpenRouter gratuits) — openrouter/free
-          # (routeur auto) sert de dernier filet.
+          # 👇 Fallback OpenRouter (modèles gratuits vérifiés via l'API live
+          # openrouter.ai/api/v1/models — pricing=0 ET tool-calling supporté).
+          # On essaie plusieurs modèles gratuits dans l'ordre, car un modèle
+          # "free" individuel peut être temporairement indisponible/rate-
+          # limité (quota partagé entre tous les utilisateurs OpenRouter
+          # gratuits) — openrouter/free (routeur auto) sert de dernier filet.
           echo "======================================"
           echo "🔁 Fallback sur OpenRouter (modèles gratuits)"
           echo "======================================"
@@ -341,11 +362,11 @@ jobs:
             fi
           done
 
-          # 👇 NOUVEAU : dernier filet via NVIDIA NIM. Pas un modèle
-          # "gratuit" à proprement parler (crédits d'essai NGC, puis
-          # facturation) — placé en tout dernier recours, après tous les
-          # fallbacks gratuits, pour ne consommer ces crédits qu'en cas
-          # d'échec complet des autres.
+          # 👇 Dernier filet via NVIDIA NIM. Pas un modèle "gratuit" à
+          # proprement parler (crédits d'essai NGC, puis facturation) —
+          # placé en tout dernier recours, après tous les fallbacks
+          # gratuits, pour ne consommer ces crédits qu'en cas d'échec
+          # complet des autres.
           echo "======================================"
           echo "🔁 Fallback sur NVIDIA NIM"
           echo "======================================"
