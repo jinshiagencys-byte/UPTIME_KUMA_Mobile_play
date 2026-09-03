@@ -14,12 +14,37 @@ jobs:
       - name: Récupérer les sites actifs
         id: get-sites
         run: |
-          SITES=$(curl -s https://kuma-relay.up.railway.app/active-sites | jq -c '[.sites[] | {id: .id, url: .site_url}]')
-          # Si SITES est vide ou null, fournir un fallback
+          # 👇 CORRIGÉ : curl et jq sont désormais découplés, et chaque
+          # échec possible est explicitement neutralisé avec `|| echo ...`.
+          # Raison : les steps bash de GitHub Actions tournent avec
+          # `set -e -o pipefail` implicite. Avant ce fix, si `/active-sites`
+          # répondait une erreur (500, timeout, JSON sans clé "sites"...),
+          # `jq` échouait avec un code non-nul, `pipefail` faisait remonter
+          # cet échec sur toute la pipe `curl | jq`, et `set -e` arrêtait le
+          # script À CETTE LIGNE — avant même d'atteindre le bloc de
+          # fallback juste en dessous. L'output "sites" du job restait donc
+          # vide/non défini, d'où l'erreur GitHub Actions "Matrix vector
+          # 'site' does not contain any values" (fromJson('') sur un output
+          # jamais écrit).
+          RAW=$(curl -s https://kuma-relay.up.railway.app/active-sites || echo "")
+
+          # `.sites[]?` : itération "safe" — si la clé "sites" est absente
+          # ou null (ex: réponse d'erreur du relay), ne lève pas d'erreur
+          # jq, produit juste une liste vide. Le `2>/dev/null || echo ""`
+          # couvre en plus le cas où $RAW n'est même pas du JSON valide
+          # (curl a échoué, réponse HTML d'erreur, etc.) — dans TOUS les
+          # cas d'échec, SITES devient une chaîne vide plutôt que de faire
+          # planter le step.
+          SITES=$(echo "$RAW" | jq -c '[.sites[]? | {id: .id, url: .site_url}]' 2>/dev/null || echo "")
+
+          # Si SITES est vide, "[]" ou "null" (API en erreur, aucun site
+          # actif/acquitté, etc.), fournir un fallback pour que la matrice
+          # ne soit jamais vide.
           if [ -z "$SITES" ] || [ "$SITES" == "[]" ] || [ "$SITES" == "null" ]; then
-            echo "⚠️ Aucun site retourné par l'API, utilisation d'une valeur par défaut"
+            echo "⚠️ Aucun site exploitable retourné par l'API, utilisation d'une valeur par défaut"
             SITES='[{"id":"test","url":"https://example.com"}]'
           fi
+
           echo "sites=$SITES" >> "$GITHUB_OUTPUT"
           echo "📡 Sites à monitorer: $SITES"
 
