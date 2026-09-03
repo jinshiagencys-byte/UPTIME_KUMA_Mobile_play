@@ -66,7 +66,7 @@ jobs:
 
       - name: Mesurer SSL + temps de chargement (avant OpenClaw)
         run: |
-          node check-metrics.js "${{ matrix.site.id }}" "${{ matrix.site.url }}" || echo "⚠️ Échec mesure métriques (non bloquant)"
+          node check-metrics.js "${{ matrix.site.id }}" "${{ matrix.site.url }}" true || echo "⚠️ Échec mesure métriques (non bloquant)"
         env:
           RELAY_URL: https://kuma-relay.up.railway.app
           RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
@@ -123,6 +123,13 @@ jobs:
                     { "id": "thinkingmachines/inkling:free", "name": "inkling-free" },
                     { "id": "openrouter/free", "name": "openrouter-auto-free" }
                   ]
+                },
+                "nvidia": {
+                  "api": "openai-completions",
+                  "baseUrl": "https://integrate.api.nvidia.com/v1",
+                  "models": [
+                    { "id": "moonshotai/kimi-k3", "name": "moonshotai/kimi-k3" }
+                  ]
                 }
               }
             }
@@ -136,6 +143,7 @@ jobs:
           printf "%s\n" "$GOOGLE_API_KEY" | ~/.npm-global/bin/openclaw models auth paste-api-key --provider google || echo "⚠️ Échec enregistrement clé Google"
           printf "%s\n" "$HF_API_KEY" | ~/.npm-global/bin/openclaw models auth paste-api-key --provider huggingface || echo "⚠️ Échec enregistrement clé HuggingFace"
           printf "%s\n" "$OPENROUTER_API_KEY" | ~/.npm-global/bin/openclaw models auth paste-api-key --provider openrouter || echo "⚠️ Échec enregistrement clé OpenRouter"
+          printf "%s\n" "$NVIDIA_API_KEY" | ~/.npm-global/bin/openclaw models auth paste-api-key --provider nvidia || echo "⚠️ Échec enregistrement clé NVIDIA"
 
           ~/.npm-global/bin/openclaw models set mistral/mistral-small-latest || true
         env:
@@ -143,6 +151,7 @@ jobs:
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           HF_API_KEY: ${{ secrets.HF_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
 
       - name: Générer la tâche
         run: |
@@ -332,7 +341,22 @@ jobs:
             fi
           done
 
-          echo "❌ Échec final après Mistral, Google, Hugging Face et OpenRouter"
+          # 👇 NOUVEAU : dernier filet via NVIDIA NIM. Pas un modèle
+          # "gratuit" à proprement parler (crédits d'essai NGC, puis
+          # facturation) — placé en tout dernier recours, après tous les
+          # fallbacks gratuits, pour ne consommer ces crédits qu'en cas
+          # d'échec complet des autres.
+          echo "======================================"
+          echo "🔁 Fallback sur NVIDIA NIM"
+          echo "======================================"
+          run_agent "nvidia/moonshotai/kimi-k3" "nvidia1"
+          if is_success output.json; then
+            echo "✅ Succès avec NVIDIA (moonshotai/kimi-k3)"
+            echo "agent_failed=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "❌ Échec final après Mistral, Google, Hugging Face, OpenRouter et NVIDIA"
           echo "agent_failed=true" >> $GITHUB_OUTPUT
 
         env:
@@ -340,6 +364,7 @@ jobs:
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           HF_API_KEY: ${{ secrets.HF_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
           OPENCLAW_GATEWAY_TOKEN: "ci-test-token-12345"
 
       - name: Extraire et envoyer le résultat
@@ -413,6 +438,24 @@ jobs:
             || echo "⚠️ Envoi mark-crawled échoué"
 
         env:
+          RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
+
+      - name: Mesurer SSL + temps de chargement (pages découvertes par OpenClaw)
+        if: always()
+        run: |
+          if [ ! -f pages.json ]; then
+            echo "ℹ️ Pas de pages.json (agent en échec ou pas de bloc structuré), rien à mesurer"
+            exit 0
+          fi
+          # On exclut la page principale : déjà mesurée avant OpenClaw
+          # (step "Mesurer SSL + temps de chargement (avant OpenClaw)").
+          jq -r --arg main "${{ matrix.site.url }}" '.pages[]?.url | select(. != $main)' pages.json | sort -u | while read -r PAGE_URL; do
+            [ -z "$PAGE_URL" ] && continue
+            echo "📏 Mesure de $PAGE_URL"
+            node check-metrics.js "${{ matrix.site.id }}" "$PAGE_URL" false || echo "⚠️ Échec mesure pour $PAGE_URL (non bloquant)"
+          done
+        env:
+          RELAY_URL: https://kuma-relay.up.railway.app
           RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
 
       - name: Upload des artefacts
