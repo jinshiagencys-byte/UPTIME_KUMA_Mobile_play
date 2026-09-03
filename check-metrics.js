@@ -1,17 +1,21 @@
 // check-metrics.js
 //
-// Script standalone (Node + Playwright natif `tls`) lancé une fois par site,
-// AVANT qu'OpenClaw ne patrouille. Mesure :
-//   1. Expiration du certificat SSL (via tls.connect, comme le fait déjà
-//      kuma-relay pour /monitors/:id — même logique, reprise ici pour ne
-//      plus dépendre de Kuma)
-//   2. Temps de chargement réel de l'URL principale (via l'API Navigation
-//      Timing du navigateur, comme le fait déjà crawler.js pour le `ping`
-//      envoyé à Kuma)
+// Script standalone (Node + Playwright natif `tls`) lancé UNE FOIS PAR PAGE
+// détectée : la page principale (avant OpenClaw, comme avant) ET chaque
+// page découverte par OpenClaw pendant sa patrouille (après OpenClaw,
+// boucle sur pages.json côté workflow). Mesure :
+//   1. Expiration du certificat SSL (via tls.connect)
+//   2. Temps de chargement réel de la page (Navigation Timing API)
 //
-// Résultat envoyé au relay via POST /sites/:id/update-metrics.
+// Résultat envoyé au relay :
+//   - toujours via POST /sites/:id/pages/update-metrics (upsert par
+//     (site_id, url) — crée la page si OpenClaw l'a découverte
+//     dynamiquement et qu'elle n'existait pas encore)
+//   - EN PLUS, si isMainPage=true, via POST /sites/:id/update-metrics
+//     (conserve l'ancien comportement pour la carte "groupe"/résumé site)
 //
-// Usage : node check-metrics.js <siteId> <siteUrl>
+// Usage : node check-metrics.js <siteId> <pageUrl> [isMainPage]
+//   isMainPage : "true" pour la page d'accueil (défaut: false)
 // Variables d'env : RELAY_URL (défaut https://kuma-relay.up.railway.app),
 //                    RELAY_SECRET (obligatoire)
 
@@ -29,13 +33,11 @@ function log(...args) {
 }
 
 // ─── SSL ────────────────────────────────────────────────────────────────────
-// Reprend exactement la logique déjà utilisée côté relay (index.js,
-// getTlsExpiry) pour rester cohérent avec ce qui existait avant.
-function getTlsExpiry(siteUrl) {
+function getTlsExpiry(pageUrl) {
   return new Promise((resolve) => {
     let hostname;
     try {
-      hostname = new URL(siteUrl).hostname;
+      hostname = new URL(pageUrl).hostname;
     } catch {
       return resolve(null);
     }
@@ -69,9 +71,7 @@ function getTlsExpiry(siteUrl) {
 }
 
 // ─── Temps de chargement ────────────────────────────────────────────────────
-// Reprend le même principe que crawler.js (Navigation Timing API), mesuré
-// uniquement sur l'URL principale du site.
-async function getLoadTimeMs(siteUrl) {
+async function getLoadTimeMs(pageUrl) {
   const browser = await chromium.launch({ headless: true });
   try {
     const context = await browser.newContext({
@@ -80,7 +80,7 @@ async function getLoadTimeMs(siteUrl) {
     });
     const page = await context.newPage();
     const start = Date.now();
-    await page.goto(siteUrl, { waitUntil: 'load', timeout: PAGE_LOAD_TIMEOUT_MS });
+    await page.goto(pageUrl, { waitUntil: 'load', timeout: PAGE_LOAD_TIMEOUT_MS });
     let loadTimeMs = null;
     try {
       loadTimeMs = await page.evaluate(() => {
@@ -103,33 +103,46 @@ async function getLoadTimeMs(siteUrl) {
 }
 
 // ─── Envoi au relay ─────────────────────────────────────────────────────────
-async function sendMetrics(siteId, metrics) {
+async function postJson(path, body) {
+  const res = await fetch(`${RELAY_URL}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-relay-secret': RELAY_SECRET },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => null);
+  if (!res.ok || !data || data.success !== true) {
+    throw new Error(`Relay a refusé la mise à jour (status ${res.status}) sur ${path}: ${JSON.stringify(data)}`);
+  }
+}
+
+async function sendMetrics(siteId, pageUrl, isMainPage, metrics) {
   if (!RELAY_SECRET) {
     log('⚠️ RELAY_SECRET manquant, envoi annulé.');
     return;
   }
-  const res = await fetch(`${RELAY_URL}/sites/${siteId}/update-metrics`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-relay-secret': RELAY_SECRET },
-    body: JSON.stringify(metrics),
-  });
-  const data = await res.json().catch(() => null);
-  if (!res.ok || !data || data.success !== true) {
-    throw new Error(`Relay a refusé la mise à jour (status ${res.status}): ${JSON.stringify(data)}`);
+
+  // Toujours : métriques au niveau de la page (upsert par site_id+url)
+  await postJson(`/sites/${siteId}/pages/update-metrics`, { url: pageUrl, ...metrics });
+
+  // En plus, si c'est la page principale : ancien comportement conservé
+  // pour la carte "groupe" (MonitorItem.sslValidTo / loadTimeMs)
+  if (isMainPage) {
+    await postJson(`/sites/${siteId}/update-metrics`, metrics);
   }
 }
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 async function main() {
-  const [siteId, siteUrl] = process.argv.slice(2);
-  if (!siteId || !siteUrl) {
-    console.error('Usage: node check-metrics.js <siteId> <siteUrl>');
+  const [siteId, pageUrl, isMainPageArg] = process.argv.slice(2);
+  if (!siteId || !pageUrl) {
+    console.error('Usage: node check-metrics.js <siteId> <pageUrl> [isMainPage]');
     process.exit(1);
   }
+  const isMainPage = isMainPageArg === 'true';
 
-  log(`Site ${siteId} (${siteUrl}) — mesure SSL + temps de chargement...`);
+  log(`Site ${siteId} — page ${pageUrl} (${isMainPage ? 'principale' : 'secondaire'}) — mesure SSL + temps de chargement...`);
 
-  const [tlsInfo, loadTimeMs] = await Promise.all([getTlsExpiry(siteUrl), getLoadTimeMs(siteUrl)]);
+  const [tlsInfo, loadTimeMs] = await Promise.all([getTlsExpiry(pageUrl), getLoadTimeMs(pageUrl)]);
 
   const metrics = {
     sslValidTo: tlsInfo ? tlsInfo.validTo : null,
@@ -141,7 +154,7 @@ async function main() {
   log('Résultat :', metrics);
 
   try {
-    await sendMetrics(siteId, metrics);
+    await sendMetrics(siteId, pageUrl, isMainPage, metrics);
     log('✅ Métriques envoyées au relay.');
   } catch (err) {
     log('❌ Échec envoi au relay :', err.message);
