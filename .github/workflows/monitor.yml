@@ -22,8 +22,8 @@ jobs:
           # 🛡️ SÉCURITÉ : entrée utilisateur passée par env, jamais interpolée
           # directement dans le script (protection contre l'injection de commande)
           SITE_ID_INPUT: ${{ github.event.inputs.site_id }}
+          RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
         run: |
-          RELAY_SECRET="${{ secrets.RELAY_SECRET }}"
           SITE_ID="$SITE_ID_INPUT"
 
           if [ -n "$SITE_ID" ]; then
@@ -67,8 +67,6 @@ jobs:
 
           echo "sites=$SITES" >> "$GITHUB_OUTPUT"
           echo "📡 Sites à monitorer: $SITES"
-        env:
-          RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
 
   autonomous-test:
     needs: fetch-sites
@@ -257,6 +255,12 @@ jobs:
           # de données externes (site.url, site.id) dans le script bash.
           SITE_URL: ${{ matrix.site.url }}
           SITE_ID: ${{ matrix.site.id }}
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          HF_API_KEY: ${{ secrets.HF_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          OPENCLAW_GATEWAY_TOKEN: "ci-test-token-12345"
         run: |
           set +e
 
@@ -407,20 +411,13 @@ jobs:
           echo "❌ Échec final après Mistral, Google, Hugging Face, OpenRouter et NVIDIA"
           echo "agent_failed=true" >> $GITHUB_OUTPUT
 
-        env:
-          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
-          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-          HF_API_KEY: ${{ secrets.HF_API_KEY }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-          OPENCLAW_GATEWAY_TOKEN: "ci-test-token-12345"
-
       - name: Extraire et envoyer le résultat
         if: always()
         env:
           # 🛡️ SÉCURITÉ : site.id vient de l'API externe, on le passe par env
           # plutôt que de l'interpoler directement dans les commandes curl.
           SITE_ID: ${{ matrix.site.id }}
+          RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
         run: |
           if [ ! -f output.json ] || [ ! -s output.json ]; then
             STATUS="ERROR"
@@ -474,7 +471,7 @@ jobs:
             echo "📤 Envoi du rapport pages à /pages-report"
             echo "$PAGES_JSON" | jq -c '{pages: .pages}' | \
             curl -X POST "https://kuma-relay.up.railway.app/sites/${SITE_ID}/pages-report" \
-              -H "x-relay-secret: ${{ secrets.RELAY_SECRET }}" \
+              -H "x-relay-secret: $RELAY_SECRET" \
               -H "Content-Type: application/json" \
               -d @- \
               || echo "⚠️ Envoi pages-report échoué"
@@ -484,13 +481,10 @@ jobs:
 
           jq -n --arg status "$STATUS" --arg message "$REASON" '{status: $status, message: $message}' | \
           curl -X POST "https://kuma-relay.up.railway.app/sites/${SITE_ID}/mark-crawled" \
-            -H "x-relay-secret: ${{ secrets.RELAY_SECRET }}" \
+            -H "x-relay-secret: $RELAY_SECRET" \
             -H "Content-Type: application/json" \
             -d @- \
             || echo "⚠️ Envoi mark-crawled échoué"
-
-        env:
-          RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
 
       - name: Upload des artefacts
         if: always()
