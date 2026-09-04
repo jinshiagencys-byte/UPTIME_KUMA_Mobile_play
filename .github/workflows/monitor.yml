@@ -169,9 +169,10 @@ jobs:
 
       - name: Générer la tâche
         run: |
-          # 🛠️ CORRECTION : compacter les pages JSON avant analyse jq
+          # 🛠️ CORRECTION : matrix.site.pages est déjà un ARRAY (pas un objet {pages: [...]}),
+          # donc on itère directement avec .[] et non .pages[]
           PAGES_JSON='${{ toJson(matrix.site.pages) }}'
-          PAGES_LIST=$(echo "$PAGES_JSON" | jq -c . | jq -r '[.pages[]? | .url] | join("\n")')
+          PAGES_LIST=$(echo "$PAGES_JSON" | jq -c . | jq -r '[.[]? | .url] | join("\n")')
 
           cat > task.md << EOF
           Va sur ${{ matrix.site.url }} avec l'outil browser. Explore comme un
