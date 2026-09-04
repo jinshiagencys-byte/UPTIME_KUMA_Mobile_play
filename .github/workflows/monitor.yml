@@ -26,50 +26,61 @@ jobs:
             echo "🔍 Test ciblé sur le site $SITE_ID"
             DETAIL=$(curl -s -H "x-relay-secret: $RELAY_SECRET" "https://kuma-relay.up.railway.app/monitors/$SITE_ID")
             
-            # Vérifier que le relay a bien renvoyé un monitor
-            if echo "$DETAIL" | jq -e '.monitor' > /dev/null 2>&1; then
-              # Si c'est une page (type http), on prend son parent comme site
-              MONITOR=$(echo "$DETAIL" | jq -c '.monitor | if .type == "http" then {id: .parent, url: .url, name: .parentName} else {id: .id, url: .url, name: .name} end')
-            else
+            # Extraire le site parent si c'est une page, sinon le site lui-même
+            MONITOR=$(echo "$DETAIL" | jq -c '.monitor | if .type == "http" then {id: .parent, url: .url, name: .parentName} else {id: .id, url: .url, name: .name} end')
+            
+            # Si l'extraction a échoué (site introuvable ou erreur relay)
+            if [ -z "$MONITOR" ] || [ "$MONITOR" == "null" ]; then
               echo "❌ Site $SITE_ID introuvable ou erreur relay"
-              exit 1
+              echo "sites=[]" >> "$GITHUB_OUTPUT"
+              exit 0
             fi
 
             ALL_MONITORS=$(curl -s -H "x-relay-secret: $RELAY_SECRET" "https://kuma-relay.up.railway.app/monitors")
             PAGES=$(echo "$ALL_MONITORS" | jq -c --arg sid "$(echo "$MONITOR" | jq -r '.id')" '[.monitors[]? | select(.type == "http" and (.parent|tostring) == $sid) | {url: .url, name: .name}]')
             
-            # 🛠️ CORRECTION : on force le tableau avec les crochets [ ]
+            # Construire explicitement un tableau JSON avec crochets
             SITES=$(jq -n --argjson mon "$MONITOR" --argjson pages "$PAGES" '[{id: $mon.id, url: $mon.url, name: $mon.name, pages: $pages}]')
           else
             RAW=$(curl -s https://kuma-relay.up.railway.app/active-sites)
-            SITES=$(echo "$RAW" | jq -c '[.sites[]? | {id: .id, url: .site_url}]' 2>/dev/null || echo "")
-            if [ -z "$SITES" ] || [ "$SITES" == "[]" ] || [ "$SITES" == "null" ]; then
+            # Extraire les sites de base
+            SITES_RAW=$(echo "$RAW" | jq -c '[.sites[]? | {id: .id, url: .site_url}]' 2>/dev/null || echo "")
+            
+            if [ -z "$SITES_RAW" ] || [ "$SITES_RAW" == "[]" ] || [ "$SITES_RAW" == "null" ]; then
               echo "⚠️ Aucun site exploitable, utilisation d'une valeur par défaut"
-              SITES='[{"id":"test","url":"https://example.com","pages":[]}]'
-            else
-              FINAL_SITES=""
-              while IFS= read -r site; do
-                sid=$(echo "$site" | jq -r '.id')
-                all=$(curl -s -H "x-relay-secret: $RELAY_SECRET" "https://kuma-relay.up.railway.app/monitors")
-                pages=$(echo "$all" | jq -c --arg sid "$sid" '[.monitors[]? | select(.type == "http" and (.parent|tostring) == $sid) | {url: .url, name: .name}]')
-                site_with_pages=$(echo "$site" | jq --argjson pages "$pages" '. + {pages: $pages}')
-                FINAL_SITES="$FINAL_SITES$site_with_pages\n"
-              done <<< "$(echo "$SITES" | jq -c '.[]')"
-              # 🛠️ CORRECTION : on s'assure que le résultat est bien un tableau
-              SITES=$(printf '%b' "$FINAL_SITES" | jq -s '.')
+              SITES_RAW='[{"id":"test","url":"https://example.com"}]'
             fi
+
+            # Construire le tableau final en enrichissant chaque site avec ses pages
+            SITES_ARRAY="[]"
+            while IFS= read -r site; do
+              sid=$(echo "$site" | jq -r '.id')
+              all=$(curl -s -H "x-relay-secret: $RELAY_SECRET" "https://kuma-relay.up.railway.app/monitors")
+              pages=$(echo "$all" | jq -c --arg sid "$sid" '[.monitors[]? | select(.type == "http" and (.parent|tostring) == $sid) | {url: .url, name: .name}]')
+              site_with_pages=$(echo "$site" | jq --argjson pages "$pages" '. + {pages: $pages}')
+              # Ajouter le site enrichi au tableau de manière explicite
+              SITES_ARRAY=$(echo "$SITES_ARRAY" | jq --argjson site "$site_with_pages" '. + [$site]')
+            done <<< "$(echo "$SITES_RAW" | jq -c '.[]')"
+            SITES=$SITES_ARRAY
           fi
+
           echo "sites=$SITES" >> "$GITHUB_OUTPUT"
           echo "📡 Sites à monitorer: $SITES"
         env:
           RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
 
-  crawl-sites:
+  autonomous-test:
     needs: fetch-sites
     runs-on: ubuntu-latest
+    concurrency:
+      group: openclaw-check-${{ matrix.site.id }}
+      cancel-in-progress: false
     strategy:
+      fail-fast: false
+      max-parallel: 1
       matrix:
         site: ${{ fromJson(needs.fetch-sites.outputs.sites) }}
+
     steps:
       - name: Checkout du code
         uses: actions/checkout@v4
