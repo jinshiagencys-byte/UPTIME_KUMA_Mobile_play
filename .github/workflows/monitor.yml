@@ -58,7 +58,7 @@ jobs:
             SITES="$SITES_ARRAY"
           fi
 
-          # 🛠️ CORRECTION : compresser le JSON en une seule ligne
+          # 🛠️ COMPACTER : garantir une seule ligne JSON
           SITES=$(echo "$SITES" | jq -c .)
 
           echo "sites=$SITES" >> "$GITHUB_OUTPUT"
@@ -169,7 +169,10 @@ jobs:
 
       - name: Générer la tâche
         run: |
-          PAGES_LIST=$(jq -r '[.pages[]? | .url] | join("\n")' <<< "${{ toJson(matrix.site.pages) }}")
+          # 🛠️ CORRECTION : compacter les pages JSON avant analyse jq
+          PAGES_JSON='${{ toJson(matrix.site.pages) }}'
+          PAGES_LIST=$(echo "$PAGES_JSON" | jq -c . | jq -r '[.pages[]? | .url] | join("\n")')
+
           cat > task.md << EOF
           Va sur ${{ matrix.site.url }} avec l'outil browser. Explore comme un
           humain (scroll, structure) et détecte le type de site.
