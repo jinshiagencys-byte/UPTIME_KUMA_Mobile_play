@@ -2,6 +2,11 @@ name: OpenClaw - Monitoring Autonome Multi-Sites
 
 on:
   workflow_dispatch:
+    inputs:
+      site_id:
+        description: 'ID du site à tester spécifiquement (optionnel)'
+        required: false
+        type: string
   schedule:
     - cron: "0 */6 * * *"
 
@@ -11,17 +16,44 @@ jobs:
     outputs:
       sites: ${{ steps.get-sites.outputs.sites }}
     steps:
-      - name: Récupérer les sites actifs
+      - name: Récupérer les sites actifs et leurs pages
         id: get-sites
         run: |
-          RAW=$(curl -s https://kuma-relay.up.railway.app/active-sites || echo "")
-          SITES=$(echo "$RAW" | jq -c '[.sites[]? | {id: .id, url: .site_url}]' 2>/dev/null || echo "")
-          if [ -z "$SITES" ] || [ "$SITES" == "[]" ] || [ "$SITES" == "null" ]; then
-            echo "⚠️ Aucun site exploitable retourné par l'API, utilisation d'une valeur par défaut"
-            SITES='[{"id":"test","url":"https://example.com"}]'
+          RELAY_SECRET="${{ secrets.RELAY_SECRET }}"
+          SITE_ID="${{ github.event.inputs.site_id }}"
+
+          if [ -n "$SITE_ID" ]; then
+            echo "🔍 Test ciblé sur le site $SITE_ID"
+            # Récupérer le détail du site (type group)
+            DETAIL=$(curl -s -H "x-relay-secret: $RELAY_SECRET" "https://kuma-relay.up.railway.app/monitors/$SITE_ID")
+            MONITOR=$(echo "$DETAIL" | jq -c '.monitor | {id: .id, url: .url, name: .name}')
+            # Récupérer toutes les pages du site via /monitors (on filtre par parent)
+            ALL_MONITORS=$(curl -s -H "x-relay-secret: $RELAY_SECRET" "https://kuma-relay.up.railway.app/monitors")
+            PAGES=$(echo "$ALL_MONITORS" | jq -c --arg sid "$SITE_ID" '[.monitors[]? | select(.type == "http" and (.parent|tostring) == $sid) | {url: .url, name: .name}]')
+            SITES=$(jq -n --argjson mon "$MONITOR" --argjson pages "$PAGES" '{id: $mon.id, url: $mon.url, name: $mon.name, pages: $pages}')
+          else
+            RAW=$(curl -s https://kuma-relay.up.railway.app/active-sites)
+            SITES=$(echo "$RAW" | jq -c '[.sites[]? | {id: .id, url: .site_url}]' 2>/dev/null || echo "")
+            if [ -z "$SITES" ] || [ "$SITES" == "[]" ] || [ "$SITES" == "null" ]; then
+              echo "⚠️ Aucun site exploitable retourné par l'API, utilisation d'une valeur par défaut"
+              SITES='[{"id":"test","url":"https://example.com","pages":[]}]'
+            else
+              # Enrichir chaque site avec ses pages
+              FINAL_SITES=""
+              while IFS= read -r site; do
+                sid=$(echo "$site" | jq -r '.id')
+                all=$(curl -s -H "x-relay-secret: $RELAY_SECRET" "https://kuma-relay.up.railway.app/monitors")
+                pages=$(echo "$all" | jq -c --arg sid "$sid" '[.monitors[]? | select(.type == "http" and (.parent|tostring) == $sid) | {url: .url, name: .name}]')
+                site_with_pages=$(echo "$site" | jq --argjson pages "$pages" '. + {pages: $pages}')
+                FINAL_SITES="$FINAL_SITES$site_with_pages\n"
+              done <<< "$(echo "$SITES" | jq -c '.[]')"
+              SITES=$(printf '%b' "$FINAL_SITES" | jq -s '.')
+            fi
           fi
           echo "sites=$SITES" >> "$GITHUB_OUTPUT"
           echo "📡 Sites à monitorer: $SITES"
+        env:
+          RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
 
   autonomous-test:
     needs: fetch-sites
@@ -123,7 +155,8 @@ jobs:
 
       - name: Générer la tâche
         run: |
-          cat > task.md << 'EOF'
+          PAGES_LIST=$(jq -r '[.pages[]? | .url] | join("\n")' <<< "${{ toJson(matrix.site.pages) }}")
+          cat > task.md << EOF
           Va sur ${{ matrix.site.url }} avec l'outil browser. Explore comme un
           humain (scroll, structure) et détecte le type de site.
 
@@ -136,6 +169,9 @@ jobs:
           restent vides, bloquées en chargement, ou affichent une erreur/
           "undefined"/"null" à la place des vraies données, c'est un backend
           en panne : DOWN, même si la page HTTP répond 200.
+
+          PAGES À VÉRIFIER OBLIGATOIREMENT :
+          $PAGES_LIST
 
           Choisis 2-3 actions à tester selon le type détecté :
           - E-commerce : ajoute un produit au panier, VÉRIFIE qu'il apparaît
@@ -150,18 +186,17 @@ jobs:
           - Recherche : vérifie que des résultats s'affichent réellement.
           - Sinon : les 2-3 actions les plus représentatives du site.
 
-          Vérifie le résultat RÉEL de chaque action (pas juste "la page
-          charge"). Toute nouvelle URL atteinte (clic, form, etc.) = une page
-          distincte à noter individuellement. Repère aussi images cassées,
-          erreurs JS console, liens morts du menu/footer si le temps le
-          permet. Capture d'écran si erreur/page blanche/action sans effet.
+          Pour chaque page listée, vérifie au minimum qu'elle répond correctement
+          (HTTP 200, contenu attendu). Explores aussi les liens internes pour
+          détecter d'éventuelles pages non listées et signale-les dans le JSON
+          final. Toute nouvelle URL atteinte = une page distincte à noter.
 
           Termine par ton verdict en langage naturel (type de site + parcours
           testés, en précisant si le contenu venait bien du backend ou si
           c'était un placeholder/backend en panne), puis ce bloc JSON exact
           en toute fin (rien d'autre dedans) :
 
-          ```json
+          \`\`\`json
           {
             "overall_status": "UP",
             "site_type": "ecommerce",
@@ -175,7 +210,7 @@ jobs:
               }
             ]
           }
-          ```
+          \`\`\`
           Règles : status/overall_status = "UP" ou "DOWN" uniquement.
           site_type = ecommerce|auth|vitrine|blog|autre. Une entrée par page
           visitée (départ + chaque URL distincte, y compris erreurs/404). Un
