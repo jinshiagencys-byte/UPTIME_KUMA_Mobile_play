@@ -69,7 +69,9 @@ jobs:
                 },
                 "google": {
                   "models": [
-                    { "id": "gemini-2.5-pro", "name": "gemini-2.5-pro" }
+                    { "id": "gemini-2.5-flash", "name": "gemini-2.5-flash" },
+                    { "id": "gemini-2.5-flash-lite", "name": "gemini-2.5-flash-lite" },
+                    { "id": "gemini-1.5-flash", "name": "gemini-1.5-flash" }
                   ]
                 },
                 "huggingface": {
@@ -169,7 +171,7 @@ jobs:
                 "status": "UP",
                 "http_code": 200,
                 "action_tested": "action testée ou null",
-                "note": "explication en une phrase"
+                "note": "explication en une sentence"
               }
             ]
           }
@@ -279,15 +281,20 @@ jobs:
           fi
 
           echo "======================================"
-          echo "🔁 Fallback sur Google Gemini"
+          echo "🔁 Fallback sur Google Gemini (multiples modèles)"
           echo "======================================"
-          run_agent "google/gemini-2.5-pro" "gemini1"
-
-          if is_success output.json; then
-            echo "✅ Succès avec Google Gemini"
-            echo "agent_failed=false" >> $GITHUB_OUTPUT
-            exit 0
-          fi
+          for GEMINI_MODEL in \
+            "google/gemini-2.5-flash" \
+            "google/gemini-2.5-flash-lite" \
+            "google/gemini-1.5-flash"; do
+            
+            run_agent "$GEMINI_MODEL" "gemini-$(echo "$GEMINI_MODEL" | tr '/.' '--')"
+            if is_success output.json; then
+              echo "✅ Succès avec Google Gemini ($GEMINI_MODEL)"
+              echo "agent_failed=false" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+          done
 
           echo "======================================"
           echo "🔁 Fallback sur Hugging Face"
