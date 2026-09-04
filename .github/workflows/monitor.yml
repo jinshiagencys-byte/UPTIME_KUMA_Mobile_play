@@ -36,16 +36,6 @@ jobs:
       - name: Checkout du code
         uses: actions/checkout@v4
 
-      - name: Installer Playwright
-        run: npx playwright install --with-deps chromium
-
-      - name: Mesurer SSL + temps de chargement (avant OpenClaw)
-        run: |
-          node check-metrics.js "${{ matrix.site.id }}" "${{ matrix.site.url }}" true || echo "⚠️ Échec mesure métriques (non bloquant)"
-        env:
-          RELAY_URL: https://kuma-relay.up.railway.app
-          RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
-
       - name: Installer OpenClaw
         run: |
           curl -fsSL https://openclaw.ai/install.sh | bash
@@ -419,22 +409,6 @@ jobs:
             || echo "⚠️ Envoi mark-crawled échoué"
 
         env:
-          RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
-
-      - name: Mesurer SSL + temps de chargement (pages découvertes par OpenClaw)
-        if: always()
-        run: |
-          if [ ! -f pages.json ]; then
-            echo "ℹ️ Pas de pages.json (agent en échec ou pas de bloc structuré), rien à mesurer"
-            exit 0
-          fi
-          jq -r --arg main "${{ matrix.site.url }}" '.pages[]?.url | select(. != $main)' pages.json | sort -u | while read -r PAGE_URL; do
-            [ -z "$PAGE_URL" ] && continue
-            echo "📏 Mesure de $PAGE_URL"
-            node check-metrics.js "${{ matrix.site.id }}" "$PAGE_URL" false || echo "⚠️ Échec mesure pour $PAGE_URL (non bloquant)"
-          done
-        env:
-          RELAY_URL: https://kuma-relay.up.railway.app
           RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
 
       - name: Upload des artefacts
