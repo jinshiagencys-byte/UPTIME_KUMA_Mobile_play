@@ -18,9 +18,13 @@ jobs:
     steps:
       - name: Récupérer les sites actifs et leurs pages
         id: get-sites
+        env:
+          # 🛡️ SÉCURITÉ : entrée utilisateur passée par env, jamais interpolée
+          # directement dans le script (protection contre l'injection de commande)
+          SITE_ID_INPUT: ${{ github.event.inputs.site_id }}
         run: |
           RELAY_SECRET="${{ secrets.RELAY_SECRET }}"
-          SITE_ID="${{ github.event.inputs.site_id }}"
+          SITE_ID="$SITE_ID_INPUT"
 
           if [ -n "$SITE_ID" ]; then
             echo "🔍 Test ciblé sur le site $SITE_ID"
@@ -168,14 +172,22 @@ jobs:
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
 
       - name: Générer la tâche
+        env:
+          # 🛠️ CORRECTION : on passe le JSON via une variable d'env (pas via substitution
+          # textuelle ${{ }} dans le script) pour éviter que des caractères comme les
+          # apostrophes (ex: "Page d'accueil") ne cassent le bash généré.
+          PAGES_JSON: ${{ toJson(matrix.site.pages) }}
+          # 🛡️ SÉCURITÉ : site.url vient d'une API externe (kuma-relay). Le passer par env
+          # évite l'injection de commande : s'il contenait des backticks ou $(...), une
+          # interpolation ${{ }} directe dans le heredoc non quoté les ferait EXÉCUTER.
+          SITE_URL: ${{ matrix.site.url }}
         run: |
           # 🛠️ CORRECTION : matrix.site.pages est déjà un ARRAY (pas un objet {pages: [...]}),
           # donc on itère directement avec .[] et non .pages[]
-          PAGES_JSON='${{ toJson(matrix.site.pages) }}'
           PAGES_LIST=$(echo "$PAGES_JSON" | jq -c . | jq -r '[.[]? | .url] | join("\n")')
 
           cat > task.md << EOF
-          Va sur ${{ matrix.site.url }} avec l'outil browser. Explore comme un
+          Va sur $SITE_URL avec l'outil browser. Explore comme un
           humain (scroll, structure) et détecte le type de site.
 
           VÉRIFICATION CRITIQUE avant tout le reste : le contenu affiché
@@ -240,6 +252,11 @@ jobs:
 
       - name: Lancer OpenClaw (avec Gateway persistent)
         id: agent_run
+        env:
+          # 🛡️ SÉCURITÉ : mêmes raisons que ci-dessus, on évite l'interpolation directe
+          # de données externes (site.url, site.id) dans le script bash.
+          SITE_URL: ${{ matrix.site.url }}
+          SITE_ID: ${{ matrix.site.id }}
         run: |
           set +e
 
@@ -283,11 +300,11 @@ jobs:
             local model=$1
             local session_suffix=$2
             echo "======================================"
-            echo "Test avec $model pour ${{ matrix.site.url }}"
+            echo "Test avec $model pour $SITE_URL"
             echo "======================================"
             ~/.npm-global/bin/openclaw models set "$model" || true
             ~/.npm-global/bin/openclaw agent \
-              --session-key "ci:${{ matrix.site.id }}-$session_suffix" \
+              --session-key "ci:${SITE_ID}-$session_suffix" \
               --message-file task.md \
               --json > output.json 2>&1
             cat output.json
@@ -400,6 +417,10 @@ jobs:
 
       - name: Extraire et envoyer le résultat
         if: always()
+        env:
+          # 🛡️ SÉCURITÉ : site.id vient de l'API externe, on le passe par env
+          # plutôt que de l'interpoler directement dans les commandes curl.
+          SITE_ID: ${{ matrix.site.id }}
         run: |
           if [ ! -f output.json ] || [ ! -s output.json ]; then
             STATUS="ERROR"
@@ -452,7 +473,7 @@ jobs:
           if [ -n "$PAGES_JSON" ] && echo "$PAGES_JSON" | jq -e '.pages' > /dev/null 2>&1; then
             echo "📤 Envoi du rapport pages à /pages-report"
             echo "$PAGES_JSON" | jq -c '{pages: .pages}' | \
-            curl -X POST "https://kuma-relay.up.railway.app/sites/${{ matrix.site.id }}/pages-report" \
+            curl -X POST "https://kuma-relay.up.railway.app/sites/${SITE_ID}/pages-report" \
               -H "x-relay-secret: ${{ secrets.RELAY_SECRET }}" \
               -H "Content-Type: application/json" \
               -d @- \
@@ -462,7 +483,7 @@ jobs:
           fi
 
           jq -n --arg status "$STATUS" --arg message "$REASON" '{status: $status, message: $message}' | \
-          curl -X POST "https://kuma-relay.up.railway.app/sites/${{ matrix.site.id }}/mark-crawled" \
+          curl -X POST "https://kuma-relay.up.railway.app/sites/${SITE_ID}/mark-crawled" \
             -H "x-relay-secret: ${{ secrets.RELAY_SECRET }}" \
             -H "Content-Type: application/json" \
             -d @- \
