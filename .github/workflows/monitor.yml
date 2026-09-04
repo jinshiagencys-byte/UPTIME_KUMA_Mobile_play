@@ -24,10 +24,8 @@ jobs:
 
           if [ -n "$SITE_ID" ]; then
             echo "🔍 Test ciblé sur le site $SITE_ID"
-            # Récupérer le détail du site (type group)
             DETAIL=$(curl -s -H "x-relay-secret: $RELAY_SECRET" "https://kuma-relay.up.railway.app/monitors/$SITE_ID")
             MONITOR=$(echo "$DETAIL" | jq -c '.monitor | {id: .id, url: .url, name: .name}')
-            # Récupérer toutes les pages du site via /monitors (on filtre par parent)
             ALL_MONITORS=$(curl -s -H "x-relay-secret: $RELAY_SECRET" "https://kuma-relay.up.railway.app/monitors")
             PAGES=$(echo "$ALL_MONITORS" | jq -c --arg sid "$SITE_ID" '[.monitors[]? | select(.type == "http" and (.parent|tostring) == $sid) | {url: .url, name: .name}]')
             SITES=$(jq -n --argjson mon "$MONITOR" --argjson pages "$PAGES" '{id: $mon.id, url: $mon.url, name: $mon.name, pages: $pages}')
@@ -38,7 +36,6 @@ jobs:
               echo "⚠️ Aucun site exploitable retourné par l'API, utilisation d'une valeur par défaut"
               SITES='[{"id":"test","url":"https://example.com","pages":[]}]'
             else
-              # Enrichir chaque site avec ses pages
               FINAL_SITES=""
               while IFS= read -r site; do
                 sid=$(echo "$site" | jq -r '.id')
@@ -58,6 +55,9 @@ jobs:
   autonomous-test:
     needs: fetch-sites
     runs-on: ubuntu-latest
+    concurrency:
+      group: openclaw-check-${{ matrix.site.id }}
+      cancel-in-progress: false
     strategy:
       fail-fast: false
       max-parallel: 1
