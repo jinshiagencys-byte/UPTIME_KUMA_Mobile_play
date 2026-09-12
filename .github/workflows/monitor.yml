@@ -343,16 +343,21 @@ jobs:
                 n=$((n+1))
                 shot_out=$(openclaw browser screenshot --full-page --labels 2>>"frames-${session_suffix}/capture.log")
                 echo "$shot_out" >> "frames-${session_suffix}/capture.log"
-                # La commande n'écrit pas l'image sur stdout : elle l'enregistre sur
-                # disque et affiche une ligne "MEDIA:<chemin>" (confirmé par la doc
-                # officielle docs.openclaw.ai/tools/browser-control). On récupère ce
-                # chemin et on copie le vrai fichier image.
-                media_path=$(echo "$shot_out" | grep -o 'MEDIA:.*' | head -1 | sed 's/^MEDIA://')
-                shot_path="frames-${session_suffix}/$(printf "%04d" "$n").png"
+                # 🛠️ CORRECTION (confirmé sur un run réel) : pas de préfixe "MEDIA:" en
+                # pratique, la commande affiche le chemin brut, ex:
+                # "~/.openclaw/media/browser/<uuid>.png". On extrait cette ligne et on
+                # étend le "~" nous-mêmes (le shell ne le fait pas sur une variable).
+                media_path=$(echo "$shot_out" | grep -oE '~/\.openclaw/media/browser/[^ ]+\.(png|jpg|jpeg)' | head -1)
+                media_path="${media_path/#\~/$HOME}"
                 if [ -n "$media_path" ] && [ -f "$media_path" ]; then
-                  cp "$media_path" "$shot_path"
+                  ext="${media_path##*.}"
+                  cp "$media_path" "frames-${session_suffix}/$(printf "%04d" "$n").${ext}"
                 fi
-                sleep 2
+                # Intervalle plus large qu'au premier essai (2s) pour réduire la
+                # contention avec l'agent sur le même navigateur (observé : la
+                # plupart des tentatives échouaient avec "previous screenshot...
+                # still running" / "Frame changed while snapshot was being captured").
+                sleep 4
               done
             ) &
             CAPTURE_PID=$!
@@ -364,19 +369,20 @@ jobs:
             cat output.json
 
             # 🎥 Assemblage des frames capturées en une vraie vidéo. On renumérote
-            # d'abord en continu dans un dossier séparé, car un échec ponctuel de
-            # capture laisse des trous dans la numérotation, et ffmpeg (motif
-            # %04d.png) s'arrête à la première séquence manquante.
+            # d'abord en continu dans un dossier séparé (les captures peuvent être
+            # en .png OU .jpg selon le run — observé sur un vrai test — donc on
+            # reconvertit chaque frame en .jpg uniforme au passage avec ffmpeg,
+            # plutôt que de risquer un mélange d'extensions dans la séquence).
             mkdir -p videos "clean-${session_suffix}"
+            command -v ffmpeg >/dev/null 2>&1 || sudo apt-get install -y ffmpeg
             i=0
-            for f in $(ls "frames-${session_suffix}"/*.png 2>/dev/null | sort); do
+            for f in $(ls "frames-${session_suffix}"/*.png "frames-${session_suffix}"/*.jpg "frames-${session_suffix}"/*.jpeg 2>/dev/null | sort); do
               i=$((i+1))
-              cp "$f" "clean-${session_suffix}/$(printf "%04d" "$i").png"
+              ffmpeg -y -i "$f" "clean-${session_suffix}/$(printf "%04d" "$i").jpg" >/dev/null 2>&1
             done
             shot_count=$i
             if [ "$shot_count" -gt 0 ]; then
-              command -v ffmpeg >/dev/null 2>&1 || sudo apt-get install -y ffmpeg
-              ffmpeg -y -framerate "1/2" -i "clean-${session_suffix}/%04d.png" \
+              ffmpeg -y -framerate "1/2" -i "clean-${session_suffix}/%04d.jpg" \
                 -vf "scale=1280:-2:flags=lanczos" -c:v libx264 -pix_fmt yuv420p \
                 "videos/run-${session_suffix}.mp4" \
                 || echo "⚠️ Assemblage vidéo échoué (non bloquant)"
@@ -398,63 +404,8 @@ jobs:
 
           start_gateway || true
 
-          run_agent "mistral/mistral-small-latest" "mistral1"
-
-          if is_success output.json; then
-            echo "✅ Succès avec Mistral"
-            echo "agent_failed=false" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          if gateway_actually_down output.json; then
-            echo "🔄 Gateway injoignable, redémarrage..."
-            start_gateway || true
-            run_agent "mistral/mistral-small-latest" "mistral2"
-            if is_success output.json; then
-              echo "✅ Succès avec Mistral (2e tentative)"
-              echo "agent_failed=false" >> $GITHUB_OUTPUT
-              exit 0
-            fi
-          elif grep -qi "rate limit" output.json; then
-            echo "⚠️ Rate limit détecté, nouvelle tentative dans 30s..."
-            sleep 30
-            run_agent "mistral/mistral-small-latest" "mistral2"
-            if is_success output.json; then
-              echo "✅ Succès avec Mistral (2e tentative)"
-              echo "agent_failed=false" >> $GITHUB_OUTPUT
-              exit 0
-            fi
-          fi
-
           echo "======================================"
-          echo "🔁 Fallback sur Google Gemini (multiples modèles)"
-          echo "======================================"
-          for GEMINI_MODEL in \
-            "google/gemini-2.5-flash" \
-            "google/gemini-2.5-flash-lite" \
-            "google/gemini-1.5-flash"; do
-
-            run_agent "$GEMINI_MODEL" "gemini-$(echo "$GEMINI_MODEL" | tr '/.' '--')"
-            if is_success output.json; then
-              echo "✅ Succès avec Google Gemini ($GEMINI_MODEL)"
-              echo "agent_failed=false" >> $GITHUB_OUTPUT
-              exit 0
-            fi
-          done
-
-          echo "======================================"
-          echo "🔁 Fallback sur Hugging Face"
-          echo "======================================"
-          run_agent "huggingface/openai/gpt-oss-120b:cerebras" "hf1"
-
-          if is_success output.json; then
-            echo "✅ Succès avec Hugging Face"
-            echo "agent_failed=false" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          echo "======================================"
-          echo "🔁 Fallback sur OpenRouter (modèles gratuits)"
+          echo "🔁 OpenRouter (modèles gratuits) — Mistral/Gemini/HF retirés pour ce test (temps perdu sur quotas/erreurs)"
           echo "======================================"
 
           for OR_MODEL in \
@@ -480,7 +431,7 @@ jobs:
             exit 0
           fi
 
-          echo "❌ Échec final après Mistral, Google, Hugging Face, OpenRouter et NVIDIA"
+          echo "❌ Échec final après OpenRouter et NVIDIA"
           echo "agent_failed=true" >> $GITHUB_OUTPUT
 
       - name: Extraire et envoyer le résultat
