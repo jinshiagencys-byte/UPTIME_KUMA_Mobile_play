@@ -213,6 +213,12 @@ jobs:
           PAGES À VÉRIFIER OBLIGATOIREMENT :
           $PAGES_LIST
 
+          DOCUMENTATION VISUELLE : après chaque clic ou saisie sur un élément
+          important (bouton, lien, champ de formulaire), prends une capture
+          d'écran avec l'outil screenshot en activant --labels (et --full-page
+          si la page est longue) juste après l'action, pour visualiser
+          l'élément ciblé.
+
           Choisis 2-3 actions à tester selon le type détecté :
           - E-commerce : ajoute un produit au panier, VÉRIFIE qu'il apparaît
             bien dans le panier (nom/qté/prix) — ces données viennent du
@@ -276,7 +282,7 @@ jobs:
         run: |
           set +e
 
-          mkdir -p traces
+          mkdir -p videos
 
           start_gateway() {
             echo "🔧 Démarrage du Gateway..."
@@ -322,12 +328,12 @@ jobs:
             echo "======================================"
             openclaw models set "$model" || true
 
-            # 🎥 Trace Playwright pour cette tentative (remplace l'enregistrement vidéo :
-            # openclaw n'a pas de commande d'export vidéo native. `trace start`/`trace stop`
-            # est la commande réellement documentée ; le fichier se rejoue comme une frise
-            # chronologique scrubbable dans le Trace Viewer, avec capture à chaque action).
-            openclaw browser start --headless || true
-            openclaw browser trace start || echo "⚠️ trace start échoué (non bloquant)"
+            # 🎥 Vider le dossier de captures avant cette tentative pour isoler
+            # les frames de cette seule tentative (le dossier est partagé entre
+            # tous les modèles essayés dans ce job).
+            local shot_dir="$HOME/.openclaw/workspace/screenshots"
+            mkdir -p "$shot_dir"
+            rm -f "$shot_dir"/*.png "$shot_dir"/*.jpg "$shot_dir"/*.jpeg 2>/dev/null || true
 
             openclaw agent \
               --session-key "ci:${SITE_ID}-$session_suffix" \
@@ -335,9 +341,25 @@ jobs:
               --json > output.json 2>&1
             cat output.json
 
-            # 🎥 Arrêt + sauvegarde de la trace de cette tentative
-            openclaw browser trace stop --out "traces/trace-${session_suffix}.zip" \
-              || echo "⚠️ trace stop échoué (non bloquant)"
+            # 🎥 Assemblage des captures --labels de cette tentative en une vraie vidéo.
+            # Triées par date de modification pour respecter l'ordre chronologique
+            # des actions de l'agent.
+            mkdir -p videos "frames-${session_suffix}"
+            shot_count=$(ls "$shot_dir"/*.png "$shot_dir"/*.jpg "$shot_dir"/*.jpeg 2>/dev/null | wc -l)
+            if [ "$shot_count" -gt 0 ]; then
+              i=0
+              for f in $(ls -tr "$shot_dir"/*.png "$shot_dir"/*.jpg "$shot_dir"/*.jpeg 2>/dev/null); do
+                i=$((i+1))
+                cp "$f" "frames-${session_suffix}/$(printf "%04d" "$i").png"
+              done
+              command -v ffmpeg >/dev/null 2>&1 || sudo apt-get install -y ffmpeg
+              ffmpeg -y -framerate "1/1.5" -i "frames-${session_suffix}/%04d.png" \
+                -vf "scale=1280:-2:flags=lanczos" -c:v libx264 -pix_fmt yuv420p \
+                "videos/run-${session_suffix}.mp4" \
+                || echo "⚠️ Assemblage vidéo échoué (non bloquant)"
+            else
+              echo "ℹ️ Aucune capture --labels trouvée dans $shot_dir pour cette tentative"
+            fi
           }
 
           is_success() {
@@ -521,4 +543,4 @@ jobs:
             gateway.log
             output.json
             pages.json
-            traces/
+            videos/
