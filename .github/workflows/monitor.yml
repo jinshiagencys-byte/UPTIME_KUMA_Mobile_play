@@ -84,6 +84,19 @@ jobs:
       - name: Checkout du code
         uses: actions/checkout@v4
 
+      - name: Installer Node.js 26 (requis par OpenClaw)
+        run: |
+          export NVM_DIR="$HOME/.nvm"
+          if [ ! -d "$NVM_DIR" ]; then
+            curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
+          fi
+          \. "$NVM_DIR/nvm.sh"
+          nvm install 26
+          nvm use 26
+          nvm alias default 26
+          echo "$NVM_DIR/versions/node/$(node --version)/bin" >> "$GITHUB_PATH"
+          node --version
+
       - name: Installer OpenClaw
         run: |
           curl -fsSL https://openclaw.ai/install.sh | bash
