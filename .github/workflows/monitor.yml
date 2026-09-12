@@ -341,7 +341,13 @@ jobs:
               n=0
               while kill -0 "$AGENT_PID" 2>/dev/null; do
                 n=$((n+1))
-                shot_out=$(openclaw browser screenshot --full-page --labels 2>>"frames-${session_suffix}/capture.log")
+                # 🛠️ CORRECTION (constaté sur la vidéo réelle) : --full-page produit
+                # des captures de hauteur variable selon la longueur de la page à cet
+                # instant, ce qui écrase/déforme les frames dans la vidéo finale
+                # (l'encodeur garde une taille de canevas fixe). Le viewport seul a
+                # une résolution constante — on perd le bas de page hors écran, mais
+                # chaque frame s'assemble proprement.
+                shot_out=$(openclaw browser screenshot --labels 2>>"frames-${session_suffix}/capture.log")
                 echo "$shot_out" >> "frames-${session_suffix}/capture.log"
                 # 🛠️ CORRECTION (confirmé sur un run réel) : pas de préfixe "MEDIA:" en
                 # pratique, la commande affiche le chemin brut, ex:
@@ -382,8 +388,13 @@ jobs:
             done
             shot_count=$i
             if [ "$shot_count" -gt 0 ]; then
+              # Canevas fixe (1280x800) : chaque frame est réduite pour tenir dedans
+              # (jamais agrandie) puis complétée en blanc si besoin. Garantit une
+              # taille de sortie strictement constante quelle que soit la frame —
+              # testé localement avec des tailles très différentes avant livraison.
               ffmpeg -y -framerate "1/2" -i "clean-${session_suffix}/%04d.jpg" \
-                -vf "scale=1280:-2:flags=lanczos" -c:v libx264 -pix_fmt yuv420p \
+                -vf "scale=1280:800:force_original_aspect_ratio=decrease:flags=lanczos,pad=1280:800:(ow-iw)/2:(oh-ih)/2:color=white" \
+                -c:v libx264 -pix_fmt yuv420p \
                 "videos/run-${session_suffix}.mp4" \
                 || echo "⚠️ Assemblage vidéo échoué (non bloquant)"
               echo "🎥 $shot_count frame(s) capturée(s) pour cette tentative"
