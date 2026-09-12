@@ -213,12 +213,6 @@ jobs:
           PAGES À VÉRIFIER OBLIGATOIREMENT :
           $PAGES_LIST
 
-          DOCUMENTATION VISUELLE : après chaque clic ou saisie sur un élément
-          important (bouton, lien, champ de formulaire), prends une capture
-          d'écran avec l'outil screenshot en activant --labels (et --full-page
-          si la page est longue) juste après l'action, pour visualiser
-          l'élément ciblé.
-
           Choisis 2-3 actions à tester selon le type détecté :
           - E-commerce : ajoute un produit au panier, VÉRIFIE qu'il apparaît
             bien dans le panier (nom/qté/prix) — ces données viennent du
@@ -328,37 +322,56 @@ jobs:
             echo "======================================"
             openclaw models set "$model" || true
 
-            # 🎥 Vider le dossier de captures avant cette tentative pour isoler
-            # les frames de cette seule tentative (le dossier est partagé entre
-            # tous les modèles essayés dans ce job).
-            local shot_dir="$HOME/.openclaw/workspace/screenshots"
-            mkdir -p "$shot_dir"
-            rm -f "$shot_dir"/*.png "$shot_dir"/*.jpg "$shot_dir"/*.jpeg 2>/dev/null || true
+            # 🎥 On ne compte plus sur l'agent pour prendre des captures lui-même
+            # (testé : il n'appelle pas l'outil screenshot spontanément même sur
+            # instruction explicite). On pilote la capture nous-mêmes en tâche de
+            # fond, en parallèle de l'agent, sans dépendre de ses décisions.
+            mkdir -p "frames-${session_suffix}"
+            : > "frames-${session_suffix}/capture.log"
+
+            openclaw browser start --headless || true
 
             openclaw agent \
               --session-key "ci:${SITE_ID}-$session_suffix" \
               --message-file task.md \
-              --json > output.json 2>&1
+              --json > output.json 2>&1 &
+            AGENT_PID=$!
+
+            (
+              n=0
+              while kill -0 "$AGENT_PID" 2>/dev/null; do
+                n=$((n+1))
+                shot_path="frames-${session_suffix}/$(printf "%04d" "$n").png"
+                openclaw browser screenshot --full-page --labels > "$shot_path" 2>>"frames-${session_suffix}/capture.log"
+                # Ne garder le fichier que si c'est un vrai PNG (magic bytes),
+                # pas un message d'erreur texte redirigé par erreur dans le .png
+                if [ ! -s "$shot_path" ] || ! head -c 8 "$shot_path" 2>/dev/null | grep -qU $'\x89PNG'; then
+                  rm -f "$shot_path"
+                fi
+                sleep 2
+              done
+            ) &
+            CAPTURE_PID=$!
+
+            wait "$AGENT_PID"
+            kill "$CAPTURE_PID" 2>/dev/null || true
+            wait "$CAPTURE_PID" 2>/dev/null || true
+
             cat output.json
 
-            # 🎥 Assemblage des captures --labels de cette tentative en une vraie vidéo.
-            # Triées par date de modification pour respecter l'ordre chronologique
-            # des actions de l'agent.
-            mkdir -p videos "frames-${session_suffix}"
-            shot_count=$(ls "$shot_dir"/*.png "$shot_dir"/*.jpg "$shot_dir"/*.jpeg 2>/dev/null | wc -l)
+            # 🎥 Assemblage des frames capturées (déjà numérotées dans l'ordre
+            # chronologique) en une vraie vidéo.
+            mkdir -p videos
+            shot_count=$(ls "frames-${session_suffix}"/*.png 2>/dev/null | wc -l)
             if [ "$shot_count" -gt 0 ]; then
-              i=0
-              for f in $(ls -tr "$shot_dir"/*.png "$shot_dir"/*.jpg "$shot_dir"/*.jpeg 2>/dev/null); do
-                i=$((i+1))
-                cp "$f" "frames-${session_suffix}/$(printf "%04d" "$i").png"
-              done
               command -v ffmpeg >/dev/null 2>&1 || sudo apt-get install -y ffmpeg
-              ffmpeg -y -framerate "1/1.5" -i "frames-${session_suffix}/%04d.png" \
+              ffmpeg -y -framerate "1/2" -i "frames-${session_suffix}/%04d.png" \
                 -vf "scale=1280:-2:flags=lanczos" -c:v libx264 -pix_fmt yuv420p \
                 "videos/run-${session_suffix}.mp4" \
                 || echo "⚠️ Assemblage vidéo échoué (non bloquant)"
+              echo "🎥 $shot_count frame(s) capturée(s) pour cette tentative"
             else
-              echo "ℹ️ Aucune capture --labels trouvée dans $shot_dir pour cette tentative"
+              echo "ℹ️ Aucune frame capturée pour cette tentative (le poller n'a peut-être pas eu le temps de tourner, ou le format renvoyé par 'browser screenshot' n'est pas un PNG brut — voir frames-${session_suffix}/capture.log)"
             fi
           }
 
@@ -544,3 +557,4 @@ jobs:
             output.json
             pages.json
             videos/
+            frames-*/capture.log
