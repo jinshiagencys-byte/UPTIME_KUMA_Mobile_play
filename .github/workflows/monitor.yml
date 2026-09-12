@@ -29,9 +29,9 @@ jobs:
           if [ -n "$SITE_ID" ]; then
             echo "🔍 Test ciblé sur le site $SITE_ID"
             DETAIL=$(curl -s -H "x-relay-secret: $RELAY_SECRET" "https://kuma-relay.up.railway.app/monitors/$SITE_ID")
-            
+
             MONITOR=$(echo "$DETAIL" | jq -c '.monitor | if .type == "http" then {id: .parent, url: .url, name: .parentName} else {id: .id, url: .url, name: .name} end')
-            
+
             if [ -z "$MONITOR" ] || [ "$MONITOR" == "null" ]; then
               echo "❌ Site $SITE_ID introuvable ou erreur relay"
               echo "sites=[]" >> "$GITHUB_OUTPUT"
@@ -40,12 +40,12 @@ jobs:
 
             ALL_MONITORS=$(curl -s -H "x-relay-secret: $RELAY_SECRET" "https://kuma-relay.up.railway.app/monitors")
             PAGES=$(echo "$ALL_MONITORS" | jq -c --arg sid "$(echo "$MONITOR" | jq -r '.id')" '[.monitors[]? | select(.type == "http" and (.parent|tostring) == $sid) | {url: .url, name: .name}]')
-            
+
             SITES=$(jq -cn --argjson mon "$MONITOR" --argjson pages "$PAGES" '[{id: $mon.id, url: $mon.url, name: $mon.name, pages: $pages}]')
           else
             RAW=$(curl -s https://kuma-relay.up.railway.app/active-sites)
             SITES_RAW=$(echo "$RAW" | jq -c '[.sites[]? | {id: .id, url: .site_url}]' 2>/dev/null || echo "")
-            
+
             if [ -z "$SITES_RAW" ] || [ "$SITES_RAW" == "[]" ] || [ "$SITES_RAW" == "null" ]; then
               echo "⚠️ Aucun site exploitable, utilisation d'une valeur par défaut"
               SITES_RAW='[{"id":"test","url":"https://example.com"}]'
@@ -89,6 +89,13 @@ jobs:
           curl -fsSL https://openclaw.ai/install.sh | bash
           echo "$HOME/.npm-global/bin" >> $GITHUB_PATH
           ~/.npm-global/bin/openclaw --version
+
+          # 🎥 Vérification de la présence du binaire agent-browser (enregistrement vidéo)
+          # et de son emplacement exact — à confirmer sur un run réel.
+          echo "🔎 Recherche du binaire agent-browser..."
+          which agent-browser 2>/dev/null && echo "✅ agent-browser trouvé dans le PATH" || \
+            find "$HOME" -maxdepth 4 -iname "agent-browser*" 2>/dev/null | head -5 || \
+            echo "⚠️ agent-browser introuvable, à investiguer"
 
       - name: Configurer OpenClaw (fichier minimal)
         run: |
@@ -264,6 +271,8 @@ jobs:
         run: |
           set +e
 
+          mkdir -p videos
+
           start_gateway() {
             echo "🔧 Démarrage du Gateway..."
             ~/.npm-global/bin/openclaw gateway stop 2>/dev/null || true
@@ -307,11 +316,24 @@ jobs:
             echo "Test avec $model pour $SITE_URL"
             echo "======================================"
             ~/.npm-global/bin/openclaw models set "$model" || true
+
+            # 🎥 Démarrage de l'enregistrement vidéo pour cette tentative.
+            # NB: à vérifier sur un run réel — nom/emplacement exact du binaire
+            # agent-browser (voir étape "Installer OpenClaw"), et si `record start`
+            # doit être appelé avant ou après avoir ouvert l'URL.
+            agent-browser open "$SITE_URL" 2>&1 | tail -5 || true
+            agent-browser record start "videos/run-${session_suffix}.webm" \
+              || echo "⚠️ record start échoué (non bloquant, vérifier le binaire agent-browser)"
+
             ~/.npm-global/bin/openclaw agent \
               --session-key "ci:${SITE_ID}-$session_suffix" \
               --message-file task.md \
               --json > output.json 2>&1
             cat output.json
+
+            # 🎥 Arrêt + sauvegarde de la vidéo de cette tentative
+            agent-browser record stop \
+              || echo "⚠️ record stop échoué (non bloquant)"
           }
 
           is_success() {
@@ -361,7 +383,7 @@ jobs:
             "google/gemini-2.5-flash" \
             "google/gemini-2.5-flash-lite" \
             "google/gemini-1.5-flash"; do
-            
+
             run_agent "$GEMINI_MODEL" "gemini-$(echo "$GEMINI_MODEL" | tr '/.' '--')"
             if is_success output.json; then
               echo "✅ Succès avec Google Gemini ($GEMINI_MODEL)"
@@ -495,4 +517,4 @@ jobs:
             gateway.log
             output.json
             pages.json
-            ~/.openclaw/workspace/screenshots/
+            videos/
