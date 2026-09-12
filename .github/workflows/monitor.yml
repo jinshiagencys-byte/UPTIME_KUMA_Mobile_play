@@ -102,13 +102,6 @@ jobs:
           curl -fsSL https://openclaw.ai/install.sh | bash
           openclaw --version
 
-          # 🎥 Vérification de la présence du binaire agent-browser (enregistrement vidéo)
-          # et de son emplacement exact — à confirmer sur un run réel.
-          echo "🔎 Recherche du binaire agent-browser..."
-          which agent-browser 2>/dev/null && echo "✅ agent-browser trouvé dans le PATH" || \
-            find "$HOME" -maxdepth 4 -iname "agent-browser*" 2>/dev/null | head -5 || \
-            echo "⚠️ agent-browser introuvable, à investiguer"
-
       - name: Configurer OpenClaw (fichier minimal)
         run: |
           mkdir -p ~/.openclaw
@@ -283,7 +276,7 @@ jobs:
         run: |
           set +e
 
-          mkdir -p videos
+          mkdir -p traces
 
           start_gateway() {
             echo "🔧 Démarrage du Gateway..."
@@ -329,13 +322,12 @@ jobs:
             echo "======================================"
             openclaw models set "$model" || true
 
-            # 🎥 Démarrage de l'enregistrement vidéo pour cette tentative.
-            # NB: à vérifier sur un run réel — nom/emplacement exact du binaire
-            # agent-browser (voir étape "Installer OpenClaw"), et si `record start`
-            # doit être appelé avant ou après avoir ouvert l'URL.
-            agent-browser open "$SITE_URL" 2>&1 | tail -5 || true
-            agent-browser record start "videos/run-${session_suffix}.webm" \
-              || echo "⚠️ record start échoué (non bloquant, vérifier le binaire agent-browser)"
+            # 🎥 Trace Playwright pour cette tentative (remplace l'enregistrement vidéo :
+            # openclaw n'a pas de commande d'export vidéo native. `trace start`/`trace stop`
+            # est la commande réellement documentée ; le fichier se rejoue comme une frise
+            # chronologique scrubbable dans le Trace Viewer, avec capture à chaque action).
+            openclaw browser start --headless || true
+            openclaw browser trace start || echo "⚠️ trace start échoué (non bloquant)"
 
             openclaw agent \
               --session-key "ci:${SITE_ID}-$session_suffix" \
@@ -343,9 +335,9 @@ jobs:
               --json > output.json 2>&1
             cat output.json
 
-            # 🎥 Arrêt + sauvegarde de la vidéo de cette tentative
-            agent-browser record stop \
-              || echo "⚠️ record stop échoué (non bloquant)"
+            # 🎥 Arrêt + sauvegarde de la trace de cette tentative
+            openclaw browser trace stop --out "traces/trace-${session_suffix}.zip" \
+              || echo "⚠️ trace stop échoué (non bloquant)"
           }
 
           is_success() {
@@ -529,4 +521,4 @@ jobs:
             gateway.log
             output.json
             pages.json
-            videos/
+            traces/
