@@ -341,12 +341,16 @@ jobs:
               n=0
               while kill -0 "$AGENT_PID" 2>/dev/null; do
                 n=$((n+1))
+                shot_out=$(openclaw browser screenshot --full-page --labels 2>>"frames-${session_suffix}/capture.log")
+                echo "$shot_out" >> "frames-${session_suffix}/capture.log"
+                # La commande n'écrit pas l'image sur stdout : elle l'enregistre sur
+                # disque et affiche une ligne "MEDIA:<chemin>" (confirmé par la doc
+                # officielle docs.openclaw.ai/tools/browser-control). On récupère ce
+                # chemin et on copie le vrai fichier image.
+                media_path=$(echo "$shot_out" | grep -o 'MEDIA:.*' | head -1 | sed 's/^MEDIA://')
                 shot_path="frames-${session_suffix}/$(printf "%04d" "$n").png"
-                openclaw browser screenshot --full-page --labels > "$shot_path" 2>>"frames-${session_suffix}/capture.log"
-                # Ne garder le fichier que si c'est un vrai PNG (magic bytes),
-                # pas un message d'erreur texte redirigé par erreur dans le .png
-                if [ ! -s "$shot_path" ] || ! head -c 8 "$shot_path" 2>/dev/null | grep -qU $'\x89PNG'; then
-                  rm -f "$shot_path"
+                if [ -n "$media_path" ] && [ -f "$media_path" ]; then
+                  cp "$media_path" "$shot_path"
                 fi
                 sleep 2
               done
@@ -359,19 +363,26 @@ jobs:
 
             cat output.json
 
-            # 🎥 Assemblage des frames capturées (déjà numérotées dans l'ordre
-            # chronologique) en une vraie vidéo.
-            mkdir -p videos
-            shot_count=$(ls "frames-${session_suffix}"/*.png 2>/dev/null | wc -l)
+            # 🎥 Assemblage des frames capturées en une vraie vidéo. On renumérote
+            # d'abord en continu dans un dossier séparé, car un échec ponctuel de
+            # capture laisse des trous dans la numérotation, et ffmpeg (motif
+            # %04d.png) s'arrête à la première séquence manquante.
+            mkdir -p videos "clean-${session_suffix}"
+            i=0
+            for f in $(ls "frames-${session_suffix}"/*.png 2>/dev/null | sort); do
+              i=$((i+1))
+              cp "$f" "clean-${session_suffix}/$(printf "%04d" "$i").png"
+            done
+            shot_count=$i
             if [ "$shot_count" -gt 0 ]; then
               command -v ffmpeg >/dev/null 2>&1 || sudo apt-get install -y ffmpeg
-              ffmpeg -y -framerate "1/2" -i "frames-${session_suffix}/%04d.png" \
+              ffmpeg -y -framerate "1/2" -i "clean-${session_suffix}/%04d.png" \
                 -vf "scale=1280:-2:flags=lanczos" -c:v libx264 -pix_fmt yuv420p \
                 "videos/run-${session_suffix}.mp4" \
                 || echo "⚠️ Assemblage vidéo échoué (non bloquant)"
               echo "🎥 $shot_count frame(s) capturée(s) pour cette tentative"
             else
-              echo "ℹ️ Aucune frame capturée pour cette tentative (le poller n'a peut-être pas eu le temps de tourner, ou le format renvoyé par 'browser screenshot' n'est pas un PNG brut — voir frames-${session_suffix}/capture.log)"
+              echo "ℹ️ Aucune frame capturée pour cette tentative (le poller n'a peut-être pas eu le temps de tourner, ou aucune ligne MEDIA: n'a été trouvée — voir frames-${session_suffix}/capture.log)"
             fi
           }
 
