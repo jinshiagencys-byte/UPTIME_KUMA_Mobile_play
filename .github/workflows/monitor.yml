@@ -100,8 +100,7 @@ jobs:
       - name: Installer OpenClaw
         run: |
           curl -fsSL https://openclaw.ai/install.sh | bash
-          echo "$HOME/.npm-global/bin" >> $GITHUB_PATH
-          ~/.npm-global/bin/openclaw --version
+          openclaw --version
 
           # 🎥 Vérification de la présence du binaire agent-browser (enregistrement vidéo)
           # et de son emplacement exact — à confirmer sur un run réel.
@@ -171,17 +170,17 @@ jobs:
           }
           EOF
 
-          ~/.npm-global/bin/openclaw plugins install mistral --accept-capabilities || echo "⚠️ install mistral échoué"
-          ~/.npm-global/bin/openclaw plugins enable mistral --accept-capabilities || echo "⚠️ enable mistral échoué"
-          ~/.npm-global/bin/openclaw plugins registry --refresh || true
+          openclaw plugins install mistral --accept-capabilities || echo "⚠️ install mistral échoué"
+          openclaw plugins enable mistral --accept-capabilities || echo "⚠️ enable mistral échoué"
+          openclaw plugins registry --refresh || true
 
-          printf "%s\n" "$MISTRAL_API_KEY" | ~/.npm-global/bin/openclaw models auth paste-api-key --provider mistral || echo "⚠️ Échec enregistrement clé Mistral"
-          printf "%s\n" "$GOOGLE_API_KEY" | ~/.npm-global/bin/openclaw models auth paste-api-key --provider google || echo "⚠️ Échec enregistrement clé Google"
-          printf "%s\n" "$HF_API_KEY" | ~/.npm-global/bin/openclaw models auth paste-api-key --provider huggingface || echo "⚠️ Échec enregistrement clé HuggingFace"
-          printf "%s\n" "$OPENROUTER_API_KEY" | ~/.npm-global/bin/openclaw models auth paste-api-key --provider openrouter || echo "⚠️ Échec enregistrement clé OpenRouter"
-          printf "%s\n" "$NVIDIA_API_KEY" | ~/.npm-global/bin/openclaw models auth paste-api-key --provider nvidia || echo "⚠️ Échec enregistrement clé NVIDIA"
+          printf "%s\n" "$MISTRAL_API_KEY" | openclaw models auth paste-api-key --provider mistral || echo "⚠️ Échec enregistrement clé Mistral"
+          printf "%s\n" "$GOOGLE_API_KEY" | openclaw models auth paste-api-key --provider google || echo "⚠️ Échec enregistrement clé Google"
+          printf "%s\n" "$HF_API_KEY" | openclaw models auth paste-api-key --provider huggingface || echo "⚠️ Échec enregistrement clé HuggingFace"
+          printf "%s\n" "$OPENROUTER_API_KEY" | openclaw models auth paste-api-key --provider openrouter || echo "⚠️ Échec enregistrement clé OpenRouter"
+          printf "%s\n" "$NVIDIA_API_KEY" | openclaw models auth paste-api-key --provider nvidia || echo "⚠️ Échec enregistrement clé NVIDIA"
 
-          ~/.npm-global/bin/openclaw models set mistral/mistral-small-latest || true
+          openclaw models set mistral/mistral-small-latest || true
         env:
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
@@ -288,30 +287,30 @@ jobs:
 
           start_gateway() {
             echo "🔧 Démarrage du Gateway..."
-            ~/.npm-global/bin/openclaw gateway stop 2>/dev/null || true
+            openclaw gateway stop 2>/dev/null || true
             pkill -f "openclaw gateway" || true
             sleep 3
 
             echo "🔧 Rafraîchissement du registre de plugins..."
-            ~/.npm-global/bin/openclaw plugins registry --refresh || echo "⚠️ registry --refresh échoué (non bloquant)"
+            openclaw plugins registry --refresh || echo "⚠️ registry --refresh échoué (non bloquant)"
 
             echo "🔧 Désactivation de perplexity..."
-            ~/.npm-global/bin/openclaw plugins disable perplexity 2>&1 | tail -5 || true
-            ~/.npm-global/bin/openclaw config set plugins.entries.perplexity.enabled false || true
+            openclaw plugins disable perplexity 2>&1 | tail -5 || true
+            openclaw config set plugins.entries.perplexity.enabled false || true
 
             echo "🔧 Activation de mistral avec consentement..."
-            if ! ~/.npm-global/bin/openclaw plugins enable mistral --accept-capabilities; then
+            if ! openclaw plugins enable mistral --accept-capabilities; then
               echo "❌ Consentement mistral échoué"
-              ~/.npm-global/bin/openclaw plugins enable mistral --accept-capabilities 2>&1 | tail -20
+              openclaw plugins enable mistral --accept-capabilities 2>&1 | tail -20
             fi
 
-            ~/.npm-global/bin/openclaw plugins list --json | jq -r '.plugins[]? | "\(.id): \(.status)"' | head -20 || true
+            openclaw plugins list --json | jq -r '.plugins[]? | "\(.id): \(.status)"' | head -20 || true
 
-            nohup ~/.npm-global/bin/openclaw gateway run --force --port 18789 --allow-unconfigured > gateway.log 2>&1 &
+            nohup openclaw gateway run --force --port 18789 --allow-unconfigured > gateway.log 2>&1 &
 
             echo "⏳ Attente du Gateway (polling 60s)..."
             for i in $(seq 1 30); do
-              if ~/.npm-global/bin/openclaw gateway status 2>&1 | grep -qi "running"; then
+              if openclaw gateway status 2>&1 | grep -qi "running"; then
                 echo "✅ Gateway opérationnel"
                 return 0
               fi
@@ -328,7 +327,7 @@ jobs:
             echo "======================================"
             echo "Test avec $model pour $SITE_URL"
             echo "======================================"
-            ~/.npm-global/bin/openclaw models set "$model" || true
+            openclaw models set "$model" || true
 
             # 🎥 Démarrage de l'enregistrement vidéo pour cette tentative.
             # NB: à vérifier sur un run réel — nom/emplacement exact du binaire
@@ -338,7 +337,7 @@ jobs:
             agent-browser record start "videos/run-${session_suffix}.webm" \
               || echo "⚠️ record start échoué (non bloquant, vérifier le binaire agent-browser)"
 
-            ~/.npm-global/bin/openclaw agent \
+            openclaw agent \
               --session-key "ci:${SITE_ID}-$session_suffix" \
               --message-file task.md \
               --json > output.json 2>&1
