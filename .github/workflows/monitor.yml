@@ -253,6 +253,8 @@ jobs:
 
           TASK_CONTENT=$(cat task.md)
 
+          mkdir -p recordings
+
           run_agent() {
             local provider=$1
             local model=$2
@@ -278,6 +280,22 @@ jobs:
               > "output-${label}.json" 2>&1
 
             echo "exit_code=$?"
+
+            # 🛠️ AJOUTÉ : copier la vidéo de CETTE tentative précise, avant
+            # qu'elle ne se retrouve mélangée avec celle d'une autre tentative.
+            # Sans ça, ~/.hermes/browser_recordings/ accumule un .webm par
+            # tentative (échouées incluses) sans lien explicite avec le
+            # output-${label}.json correspondant — impossible de savoir quelle
+            # vidéo montre le run qui a produit le verdict final retenu.
+            # On prend le .webm le plus récent juste après l'appel : Hermes
+            # finalise l'enregistrement à la fermeture de la session, donc au
+            # moment où `hermes -z ...` rend la main, le fichier est déjà écrit.
+            latest_webm=$(ls -t ~/.hermes/browser_recordings/*.webm 2>/dev/null | head -n1)
+            if [ -n "$latest_webm" ]; then
+              cp -v "$latest_webm" "recordings/${label}.webm"
+            else
+              echo "ℹ️ Aucune vidéo trouvée pour la tentative ${label}"
+            fi
           }
 
           is_success() {
@@ -311,6 +329,7 @@ jobs:
             if is_success output.json; then
               echo "✅ Succès avec OpenRouter ($OR_MODEL)"
               echo "agent_failed=false" >> $GITHUB_OUTPUT
+              echo "winning_label=${label}" >> $GITHUB_OUTPUT
               exit 0
             fi
           done
@@ -337,6 +356,7 @@ jobs:
             if is_success output.json; then
               echo "✅ Succès avec $provider/$model"
               echo "agent_failed=false" >> $GITHUB_OUTPUT
+              echo "winning_label=${label}" >> $GITHUB_OUTPUT
               exit 0
             fi
           done
@@ -349,25 +369,12 @@ jobs:
           if is_success output.json; then
             echo "✅ Succès avec NVIDIA (moonshotai/kimi-k3)"
             echo "agent_failed=false" >> $GITHUB_OUTPUT
+            echo "winning_label=nvidia1" >> $GITHUB_OUTPUT
             exit 0
           fi
 
           echo "❌ Échec final après tous les providers"
           echo "agent_failed=true" >> $GITHUB_OUTPUT
-
-      - name: Récupérer les enregistrements vidéo Hermes
-        if: always()
-        run: |
-          mkdir -p recordings
-          # Les sessions Hermes enregistrent en WebM dans ~/.hermes/browser_recordings/
-          # dès que la session navigateur se ferme (fin de l'appel hermes chat).
-          # Nettoyage auto après 72h côté Hermes — sans effet ici puisque le
-          # runner est jetable, mais on copie systématiquement avant la fin du job.
-          if [ -d ~/.hermes/browser_recordings ]; then
-            cp -v ~/.hermes/browser_recordings/*.webm recordings/ 2>/dev/null || echo "ℹ️ Aucun enregistrement trouvé pour cette tentative"
-          else
-            echo "ℹ️ Dossier browser_recordings absent — aucune session navigateur enregistrée"
-          fi
 
       - name: Extraire et envoyer le résultat
         if: always()
@@ -399,8 +406,18 @@ jobs:
             ')
 
             if echo "$PAGES_JSON" | jq -e '.overall_status and .pages' > /dev/null 2>&1; then
-              STATUS=$(echo "$PAGES_JSON" | jq -r '.overall_status // "UNKNOWN"')
+              # 🛠️ CORRIGÉ : is_success() accepte "up"/"down" en minuscules
+              # (regex -i), mais rien ne garantissait que le statut envoyé au
+              # relay soit en majuscules. La contrainte CHECK SQL sur
+              # page_checks.status/sites n'accepte que 'UP'/'DOWN'/'ERROR'/
+              # 'UNKNOWN' en majuscules — un modèle répondant "up"/"down" en
+              # minuscules faisait échouer l'insert côté DB, silencieusement
+              # (le curl est suivi de `|| echo ... échoué`, sans faire planter
+              # le job). Normalisation en majuscules ajoutée ici et sur chaque
+              # page individuelle avant tout envoi au relay.
+              STATUS=$(echo "$PAGES_JSON" | jq -r '.overall_status // "UNKNOWN"' | tr '[:lower:]' '[:upper:]')
               SITE_TYPE=$(echo "$PAGES_JSON" | jq -r '.site_type // "non détecté"')
+              PAGES_JSON=$(echo "$PAGES_JSON" | jq -c '.pages |= map(.status |= (if . then ascii_upcase else "UNKNOWN" end))')
               REASON=$(echo "$PAGES_JSON" | jq -c '.pages')
               echo "$PAGES_JSON" > pages.json
               echo "🏷️ Type de site détecté : $SITE_TYPE"
