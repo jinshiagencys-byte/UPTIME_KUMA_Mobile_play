@@ -152,6 +152,26 @@ jobs:
           #     `custom_providers:` (liste, pas dict), sélectionné ensuite via
           #     --provider custom:mistral.
           #   - Le provider Google/Gemini s'appelle "gemini", pas "google".
+          # 🛠️ CORRIGÉ après un run réel sans aucune vidéo récupérée, alors
+          # qu'une tentative (thinkingmachines/inkling:free) avait bel et bien
+          # navigué et produit un vrai verdict : suspect principal identifié,
+          # `sessions: auto_prune: true` peut purger les données de session
+          # (enregistrement inclus) dès la fermeture de la session, ce qui peut
+          # arriver avant que notre `cp` n'ait le temps de récupérer le .webm
+          # dans la même étape shell. Retiré pour test — à réactiver seulement
+          # si confirmé sans impact sur les enregistrements.
+          #
+          # ⚠️ BUG CORRIGÉ : un patch précédent avait injecté ce commentaire
+          # À L'INTÉRIEUR du heredoc ci-dessous et avait supprimé par erreur
+          # sa ligne de fermeture `EOF` ainsi que tout le bloc
+          # `custom_providers:` (Mistral). Résultat confirmé par un run réel :
+          # "warning: here-document at line 29 delimited by end-of-file
+          # (wanted `EOF')" — bash n'a jamais trouvé la fermeture, donc TOUT
+          # le reste du script (hermes doctor, doctor --fix, le cat de
+          # vérification, etc.) a été avalé comme contenu du heredoc au lieu
+          # d'être exécuté. Rien de tout ça n'avait donc réellement tourné.
+          # Les commentaires shell sont désormais placés AVANT l'ouverture du
+          # heredoc, jamais entre son ouverture et sa fermeture.
           cat > ~/.hermes/config.yaml << 'EOF'
           browser:
             enabled: true
@@ -164,17 +184,15 @@ jobs:
           sessions:
             auto_prune: false
 
-          # 🛠️ CORRIGÉ après un run réel sans aucune vidéo récupérée, alors
-          # qu'une tentative (thinkingmachines/inkling:free) avait bel et bien
-          # navigué et produit un vrai verdict : suspect principal identifié,
-          # `sessions: auto_prune: true` peut purger les données de session
-          # (enregistrement inclus) dès la fermeture de la session, ce qui peut
-          # arriver avant que notre `cp` n'ait le temps de récupérer le .webm
-          # dans la même étape shell. Retiré pour test — à réactiver seulement
-          # si confirmé sans impact sur les enregistrements.
           model:
             provider: openrouter
             default: openrouter/free
+
+          custom_providers:
+            - name: mistral
+              base_url: https://api.mistral.ai/v1
+              key_env: MISTRAL_API_KEY
+          EOF
 
           hermes doctor
 
