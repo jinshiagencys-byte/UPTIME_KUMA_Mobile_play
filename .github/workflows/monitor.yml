@@ -90,20 +90,21 @@ jobs:
 
       # 🛠️ SIMPLIFICATION vs OpenClaw : plus besoin d'installer Node.js à la main,
       # l'installeur Hermes gère lui-même Python/Node/ffmpeg/Playwright.
-      # --skip-computer-use : on n'utilise pas le toolset Computer Use, seulement
-      # l'automatisation navigateur (Playwright/agent-browser reste installé).
       #
-      # ⚠️ SUSPECT ACTUEL pour l'absence totale de vidéo : après avoir écarté
-      # `sessions.auto_prune` (testé à false, toujours aucune vidéo sur un run
-      # où l'agent a pourtant réellement navigué et produit un verdict complet),
-      # cette flag est la piste suivante à tester — si l'enregistrement de
-      # session dépend de l'infra installée par le module Computer Use (capture
-      # d'écran type Xvfb/ffmpeg), la sauter à l'installation désactiverait
-      # `record_sessions` indépendamment de la config. Non confirmé : à tester
-      # en retirant --skip-computer-use sur un prochain run.
+      # 🛠️ RETIRÉ --skip-computer-use après un run réel confirmant qu'aucune
+      # vidéo n'apparaît (0/8 tentatives, y compris une qui a réellement navigué
+      # et produit un verdict complet sur usinformatique.com) même avec
+      # `sessions.auto_prune: false` — ce flag reste le suspect le plus probable
+      # si l'enregistrement de session dépend de l'infra installée par le module
+      # Computer Use (capture d'écran type Xvfb/ffmpeg). À confirmer sur le
+      # prochain run : si une vidéo apparaît enfin, c'était bien ça: si toujours
+      # rien, il faudra chercher ailleurs (ex: vérifier que
+      # ~/.hermes/browser_recordings/ existe même vide après le run, via un
+      # `ls -la` de diagnostic, pour savoir si Hermes tente d'écrire quelque
+      # chose ou n'essaie même pas).
       - name: Installer Hermes Agent
         run: |
-          curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash -s -- --skip-computer-use
+          curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           source ~/.bashrc || true
           hermes --version
@@ -328,6 +329,16 @@ jobs:
               cp -v "$latest_webm" "recordings/${label}.webm"
             else
               echo "ℹ️ Aucune vidéo trouvée pour la tentative ${label}"
+              # 🛠️ AJOUTÉ : diagnostic pour savoir si Hermes tente même d'écrire
+              # quelque chose dans ce dossier (dossier absent = Hermes n'essaie
+              # pas du tout d'enregistrer ; dossier présent mais vide = Hermes
+              # essaie mais échoue silencieusement, cause différente à chercher)
+              if [ -d ~/.hermes/browser_recordings ]; then
+                echo "   (le dossier ~/.hermes/browser_recordings existe mais est vide — Hermes tente d'enregistrer mais échoue)"
+                ls -la ~/.hermes/browser_recordings/ || true
+              else
+                echo "   (le dossier ~/.hermes/browser_recordings n'existe pas du tout — Hermes n'a jamais tenté d'enregistrer)"
+              fi
             fi
           }
 
