@@ -97,7 +97,7 @@ jobs:
           curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash -s -- --skip-computer-use
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           source ~/.bashrc || true
-          hermes version
+          hermes --version
           hermes doctor || echo "⚠️ hermes doctor a signalé des avertissements (voir logs) — non bloquant"
 
       # 🎥 Remplace tout le pipeline rrweb/ffmpeg d'OpenClaw : Hermes enregistre
@@ -264,16 +264,16 @@ jobs:
             echo "Test avec $model pour ${{ matrix.site.url }}"
             echo "======================================"
 
-            # ⚠️ Point non vérifié (même prudence que pour l'ancien pipeline
-            # OpenClaw) : le nom exact du flag pour fournir un prompt long/multi-
-            # ligne à `hermes chat` en une passe. -q/--query est confirmé pour le
-            # mode one-shot ; testé ici via substitution de commande. Si la tâche
-            # dépasse une limite de longueur d'argument, passer par un fichier
-            # temporaire et vérifier la doc `hermes chat --help` en cas d'échec.
-            hermes chat -q "$TASK_CONTENT" \
+            # 🛠️ CORRIGÉ après un run réel : `hermes chat -q` n'existe pas tel quel.
+            # `--help` confirme que le prompt one-shot (-z) et les toolsets (-t) sont
+            # des flags TOP-LEVEL de `hermes`, pas des options de la sous-commande
+            # `chat`. --yolo évite que l'agent se bloque en attendant une
+            # confirmation humaine pour une action (clic, soumission de formulaire)
+            # puisque personne n'est présent en CI pour l'approuver.
+            hermes -z "$TASK_CONTENT" \
               -m "$model" \
               -t "browser,terminal" \
-              --toolsets "browser,terminal" \
+              --yolo \
               > "output-${label}.json" 2>&1
 
             echo "exit_code=$?"
