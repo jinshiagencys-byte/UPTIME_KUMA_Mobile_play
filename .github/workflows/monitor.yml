@@ -287,19 +287,24 @@ jobs:
           TASK_CONTENT=$(cat task.md)
 
           run_agent() {
-            local model=$1
-            local label=$2
+            local provider=$1
+            local model=$2
+            local label=$3
             echo "======================================"
-            echo "Test avec $model pour ${{ matrix.site.url }}"
+            echo "Test avec $provider/$model pour ${{ matrix.site.url }}"
             echo "======================================"
 
-            # 🛠️ CORRIGÉ après un run réel : `hermes chat -q` n'existe pas tel quel.
-            # `--help` confirme que le prompt one-shot (-z) et les toolsets (-t) sont
-            # des flags TOP-LEVEL de `hermes`, pas des options de la sous-commande
-            # `chat`. --yolo évite que l'agent se bloque en attendant une
-            # confirmation humaine pour une action (clic, soumission de formulaire)
-            # puisque personne n'est présent en CI pour l'approuver.
+            # 🛠️ CORRIGÉ après un run réel : tous les appels échouaient avec "not
+            # a valid model ID", SAUF google/gemini-2.5-pro qui a atteint OpenRouter
+            # et buté sur un 402 crédits épuisés — preuve que fusionner provider et
+            # modèle dans un seul -m "provider/model" fait passer TOUS les appels
+            # par défaut dans le catalogue de modèles OpenRouter (qui n'a reconnu
+            # que google/gemini-2.5-pro, un vrai slug OpenRouter). `--help` confirme
+            # que -m et --provider sont deux flags distincts : --provider sélectionne
+            # le provider défini dans config.yaml, -m prend l'ID brut listé dans ses
+            # models: [...] (ex: mistral-small-latest, poolside/laguna-s-2.1:free).
             hermes -z "$TASK_CONTENT" \
+              --provider "$provider" \
               -m "$model" \
               -t "browser,terminal" \
               --yolo \
@@ -324,13 +329,15 @@ jobs:
           echo "======================================"
           echo "🔁 Chaîne de repli OpenRouter (modèles gratuits)"
           echo "======================================"
+          # Modèles listés avec leur ID brut (sans préfixe "openrouter/"), tel que
+          # déclaré dans config.yaml sous models.providers.openrouter.models
           for OR_MODEL in \
-            "openrouter/poolside/laguna-s-2.1:free" \
-            "openrouter/inclusionai/ling-3.0-flash-fin:free" \
-            "openrouter/thinkingmachines/inkling:free" \
-            "openrouter/openrouter/free"; do
+            "poolside/laguna-s-2.1:free" \
+            "inclusionai/ling-3.0-flash-fin:free" \
+            "thinkingmachines/inkling:free" \
+            "openrouter/free"; do
             label="openrouter-$(echo "$OR_MODEL" | tr '/:' '--')"
-            run_agent "$OR_MODEL" "$label"
+            run_agent "openrouter" "$OR_MODEL" "$label"
             cp "output-${label}.json" output.json
             if is_success output.json; then
               echo "✅ Succès avec OpenRouter ($OR_MODEL)"
@@ -342,12 +349,14 @@ jobs:
           echo "======================================"
           echo "🔁 Fallback sur Mistral / Google / HuggingFace"
           echo "======================================"
-          for MODEL in "mistral/mistral-small-latest" "google/gemini-2.5-pro" "huggingface/openai/gpt-oss-120b:cerebras"; do
-            label="$(echo "$MODEL" | tr '/:' '--')"
-            run_agent "$MODEL" "$label"
+          for PAIR in "mistral:mistral-small-latest" "google:gemini-2.5-pro" "huggingface:openai/gpt-oss-120b:cerebras"; do
+            provider="${PAIR%%:*}"
+            model="${PAIR#*:}"
+            label="$(echo "${provider}-${model}" | tr '/:' '--')"
+            run_agent "$provider" "$model" "$label"
             cp "output-${label}.json" output.json
             if is_success output.json; then
-              echo "✅ Succès avec $MODEL"
+              echo "✅ Succès avec $provider/$model"
               echo "agent_failed=false" >> $GITHUB_OUTPUT
               exit 0
             fi
@@ -356,7 +365,7 @@ jobs:
           echo "======================================"
           echo "🔁 Dernier recours : NVIDIA NIM"
           echo "======================================"
-          run_agent "nvidia/moonshotai/kimi-k3" "nvidia1"
+          run_agent "nvidia" "moonshotai/kimi-k3" "nvidia1"
           cp "output-nvidia1.json" output.json
           if is_success output.json; then
             echo "✅ Succès avec NVIDIA (moonshotai/kimi-k3)"
