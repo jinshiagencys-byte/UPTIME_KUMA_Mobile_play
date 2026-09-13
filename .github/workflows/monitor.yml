@@ -92,6 +92,15 @@ jobs:
       # l'installeur Hermes gère lui-même Python/Node/ffmpeg/Playwright.
       # --skip-computer-use : on n'utilise pas le toolset Computer Use, seulement
       # l'automatisation navigateur (Playwright/agent-browser reste installé).
+      #
+      # ⚠️ SUSPECT ACTUEL pour l'absence totale de vidéo : après avoir écarté
+      # `sessions.auto_prune` (testé à false, toujours aucune vidéo sur un run
+      # où l'agent a pourtant réellement navigué et produit un verdict complet),
+      # cette flag est la piste suivante à tester — si l'enregistrement de
+      # session dépend de l'infra installée par le module Computer Use (capture
+      # d'écran type Xvfb/ffmpeg), la sauter à l'installation désactiverait
+      # `record_sessions` indépendamment de la config. Non confirmé : à tester
+      # en retirant --skip-computer-use sur un prochain run.
       - name: Installer Hermes Agent
         run: |
           curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash -s -- --skip-computer-use
@@ -415,13 +424,17 @@ jobs:
             REASON="Agent execution failed after all attempts"
             PAGES_JSON=""
           else
-            # Même logique d'extraction que le workflow OpenClaw : le format de
-            # sortie attendu (bloc ```json final) ne dépend pas de l'agent utilisé,
-            # seulement du prompt dans task.md, resté identique.
-            AGENT_TEXT=$(jq -r '[.. | .text? // empty] | map(select(type == "string")) | first // ""' output.json 2>/dev/null)
-            if [ -z "$AGENT_TEXT" ]; then
-              AGENT_TEXT=$(cat output.json)
-            fi
+            # 🛠️ CORRIGÉ après un run réel : ce bloc supposait, comme à l'époque
+            # d'OpenClaw, qu'output.json était un objet JSON structuré avec des
+            # champs .text imbriqués. Hermes ne sort que du texte brut (verdict
+            # + bloc ```json final) — jq échouait donc à parser le fichier et
+            # retournait un code d'erreur non nul. Le `2>/dev/null` masquait le
+            # message mais pas le code de sortie, et comme les steps GitHub
+            # Actions tournent en `bash -eo pipefail` par défaut, ça tuait toute
+            # l'étape avant même d'atteindre le fallback cat — donc ni
+            # mark-crawled ni pages-report n'étaient jamais envoyés, même quand
+            # l'agent avait produit un verdict JSON parfaitement valide.
+            AGENT_TEXT=$(cat output.json)
             PAGES_JSON=$(printf '%s' "$AGENT_TEXT" | awk '
               /```json/ { capture=1; buf=""; next }
               /```/ { if (capture) { last=buf; capture=0 } ; next }
