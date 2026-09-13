@@ -116,16 +116,32 @@ jobs:
         run: |
           mkdir -p ~/.hermes
 
-          # Les clés vont dans .env (Hermes détecte automatiquement les providers
-          # pour lesquels une clé existe — cf. doc "Configuring Models").
+          # 🛠️ CORRIGÉ après un run réel : Hugging Face attend HF_TOKEN, pas
+          # HF_API_KEY (erreur confirmée : "No usable credentials found for
+          # provider 'huggingface'. Set HF_TOKEN."). Le secret GitHub reste nommé
+          # HF_API_KEY (pas besoin de le renommer côté repo), on l'expose juste
+          # aussi sous le nom que Hermes attend.
           cat > ~/.hermes/.env << EOF
           MISTRAL_API_KEY=${MISTRAL_API_KEY}
           GOOGLE_API_KEY=${GOOGLE_API_KEY}
-          HF_API_KEY=${HF_API_KEY}
+          HF_TOKEN=${HF_API_KEY}
           OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
           NVIDIA_API_KEY=${NVIDIA_API_KEY}
           EOF
 
+          # 🛠️ CORRIGÉ après un run réel : la structure `models: providers: {...}`
+          # que j'avais écrite n'existe pas dans le vrai schéma Hermes (confirmé
+          # par le message "Config version outdated (v0 → v44)" de hermes doctor,
+          # et par "Unknown provider 'mistral'" au moment d'appeler l'agent). Le
+          # vrai schéma (doc officielle "AI Providers") :
+          #   - openrouter, nvidia, huggingface, gemini sont des providers
+          #     INTÉGRÉS — aucune déclaration requise ici, juste la bonne clé
+          #     d'env (voir ci-dessus) et --provider <nom> au moment de l'appel.
+          #   - Mistral N'EST PAS un provider intégré à Hermes (confirmé par deux
+          #     issues GitHub ouvertes demandant son ajout) : il doit passer par
+          #     `custom_providers:` (liste, pas dict), sélectionné ensuite via
+          #     --provider custom:mistral.
+          #   - Le provider Google/Gemini s'appelle "gemini", pas "google".
           cat > ~/.hermes/config.yaml << 'EOF'
           browser:
             enabled: true
@@ -138,65 +154,16 @@ jobs:
           sessions:
             auto_prune: true
 
-          models:
-            providers:
-              mistral:
-                provider: mistral
-                api_mode: openai-completions
-                base_url: https://api.mistral.ai/v1
-                models:
-                  - id: mistral-small-latest
-                    name: mistral-small-latest
-                default: mistral-small-latest
-              google:
-                provider: google
-                models:
-                  - id: gemini-2.5-pro
-                    name: gemini-2.5-pro
-                default: gemini-2.5-pro
-              huggingface:
-                provider: huggingface
-                api_mode: openai-completions
-                base_url: https://router.huggingface.co/v1
-                models:
-                  - id: openai/gpt-oss-120b:cerebras
-                    name: openai/gpt-oss-120b:cerebras
-                default: openai/gpt-oss-120b:cerebras
-              openrouter:
-                provider: openrouter
-                api_mode: openai-completions
-                base_url: https://openrouter.ai/api/v1
-                # 🛠️ CORRIGÉ après un run réel (erreur "HTTP 400: ... is not a
-                # valid model ID") : un base_url + api_mode ne suffit pas à faire
-                # reconnaître un ID de modèle par Hermes — chaque modèle utilisable
-                # via -m doit être listé explicitement ici, comme c'était déjà le
-                # cas pour OpenClaw.
-                models:
-                  - id: poolside/laguna-s-2.1:free
-                    name: laguna-s-2.1-free
-                  - id: inclusionai/ling-3.0-flash-fin:free
-                    name: ling-3.0-flash-fin-free
-                  - id: thinkingmachines/inkling:free
-                    name: inkling-free
-                  - id: openrouter/free
-                    name: openrouter-auto-free
-              nvidia:
-                provider: nvidia
-                api_mode: openai-completions
-                base_url: https://integrate.api.nvidia.com/v1
-                models:
-                  - id: moonshotai/kimi-k3
-                    name: moonshotai/kimi-k3
-                default: moonshotai/kimi-k3
+          model:
+            provider: openrouter
+            default: openrouter/free
+
+          custom_providers:
+            - name: mistral
+              base_url: https://api.mistral.ai/v1
+              key_env: MISTRAL_API_KEY
           EOF
 
-          # ⚠️ Point non vérifié : la sous-commande exacte pour lister les modèles
-          # enregistrés (probablement `hermes model` ou `hermes model list`).
-          # Affiché en diagnostic non-bloquant pour repérer un ID de modèle mal
-          # enregistré AVANT de lancer toute la chaîne de repli — c'est ce qui a
-          # manqué au run précédent (erreur "not a valid model ID" découverte
-          # seulement après coup, dans la sortie de `hermes -z`).
-          hermes model list 2>&1 || hermes model 2>&1 || echo "⚠️ Impossible de lister les modèles (non bloquant)"
           hermes doctor
 
       - name: Générer la tâche
@@ -314,23 +281,25 @@ jobs:
           }
 
           is_success() {
-            local status
-            status=$(jq -r '[.. | .status? // empty] | map(select(type == "string")) | first // empty' "$1" 2>/dev/null)
-            if [ -z "$status" ]; then
-              # Le texte peut ne pas être du JSON structuré (sortie de chat brute) ;
-              # on retombe sur une recherche de motif dans le texte, comme pour
-              # l'extraction finale plus bas.
-              grep -qiE '"overall_status"\s*:\s*"(up|ok)"' "$1"
-              return $?
-            fi
-            echo "$status" | grep -qiE '^(up|ok)$'
+            # 🛠️ CORRIGÉ après un run réel : cette fonction ne reconnaissait qu'un
+            # site "UP" comme un succès. Un verdict DOWN est un résultat tout aussi
+            # valide (l'agent a fait son travail et produit une réponse structurée)
+            # — le confondre avec un échec d'API faisait continuer la boucle et
+            # écraser un bon résultat (ex: thinkingmachines/inkling avait produit
+            # un vrai verdict DOWN détaillé, mais la boucle a continué jusqu'à
+            # NVIDIA et c'est SON échec 429 qui s'est retrouvé dans output.json
+            # final). Un run est un succès dès qu'un bloc ```json avec
+            # overall_status (UP ou DOWN) est présent — pas seulement UP.
+            grep -qiE '"overall_status"\s*:\s*"(up|down)"' "$1"
           }
 
           echo "======================================"
           echo "🔁 Chaîne de repli OpenRouter (modèles gratuits)"
           echo "======================================"
-          # Modèles listés avec leur ID brut (sans préfixe "openrouter/"), tel que
-          # déclaré dans config.yaml sous models.providers.openrouter.models
+          # Modèles listés avec leur ID brut (sans préfixe "openrouter/") — ce
+          # sont des slugs OpenRouter réels, confirmés fonctionnels sur un run
+          # réel (thinkingmachines/inkling:free et openrouter/free ont produit
+          # un vrai verdict).
           for OR_MODEL in \
             "poolside/laguna-s-2.1:free" \
             "inclusionai/ling-3.0-flash-fin:free" \
@@ -347,11 +316,21 @@ jobs:
           done
 
           echo "======================================"
-          echo "🔁 Fallback sur Mistral / Google / HuggingFace"
+          echo "🔁 Fallback sur Mistral / Gemini / HuggingFace"
           echo "======================================"
-          for PAIR in "mistral:mistral-small-latest" "google:gemini-2.5-pro" "huggingface:openai/gpt-oss-120b:cerebras"; do
-            provider="${PAIR%%:*}"
-            model="${PAIR#*:}"
+          # Séparateur '|' (pas ':') car "custom:mistral" contient déjà un ':',
+          # et le modèle HuggingFace aussi ("openai/gpt-oss-120b:cerebras").
+          # 🛠️ CORRIGÉ : "mistral" seul n'est pas un provider connu de Hermes
+          # (confirmé par "Unknown provider 'mistral'") — Mistral n'est pas un
+          # provider intégré, il doit passer par custom_providers: et se
+          # sélectionne via "custom:mistral". Le provider Google/Gemini
+          # s'appelle "gemini", pas "google" (confirmé par la doc officielle).
+          # Modèle Gemini mis à jour : gemini-2.5-pro est retiré (confirmé par
+          # l'erreur HTTP 404 du run précédent, qui recommandait
+          # gemini-3.1-pro-preview).
+          for PAIR in "custom:mistral|mistral-small-latest" "gemini|gemini-3.1-pro-preview" "huggingface|openai/gpt-oss-120b:cerebras"; do
+            provider="${PAIR%%|*}"
+            model="${PAIR#*|}"
             label="$(echo "${provider}-${model}" | tr '/:' '--')"
             run_agent "$provider" "$model" "$label"
             cp "output-${label}.json" output.json
