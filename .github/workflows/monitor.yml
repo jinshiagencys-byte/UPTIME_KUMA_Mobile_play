@@ -152,8 +152,16 @@ jobs:
             tool_progress: "off"
 
           sessions:
-            auto_prune: true
+            auto_prune: false
 
+          # 🛠️ CORRIGÉ après un run réel sans aucune vidéo récupérée, alors
+          # qu'une tentative (thinkingmachines/inkling:free) avait bel et bien
+          # navigué et produit un vrai verdict : suspect principal identifié,
+          # `sessions: auto_prune: true` peut purger les données de session
+          # (enregistrement inclus) dès la fermeture de la session, ce qui peut
+          # arriver avant que notre `cp` n'ait le temps de récupérer le .webm
+          # dans la même étape shell. Retiré pour test — à réactiver seulement
+          # si confirmé sans impact sur les enregistrements.
           model:
             provider: openrouter
             default: openrouter/free
@@ -280,6 +288,22 @@ jobs:
               > "output-${label}.json" 2>&1
 
             echo "exit_code=$?"
+
+            # 🛠️ AJOUTÉ après un run réel : une tentative (thinkingmachines/
+            # inkling:free) a réellement navigué et vérifié le site, terminant
+            # par "Verdict DOWN. Bloc JSON généré ci-dessus avec 10 pages
+            # notées." — mais ce bloc ```json n'était PAS dans le fichier
+            # capturé (réponse coupée avant la sortie du JSON final). is_success()
+            # a donc conclu (à raison, sur ce fichier) à un échec, et la boucle a
+            # continué vers un provider suivant qui, lui, a vraiment échoué (429),
+            # écrasant un vrai travail de vérification par une erreur générique.
+            # On détecte ce cas précis pour au moins le signaler distinctement
+            # dans les logs (le travail de l'agent n'est pas perdu, juste son
+            # JSON final n'a pas pu être imprimé à temps).
+            if ! grep -qiE '"overall_status"\s*:\s*"(up|down)"' "output-${label}.json" \
+               && grep -qiE 'bloc json|json (ci-dessus|généré|generated above)' "output-${label}.json"; then
+              echo "⚠️ ${label} : l'agent a terminé sa vérification (voir texte) mais n'a jamais imprimé le bloc JSON final — réponse probablement tronquée. Ce run sera compté comme échec faute de JSON exploitable, mais consultez output-${label}.json pour le résumé texte."
+            fi
 
             # 🛠️ AJOUTÉ : copier la vidéo de CETTE tentative précise, avant
             # qu'elle ne se retrouve mélangée avec celle d'une autre tentative.
