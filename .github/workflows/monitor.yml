@@ -102,6 +102,99 @@ jobs:
           curl -fsSL https://openclaw.ai/install.sh | bash
           openclaw --version
 
+      - name: Télécharger rrweb (enregistrement des sessions par page)
+        run: |
+          curl -fsSL https://cdn.jsdelivr.net/npm/rrweb@latest/dist/record/rrweb-record.min.js -o rrweb-record.min.js
+          # Le bundle déclare "var rrwebRecord=..." en tête. Injecté via `browser evaluate`,
+          # le corps est enveloppé dans une fonction async par OpenClaw, donc un `var` resterait
+          # local à cet appel et disparaîtrait à l'appel evaluate suivant. On force l'assignation
+          # sur window pour qu'elle survive d'un appel à l'autre sur la même page.
+          sed -i 's/^var rrwebRecord=/window.rrwebRecord=/' rrweb-record.min.js
+
+          curl -fsSL https://cdn.jsdelivr.net/npm/rrweb-player@latest/dist/index.js -o rrweb-player.js
+          curl -fsSL https://cdn.jsdelivr.net/npm/rrweb-player@latest/dist/style.css -o rrweb-player.css
+
+          # ⚠️ Point non vérifié : la forme exacte du JSON renvoyé par
+          # `openclaw browser evaluate --json` (data.result ? data.value ? autre chose ?).
+          # Ce script essaie plusieurs chemins plausibles dans l'ordre ; s'il échoue, le
+          # JSON brut est dans capture.log pour corriger précisément plutôt qu'en devinant.
+          cat > extract_evaluate_result.py << 'PYEOF'
+          import sys, json
+
+          def extract(raw):
+              try:
+                  obj = json.loads(raw)
+              except Exception:
+                  return None
+              candidates = []
+              data = obj.get("data") if isinstance(obj, dict) else None
+              if isinstance(data, dict):
+                  candidates.append(data.get("result"))
+                  candidates.append(data.get("value"))
+              if isinstance(obj, dict):
+                  candidates.append(obj.get("result"))
+                  candidates.append(obj.get("value"))
+              candidates.append(data)
+              candidates.append(obj)
+              for c in candidates:
+                  if c is not None:
+                      return c
+              return None
+
+          if __name__ == "__main__":
+              raw = sys.stdin.read()
+              result = extract(raw)
+              if result is None:
+                  sys.exit(1)
+              print(result if isinstance(result, str) else json.dumps(result))
+          PYEOF
+
+          cat > append_events_ndjson.py << 'PYEOF'
+          import json, sys
+
+          try:
+              for ev in json.loads(sys.stdin.read()):
+                  print(json.dumps(ev))
+          except Exception:
+              pass
+          PYEOF
+
+          cat > build_replay.py << 'PYEOF'
+          import sys, json
+
+          events_path, out_path, url = sys.argv[1], sys.argv[2], sys.argv[3]
+          events = []
+          with open(events_path) as f:
+              for line in f:
+                  line = line.strip()
+                  if not line:
+                      continue
+                  try:
+                      events.append(json.loads(line))
+                  except Exception:
+                      pass
+
+          with open("rrweb-player.js") as f:
+              player_js = f.read()
+          with open("rrweb-player.css") as f:
+              player_css = f.read()
+
+          safe_url = url.replace("<", "").replace(">", "")
+          html = (
+              "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+              "<title>Replay - " + safe_url + "</title>"
+              "<style>" + player_css + "</style></head><body>"
+              "<div id=\"player\"></div>"
+              "<script>" + player_js + "</script>"
+              "<script>new rrwebPlayer({target: document.getElementById('player'), "
+              "props: {events: " + json.dumps(events) + ", width: 1280, height: 800}});</script>"
+              "</body></html>"
+          )
+          with open(out_path, "w") as f:
+              f.write(html)
+          print(f"Replay saved: {out_path} ({len(events)} events)")
+          PYEOF
+
       - name: Configurer OpenClaw (fichier minimal)
         run: |
           mkdir -p ~/.openclaw
@@ -276,7 +369,7 @@ jobs:
         run: |
           set +e
 
-          mkdir -p videos
+          mkdir -p replays
 
           start_gateway() {
             echo "🔧 Démarrage du Gateway..."
@@ -322,12 +415,12 @@ jobs:
             echo "======================================"
             openclaw models set "$model" || true
 
-            # 🎥 On ne compte plus sur l'agent pour prendre des captures lui-même
-            # (testé : il n'appelle pas l'outil screenshot spontanément même sur
-            # instruction explicite). On pilote la capture nous-mêmes en tâche de
-            # fond, en parallèle de l'agent, sans dépendre de ses décisions.
-            mkdir -p "frames-${session_suffix}"
-            : > "frames-${session_suffix}/capture.log"
+            # 🎥 Un replay rrweb par page visitée, au lieu d'une vidéo assemblée à partir
+            # de captures d'écran. rrweb enregistre les événements DOM en continu (pas de
+            # trous entre deux polls) mais perd son état à chaque navigation — donc un
+            # segment/replay distinct par page, ce qui convient très bien ici.
+            mkdir -p "replays-${session_suffix}"
+            : > "replays-${session_suffix}/capture.log"
 
             openclaw browser start --headless || true
 
@@ -338,33 +431,59 @@ jobs:
             AGENT_PID=$!
 
             (
-              n=0
-              while kill -0 "$AGENT_PID" 2>/dev/null; do
-                n=$((n+1))
-                # 🛠️ CORRECTION (constaté sur la vidéo réelle) : --full-page produit
-                # des captures de hauteur variable selon la longueur de la page à cet
-                # instant, ce qui écrase/déforme les frames dans la vidéo finale
-                # (l'encodeur garde une taille de canevas fixe). Le viewport seul a
-                # une résolution constante — on perd le bas de page hors écran, mais
-                # chaque frame s'assemble proprement.
-                shot_out=$(openclaw browser screenshot --labels 2>>"frames-${session_suffix}/capture.log")
-                echo "$shot_out" >> "frames-${session_suffix}/capture.log"
-                # 🛠️ CORRECTION (confirmé sur un run réel) : pas de préfixe "MEDIA:" en
-                # pratique, la commande affiche le chemin brut, ex:
-                # "~/.openclaw/media/browser/<uuid>.png". On extrait cette ligne et on
-                # étend le "~" nous-mêmes (le shell ne le fait pas sur une variable).
-                media_path=$(echo "$shot_out" | grep -oE '~/\.openclaw/media/browser/[^ ]+\.(png|jpg|jpeg)' | head -1)
-                media_path="${media_path/#\~/$HOME}"
-                if [ -n "$media_path" ] && [ -f "$media_path" ]; then
-                  ext="${media_path##*.}"
-                  cp "$media_path" "frames-${session_suffix}/$(printf "%04d" "$n").${ext}"
+              page_index=0
+              current_url=""
+              events_buffer="replays-${session_suffix}/events-current.ndjson"
+              : > "$events_buffer"
+
+              harvest_events() {
+                local out extracted
+                out=$(openclaw browser evaluate --json --fn 'const e = (window.__rrwebEvents||[]).splice(0); return JSON.stringify(e);' 2>>"replays-${session_suffix}/capture.log")
+                echo "$out" >> "replays-${session_suffix}/capture.log"
+                extracted=$(echo "$out" | python3 extract_evaluate_result.py 2>>"replays-${session_suffix}/capture.log")
+                if [ -n "$extracted" ]; then
+                  echo "$extracted" | python3 append_events_ndjson.py >> "$events_buffer"
                 fi
-                # Intervalle plus large qu'au premier essai (2s) pour réduire la
-                # contention avec l'agent sur le même navigateur (observé : la
-                # plupart des tentatives échouaient avec "previous screenshot...
-                # still running" / "Frame changed while snapshot was being captured").
-                sleep 4
+              }
+
+              finalize_page() {
+                harvest_events
+                if [ -s "$events_buffer" ] && [ "$page_index" -gt 0 ]; then
+                  python3 build_replay.py "$events_buffer" "replays-${session_suffix}/page-$(printf "%02d" "$page_index").html" "$current_url" \
+                    || echo "⚠️ Construction du replay échouée pour la page $page_index (non bloquant)"
+                fi
+              }
+
+              inject_recorder() {
+                page_index=$((page_index+1))
+                : > "$events_buffer"
+                cat rrweb-record.min.js > "replays-${session_suffix}/inject.js"
+                cat >> "replays-${session_suffix}/inject.js" << 'INJECTEOF'
+          window.__rrwebEvents = [];
+          if (window.__rrwebStopFn) { try { window.__rrwebStopFn(); } catch (e) {} }
+          window.__rrwebStopFn = window.rrwebRecord.record({ emit: function(ev) { window.__rrwebEvents.push(ev); } });
+          INJECTEOF
+                openclaw browser evaluate --json --fn "$(cat "replays-${session_suffix}/inject.js")" \
+                  >> "replays-${session_suffix}/capture.log" 2>&1
+              }
+
+              while kill -0 "$AGENT_PID" 2>/dev/null; do
+                url_out=$(openclaw browser evaluate --json --fn 'return location.href;' 2>>"replays-${session_suffix}/capture.log")
+                echo "$url_out" >> "replays-${session_suffix}/capture.log"
+                new_url=$(echo "$url_out" | python3 extract_evaluate_result.py 2>>"replays-${session_suffix}/capture.log")
+
+                if [ -n "$new_url" ] && [ "$new_url" != "$current_url" ]; then
+                  if [ -n "$current_url" ]; then
+                    finalize_page
+                  fi
+                  current_url="$new_url"
+                  inject_recorder
+                else
+                  harvest_events
+                fi
+                sleep 2
               done
+              finalize_page
             ) &
             CAPTURE_PID=$!
 
@@ -374,35 +493,13 @@ jobs:
 
             cat output.json
 
-            # 🎥 Assemblage des frames capturées en une vraie vidéo. On renumérote
-            # d'abord en continu dans un dossier séparé (les captures peuvent être
-            # en .png OU .jpg selon le run — observé sur un vrai test — donc on
-            # reconvertit chaque frame en .jpg uniforme au passage avec ffmpeg,
-            # plutôt que de risquer un mélange d'extensions dans la séquence).
-            mkdir -p videos "clean-${session_suffix}"
-            command -v ffmpeg >/dev/null 2>&1 || sudo apt-get install -y ffmpeg
-            i=0
-            for f in $(ls "frames-${session_suffix}"/*.png "frames-${session_suffix}"/*.jpg "frames-${session_suffix}"/*.jpeg 2>/dev/null | sort); do
-              i=$((i+1))
-              ffmpeg -y -i "$f" "clean-${session_suffix}/$(printf "%04d" "$i").jpg" >/dev/null 2>&1
-            done
-            shot_count=$i
-            if [ "$shot_count" -gt 0 ]; then
-              # Canevas fixe (1280x800) : chaque frame est réduite pour tenir dedans
-              # (jamais agrandie) puis complétée en blanc si besoin. Garantit une
-              # taille de sortie strictement constante quelle que soit la frame —
-              # testé localement avec des tailles très différentes avant livraison.
-              ffmpeg -y -framerate "1/2" -i "clean-${session_suffix}/%04d.jpg" \
-                -vf "scale=1280:800:force_original_aspect_ratio=decrease:flags=lanczos,pad=1280:800:(ow-iw)/2:(oh-ih)/2:color=white" \
-                -c:v libx264 -pix_fmt yuv420p \
-                "videos/run-${session_suffix}.mp4" \
-                || echo "⚠️ Assemblage vidéo échoué (non bloquant)"
-              echo "🎥 $shot_count frame(s) capturée(s) pour cette tentative"
+            replay_count=$(ls "replays-${session_suffix}"/page-*.html 2>/dev/null | wc -l)
+            if [ "$replay_count" -gt 0 ]; then
+              echo "🎥 $replay_count replay(s) construits pour cette tentative"
             else
-              echo "ℹ️ Aucune frame capturée pour cette tentative (le poller n'a peut-être pas eu le temps de tourner, ou aucune ligne MEDIA: n'a été trouvée — voir frames-${session_suffix}/capture.log)"
+              echo "ℹ️ Aucun replay construit pour cette tentative — voir replays-${session_suffix}/capture.log"
             fi
           }
-
           is_success() {
             local status
             status=$(jq -r '[.. | .status? // empty] | map(select(type == "string")) | first // empty' "$1" 2>/dev/null)
@@ -529,5 +626,6 @@ jobs:
             gateway.log
             output.json
             pages.json
-            videos/
+            replays-*/page-*.html
+            replays-*/capture.log
             frames-*/capture.log
