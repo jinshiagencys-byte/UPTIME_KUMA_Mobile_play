@@ -75,6 +75,13 @@ jobs:
     needs: fetch-sites
     if: needs.fetch-sites.outputs.sites != '[]'
     runs-on: ubuntu-latest
+    # 🛠️ NOUVEAU : déclaré au niveau du job pour que TOUTES les étapes (hermes
+    # doctor, hermes -z) voient l'endpoint CDP lancé par le step dédié ci-dessous.
+    # Hermes n'expose le tool browser-cdp que si un endpoint est joignable au
+    # démarrage de session — son absence est affichée à tort comme « system
+    # dependency not met » (issue #25753).
+    env:
+      BROWSER_CDP_URL: http://127.0.0.1:9222
     concurrency:
       group: hermes-check-${{ matrix.site.id }}
       cancel-in-progress: false
@@ -90,18 +97,9 @@ jobs:
 
       # 🛠️ SIMPLIFICATION vs OpenClaw : plus besoin d'installer Node.js à la main,
       # l'installeur Hermes gère lui-même Python/Node/ffmpeg/Playwright.
-      #
-      # 🛠️ RETIRÉ --skip-computer-use après un run réel confirmant qu'aucune
-      # vidéo n'apparaît (0/8 tentatives, y compris une qui a réellement navigué
-      # et produit un verdict complet sur usinformatique.com) même avec
-      # `sessions.auto_prune: false` — ce flag reste le suspect le plus probable
-      # si l'enregistrement de session dépend de l'infra installée par le module
-      # Computer Use (capture d'écran type Xvfb/ffmpeg). À confirmer sur le
-      # prochain run : si une vidéo apparaît enfin, c'était bien ça: si toujours
-      # rien, il faudra chercher ailleurs (ex: vérifier que
-      # ~/.hermes/browser_recordings/ existe même vide après le run, via un
-      # `ls -la` de diagnostic, pour savoir si Hermes tente d'écrire quelque
-      # chose ou n'essaie même pas).
+      # (--skip-computer-use a été retiré et l'hypothèse associée a été
+      # INVALIDÉE par un run réel : le dossier recordings n'apparaissait pas
+      # plus avec le module Computer Use installé.)
       - name: Installer Hermes Agent
         run: |
           curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
@@ -109,6 +107,80 @@ jobs:
           source ~/.bashrc || true
           hermes --version
           hermes doctor || echo "⚠️ hermes doctor a signalé des avertissements (voir logs) — non bloquant"
+
+      # 🛠️ NOUVEAU — cause racine identifiée : « browser-cdp ⚠ system dependency
+      # not met » ne signifie PAS qu'il manque une lib système, mais qu'aucun
+      # endpoint CDP n'est joignable au démarrage de session (label trompeur,
+      # issue #25753). Aucune des hypothèses précédentes (auto_prune,
+      # --skip-computer-use, schéma config) ne pouvait créer un tel endpoint.
+      # On en crée un ICI, avant tout appel Hermes, et on vérifie par curl.
+      - name: Lancer Chromium avec endpoint CDP
+        run: |
+          set -e
+
+          # Chrome stable est préinstallé sur les runners ubuntu-latest ;
+          # chromium-browser est un paquet-snap sur 22.04+, capricieux en CI.
+          CHROME_BIN=""
+          for candidate in google-chrome google-chrome-stable chromium chromium-browser; do
+            if command -v "$candidate" >/dev/null 2>&1; then
+              CHROME_BIN="$candidate"
+              break
+            fi
+          done
+          if [ -z "$CHROME_BIN" ]; then
+            echo "Aucun navigateur détecté, installation apt…"
+            sudo apt-get update
+            sudo apt-get install -y chromium-browser || sudo apt-get install -y chromium || true
+            CHROME_BIN="$(command -v chromium-browser || command -v chromium || true)"
+          fi
+          if [ -z "$CHROME_BIN" ]; then
+            echo "❌ Aucun navigateur Chromium-family disponible sur le runner"
+            exit 1
+          fi
+          echo "🌐 Navigateur : $CHROME_BIN ($("$CHROME_BIN" --version))"
+
+          # ⚠️ Profil DÉDIÉ obligatoire : sur les Chrome récents,
+          # --remote-debugging-port est silencieusement IGNORÉ avec le profil
+          # par défaut — LE piège classique qui fait croire à un bug CDP.
+          # La doc Hermes recommande explicitement un profil séparé.
+          mkdir -p "$HOME/.hermes/chrome-debug"
+
+          "$CHROME_BIN" \
+            --headless=new \
+            --no-sandbox \
+            --disable-dev-shm-usage \
+            --disable-gpu \
+            --remote-debugging-port=9222 \
+            --user-data-dir="$HOME/.hermes/chrome-debug" \
+            --window-size=1280,800 \
+            --no-first-run \
+            --no-default-browser-check \
+            about:blank > /tmp/chromium.log 2>&1 &
+
+          # Attente active 30 s max, puis échec DUR : fini les runs « tout
+          # silencieux » — si CDP ne monte pas, le job plante ICI avec le log.
+          CDP_OK=0
+          for i in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:9222/json/version > /tmp/cdp-version.json 2>/dev/null; then
+              CDP_OK=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$CDP_OK" != "1" ]; then
+            echo "❌ Endpoint CDP jamais monté sur 127.0.0.1:9222 — log Chromium :"
+            cat /tmp/chromium.log || true
+            exit 1
+          fi
+          echo "✅ Endpoint CDP opérationnel :"
+          cat /tmp/cdp-version.json
+
+          # 🛠️ Issue #15952 : sur certaines versions (dont possiblement 0.21.2),
+          # le check browser-cdp exige agent-browser MÊME avec cdp_url configuré.
+          # Installation best-effort — si le paquet n'existe pas, non bloquant :
+          # le grep doctor à l'étape suivante dira si c'était nécessaire.
+          npm install -g agent-browser >/dev/null 2>&1 \
+            || echo "ℹ️ agent-browser non installé via npm (non bloquant)"
 
       # 🎥 Remplace tout le pipeline rrweb/ffmpeg d'OpenClaw : Hermes enregistre
       # nativement la session navigateur en WebM (browser.record_sessions: true),
@@ -126,10 +198,9 @@ jobs:
         run: |
           mkdir -p ~/.hermes
 
-          # 🛠️ CORRIGÉ après un run réel : Hugging Face attend HF_TOKEN, pas
-          # HF_API_KEY (erreur confirmée : "No usable credentials found for
-          # provider 'huggingface'. Set HF_TOKEN."). Le secret GitHub reste nommé
-          # HF_API_KEY (pas besoin de le renommer côté repo), on l'expose juste
+          # 🛠️ Hugging Face attend HF_TOKEN, pas HF_API_KEY (erreur confirmée :
+          # "No usable credentials found for provider 'huggingface'. Set
+          # HF_TOKEN."). Le secret GitHub reste nommé HF_API_KEY, on l'expose
           # aussi sous le nom que Hermes attend.
           cat > ~/.hermes/.env << EOF
           MISTRAL_API_KEY=${MISTRAL_API_KEY}
@@ -139,44 +210,22 @@ jobs:
           NVIDIA_API_KEY=${NVIDIA_API_KEY}
           EOF
 
-          # 🛠️ CORRIGÉ après un run réel : la structure `models: providers: {...}`
-          # que j'avais écrite n'existe pas dans le vrai schéma Hermes (confirmé
-          # par le message "Config version outdated (v0 → v44)" de hermes doctor,
-          # et par "Unknown provider 'mistral'" au moment d'appeler l'agent). Le
-          # vrai schéma (doc officielle "AI Providers") :
-          #   - openrouter, nvidia, huggingface, gemini sont des providers
-          #     INTÉGRÉS — aucune déclaration requise ici, juste la bonne clé
-          #     d'env (voir ci-dessus) et --provider <nom> au moment de l'appel.
-          #   - Mistral N'EST PAS un provider intégré à Hermes (confirmé par deux
-          #     issues GitHub ouvertes demandant son ajout) : il doit passer par
-          #     `custom_providers:` (liste, pas dict), sélectionné ensuite via
-          #     --provider custom:mistral.
-          #   - Le provider Google/Gemini s'appelle "gemini", pas "google".
-          # 🛠️ CORRIGÉ après un run réel sans aucune vidéo récupérée, alors
-          # qu'une tentative (thinkingmachines/inkling:free) avait bel et bien
-          # navigué et produit un vrai verdict : suspect principal identifié,
-          # `sessions: auto_prune: true` peut purger les données de session
-          # (enregistrement inclus) dès la fermeture de la session, ce qui peut
-          # arriver avant que notre `cp` n'ait le temps de récupérer le .webm
-          # dans la même étape shell. Retiré pour test — à réactiver seulement
-          # si confirmé sans impact sur les enregistrements.
+          # 🛠️ RÈGLE DE LA MAISON (confirmée par un run réel cassé) : AUCUN
+          # commentaire shell entre l'ouverture du heredoc et son EOF de
+          # fermeture — un patch précédent avait avalé tout le reste du script.
           #
-          # ⚠️ BUG CORRIGÉ : un patch précédent avait injecté ce commentaire
-          # À L'INTÉRIEUR du heredoc ci-dessous et avait supprimé par erreur
-          # sa ligne de fermeture `EOF` ainsi que tout le bloc
-          # `custom_providers:` (Mistral). Résultat confirmé par un run réel :
-          # "warning: here-document at line 29 delimited by end-of-file
-          # (wanted `EOF')" — bash n'a jamais trouvé la fermeture, donc TOUT
-          # le reste du script (hermes doctor, doctor --fix, le cat de
-          # vérification, etc.) a été avalé comme contenu du heredoc au lieu
-          # d'être exécuté. Rien de tout ça n'avait donc réellement tourné.
-          # Les commentaires shell sont désormais placés AVANT l'ouverture du
-          # heredoc, jamais entre son ouverture et sa fermeture.
+          # 🛠️ MODIFIÉ : ajout de browser.cdp_url pointant vers le Chromium
+          # lancé par le step précédent. C'est LA clé qui fait passer le check
+          # browser-cdp de ⚠ à ✓ (avec BROWSER_CDP_URL en filet au niveau job).
+          # browser.record_sessions/cloud_provider ont survécu intactes à la
+          # migration v0→v44 (confirmé par doctor --fix), elles n'étaient pas
+          # le problème — l'absence d'endpoint CDP si.
           cat > ~/.hermes/config.yaml << 'EOF'
           browser:
             enabled: true
             cloud_provider: local
             record_sessions: true
+            cdp_url: http://127.0.0.1:9222
 
           display:
             tool_progress: "off"
@@ -196,16 +245,16 @@ jobs:
 
           hermes doctor
 
-          # 🛠️ AJOUTÉ après un hermes doctor réel montrant "Config version
-          # outdated (v0 → v44) (new settings available)" : nos clés
-          # browser.record_sessions/cloud_provider ont pu être écrites dans un
-          # schéma v0 obsolète et donc silencieusement ignorées par Hermes,
-          # comme ça a déjà été le cas avec `models: providers:` par le passé.
-          # --fix migre automatiquement vers le schéma courant sans bloquer si
-          # rien à corriger.
+          # Migration automatique du schéma si obsolète (v0 → v44), non bloquante.
           hermes doctor --fix || echo "⚠️ hermes doctor --fix a échoué ou n'a rien eu à corriger — non bloquant"
           echo "--- config.yaml après migration éventuelle ---"
           cat ~/.hermes/config.yaml
+
+          # 🛠️ NOUVEAU : réponse IMMÉDIATE dans les logs à la question qui
+          # bloque depuis plusieurs runs — browser-cdp est-il enfin ✓ ?
+          echo "--- État de browser-cdp avec l'endpoint CDP actif ---"
+          hermes doctor 2>&1 | grep -i -A1 "browser-cdp" \
+            || echo "(browser-cdp absent de la sortie doctor)"
 
       - name: Générer la tâche
         env:
@@ -282,11 +331,7 @@ jobs:
           alors qu'elles sont attendues = DOWN même si HTTP 200.
           EOF
 
-      # 🛠️ SIMPLIFICATION MAJEURE vs OpenClaw : plus de gateway persistant à
-      # démarrer/arrêter/poller, plus de poller externe (screenshot ou rrweb)
-      # tournant en parallèle de l'agent. `hermes chat -q` est un exec one-shot :
-      # un appel = une vérification complète, et l'enregistrement vidéo se fait
-      # tout seul côté Hermes tant que browser.record_sessions: true.
+      # `hermes -z` est un exec one-shot : un appel = une vérification complète.
       - name: Lancer Hermes Agent (avec repli multi-providers)
         id: agent_run
         run: |
@@ -304,23 +349,13 @@ jobs:
             echo "Test avec $provider/$model pour ${{ matrix.site.url }}"
             echo "======================================"
 
-            # 🛠️ CORRIGÉ après un run réel : tous les appels échouaient avec "not
-            # a valid model ID", SAUF google/gemini-2.5-pro qui a atteint OpenRouter
-            # et buté sur un 402 crédits épuisés — preuve que fusionner provider et
-            # modèle dans un seul -m "provider/model" fait passer TOUS les appels
-            # par défaut dans le catalogue de modèles OpenRouter (qui n'a reconnu
-            # que google/gemini-2.5-pro, un vrai slug OpenRouter). `--help` confirme
-            # que -m et --provider sont deux flags distincts : --provider sélectionne
-            # le provider défini dans config.yaml, -m prend l'ID brut listé dans ses
-            # models: [...] (ex: mistral-small-latest, poolside/laguna-s-2.1:free).
-            # 🛠️ AJOUTÉ "browser-cdp" au toolset : hermes doctor liste ce tool
-            # séparément de "browser" avec "⚠ system dependency not met" — si
-            # c'est lui le mécanisme réel derrière l'enregistrement vidéo de
-            # session, ne jamais le solliciter expliquerait pourquoi
-            # ~/.hermes/browser_recordings n'est même jamais créé. En le
-            # demandant explicitement ici, on verra soit une vidéo apparaître,
-            # soit une erreur de dépendance système plus explicite dans les
-            # logs qu'un simple silence.
+            # -m et --provider sont deux flags distincts : --provider sélectionne
+            # le provider défini dans config.yaml, -m prend l'ID brut listé dans
+            # ses models: [...] (pas de préfixe provider/).
+            # 🛠️ Toolset "browser,browser-cdp,terminal" : demander explicitement
+            # browser-cdp maintenant qu'un endpoint existe (BROWSER_CDP_URL +
+            # cdp_url config) — si un problème de dépendance subsiste, on aura
+            # enfin une erreur explicite au lieu du silence.
             hermes -z "$TASK_CONTENT" \
               --provider "$provider" \
               -m "$model" \
@@ -330,40 +365,27 @@ jobs:
 
             echo "exit_code=$?"
 
-            # 🛠️ AJOUTÉ après un run réel : une tentative (thinkingmachines/
-            # inkling:free) a réellement navigué et vérifié le site, terminant
-            # par "Verdict DOWN. Bloc JSON généré ci-dessus avec 10 pages
-            # notées." — mais ce bloc ```json n'était PAS dans le fichier
-            # capturé (réponse coupée avant la sortie du JSON final). is_success()
-            # a donc conclu (à raison, sur ce fichier) à un échec, et la boucle a
-            # continué vers un provider suivant qui, lui, a vraiment échoué (429),
-            # écrasant un vrai travail de vérification par une erreur générique.
-            # On détecte ce cas précis pour au moins le signaler distinctement
-            # dans les logs (le travail de l'agent n'est pas perdu, juste son
-            # JSON final n'a pas pu être imprimé à temps).
+            # Détection du cas « verdict complet mais JSON final tronqué » :
+            # l'agent a terminé sa vérification mais n'a jamais imprimé le bloc
+            # JSON (réponse coupée). Signalé distinctement dans les logs pour ne
+            # pas confondre avec un échec d'API.
             if ! grep -qiE '"overall_status"\s*:\s*"(up|down)"' "output-${label}.json" \
                && grep -qiE 'bloc json|json (ci-dessus|généré|generated above)' "output-${label}.json"; then
               echo "⚠️ ${label} : l'agent a terminé sa vérification (voir texte) mais n'a jamais imprimé le bloc JSON final — réponse probablement tronquée. Ce run sera compté comme échec faute de JSON exploitable, mais consultez output-${label}.json pour le résumé texte."
             fi
 
-            # 🛠️ AJOUTÉ : copier la vidéo de CETTE tentative précise, avant
-            # qu'elle ne se retrouve mélangée avec celle d'une autre tentative.
-            # Sans ça, ~/.hermes/browser_recordings/ accumule un .webm par
-            # tentative (échouées incluses) sans lien explicite avec le
-            # output-${label}.json correspondant — impossible de savoir quelle
-            # vidéo montre le run qui a produit le verdict final retenu.
-            # On prend le .webm le plus récent juste après l'appel : Hermes
+            # Copier la vidéo de CETTE tentative précise, avant qu'elle ne se
+            # retrouve mélangée avec celle d'une autre tentative. Hermes
             # finalise l'enregistrement à la fermeture de la session, donc au
-            # moment où `hermes -z ...` rend la main, le fichier est déjà écrit.
+            # moment où `hermes -z ...` rend la main, le fichier est écrit.
             latest_webm=$(ls -t ~/.hermes/browser_recordings/*.webm 2>/dev/null | head -n1)
             if [ -n "$latest_webm" ]; then
               cp -v "$latest_webm" "recordings/${label}.webm"
             else
               echo "ℹ️ Aucune vidéo trouvée pour la tentative ${label}"
-              # 🛠️ AJOUTÉ : diagnostic pour savoir si Hermes tente même d'écrire
-              # quelque chose dans ce dossier (dossier absent = Hermes n'essaie
-              # pas du tout d'enregistrer ; dossier présent mais vide = Hermes
-              # essaie mais échoue silencieusement, cause différente à chercher)
+              # Diagnostic : dossier absent = Hermes n'essaie pas du tout
+              # d'enregistrer ; dossier présent mais vide = il essaie mais
+              # échoue silencieusement (cause différente à chercher).
               if [ -d ~/.hermes/browser_recordings ]; then
                 echo "   (le dossier ~/.hermes/browser_recordings existe mais est vide — Hermes tente d'enregistrer mais échoue)"
                 ls -la ~/.hermes/browser_recordings/ || true
@@ -374,25 +396,16 @@ jobs:
           }
 
           is_success() {
-            # 🛠️ CORRIGÉ après un run réel : cette fonction ne reconnaissait qu'un
-            # site "UP" comme un succès. Un verdict DOWN est un résultat tout aussi
-            # valide (l'agent a fait son travail et produit une réponse structurée)
-            # — le confondre avec un échec d'API faisait continuer la boucle et
-            # écraser un bon résultat (ex: thinkingmachines/inkling avait produit
-            # un vrai verdict DOWN détaillé, mais la boucle a continué jusqu'à
-            # NVIDIA et c'est SON échec 429 qui s'est retrouvé dans output.json
-            # final). Un run est un succès dès qu'un bloc ```json avec
-            # overall_status (UP ou DOWN) est présent — pas seulement UP.
+            # Un verdict DOWN est un résultat aussi valide qu'un UP : un run est
+            # un succès dès qu'un bloc ```json avec overall_status (UP ou DOWN)
+            # est présent — sinon la boucle écrase un bon résultat par l'échec
+            # 429 d'un provider suivant.
             grep -qiE '"overall_status"\s*:\s*"(up|down)"' "$1"
           }
 
           echo "======================================"
           echo "🔁 Chaîne de repli OpenRouter (modèles gratuits)"
           echo "======================================"
-          # Modèles listés avec leur ID brut (sans préfixe "openrouter/") — ce
-          # sont des slugs OpenRouter réels, confirmés fonctionnels sur un run
-          # réel (thinkingmachines/inkling:free et openrouter/free ont produit
-          # un vrai verdict).
           for OR_MODEL in \
             "poolside/laguna-s-2.1:free" \
             "inclusionai/ling-3.0-flash-fin:free" \
@@ -412,16 +425,9 @@ jobs:
           echo "======================================"
           echo "🔁 Fallback sur Mistral / Gemini / HuggingFace"
           echo "======================================"
-          # Séparateur '|' (pas ':') car "custom:mistral" contient déjà un ':',
-          # et le modèle HuggingFace aussi ("openai/gpt-oss-120b:cerebras").
-          # 🛠️ CORRIGÉ : "mistral" seul n'est pas un provider connu de Hermes
-          # (confirmé par "Unknown provider 'mistral'") — Mistral n'est pas un
-          # provider intégré, il doit passer par custom_providers: et se
-          # sélectionne via "custom:mistral". Le provider Google/Gemini
-          # s'appelle "gemini", pas "google" (confirmé par la doc officielle).
-          # Modèle Gemini mis à jour : gemini-2.5-pro est retiré (confirmé par
-          # l'erreur HTTP 404 du run précédent, qui recommandait
-          # gemini-3.1-pro-preview).
+          # Séparateur '|' car les noms provider/model contiennent déjà des ':'.
+          # custom:mistral passe par custom_providers: (Mistral n'est pas un
+          # provider intégré), Google s'appelle "gemini".
           for PAIR in "custom:mistral|mistral-small-latest" "gemini|gemini-3.1-pro-preview" "huggingface|openai/gpt-oss-120b:cerebras"; do
             provider="${PAIR%%|*}"
             model="${PAIR#*|}"
@@ -466,16 +472,9 @@ jobs:
             REASON="Agent execution failed after all attempts"
             PAGES_JSON=""
           else
-            # 🛠️ CORRIGÉ après un run réel : ce bloc supposait, comme à l'époque
-            # d'OpenClaw, qu'output.json était un objet JSON structuré avec des
-            # champs .text imbriqués. Hermes ne sort que du texte brut (verdict
-            # + bloc ```json final) — jq échouait donc à parser le fichier et
-            # retournait un code d'erreur non nul. Le `2>/dev/null` masquait le
-            # message mais pas le code de sortie, et comme les steps GitHub
-            # Actions tournent en `bash -eo pipefail` par défaut, ça tuait toute
-            # l'étape avant même d'atteindre le fallback cat — donc ni
-            # mark-crawled ni pages-report n'étaient jamais envoyés, même quand
-            # l'agent avait produit un verdict JSON parfaitement valide.
+            # Hermes ne sort que du texte brut (verdict + bloc ```json final) —
+            # pas d'enveloppe JSON structurée, donc pas de jq ici (le jq .text
+            # hérité d'OpenClaw tuait tout le step en exit 5 avec pipefail).
             AGENT_TEXT=$(cat output.json)
             PAGES_JSON=$(printf '%s' "$AGENT_TEXT" | awk '
               /```json/ { capture=1; buf=""; next }
@@ -485,15 +484,8 @@ jobs:
             ')
 
             if echo "$PAGES_JSON" | jq -e '.overall_status and .pages' > /dev/null 2>&1; then
-              # 🛠️ CORRIGÉ : is_success() accepte "up"/"down" en minuscules
-              # (regex -i), mais rien ne garantissait que le statut envoyé au
-              # relay soit en majuscules. La contrainte CHECK SQL sur
-              # page_checks.status/sites n'accepte que 'UP'/'DOWN'/'ERROR'/
-              # 'UNKNOWN' en majuscules — un modèle répondant "up"/"down" en
-              # minuscules faisait échouer l'insert côté DB, silencieusement
-              # (le curl est suivi de `|| echo ... échoué`, sans faire planter
-              # le job). Normalisation en majuscules ajoutée ici et sur chaque
-              # page individuelle avant tout envoi au relay.
+              # Normalisation en MAJUSCULES : la contrainte CHECK SQL côté relay
+              # n'accepte que UP/DOWN/ERROR/UNKNOWN en majuscules.
               STATUS=$(echo "$PAGES_JSON" | jq -r '.overall_status // "UNKNOWN"' | tr '[:lower:]' '[:upper:]')
               SITE_TYPE=$(echo "$PAGES_JSON" | jq -r '.site_type // "non détecté"')
               PAGES_JSON=$(echo "$PAGES_JSON" | jq -c '.pages |= map(.status |= (if . then ascii_upcase else "UNKNOWN" end))')
@@ -540,6 +532,31 @@ jobs:
             -d @- \
             || echo "⚠️ Envoi mark-crawled échoué"
 
+      # 🛠️ NOUVEAU : élargit la collecte au cas où la doc mentirait sur le
+      # chemin des enregistrements. Si un .webm/.mp4 existe quelque part sous
+      # ~/.hermes, ce find le trouvera — sinon, on aura la preuve définitive
+      # que l'enregistreur ne produit rien même avec un endpoint CDP ✓.
+      - name: Collecter les enregistrements bruts Hermes
+        if: always()
+        run: |
+          echo "--- ~/.hermes/browser_recordings ---"
+          ls -la ~/.hermes/browser_recordings/ 2>/dev/null || echo "(dossier inexistant)"
+
+          echo "--- Tous fichiers vidéo trouvés sous ~/.hermes ---"
+          find "$HOME/.hermes" -type f \( -name '*.webm' -o -name '*.mp4' -o -name '*.mkv' \) \
+            -printf '%p %s bytes\n' 2>/dev/null | head -50 || true
+
+          # Preuve que Hermes est bien passé par NOTRE Chromium : les tabs
+          # ouverts via CDP apparaissent dans /json/list.
+          echo "--- Tabs CDP restants ---"
+          curl -s --max-time 5 http://127.0.0.1:9222/json/list | head -40 || true
+
+          mkdir -p hermes-raw
+          cp -r ~/.hermes/browser_recordings/* hermes-raw/ 2>/dev/null || true
+          cp -v /tmp/chromium.log hermes-raw/ 2>/dev/null || true
+          cp -v /tmp/cdp-version.json hermes-raw/ 2>/dev/null || true
+          cp -v ~/.hermes/config.yaml hermes-raw/ 2>/dev/null || true
+
       - name: Upload des artefacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -549,3 +566,4 @@ jobs:
             output*.json
             pages.json
             recordings/*.webm
+            hermes-raw/**
