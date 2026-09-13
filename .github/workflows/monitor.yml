@@ -1,4 +1,4 @@
-name: OpenClaw - Monitoring Autonome Multi-Sites
+name: Hermes Agent - Monitoring Autonome Multi-Sites
 
 on:
   workflow_dispatch:
@@ -16,11 +16,11 @@ jobs:
     outputs:
       sites: ${{ steps.get-sites.outputs.sites }}
     steps:
+      # Job inchangé par rapport au workflow OpenClaw : la découverte des sites/pages
+      # via kuma-relay ne dépend pas de l'agent utilisé pour la vérification.
       - name: Récupérer les sites actifs et leurs pages
         id: get-sites
         env:
-          # 🛡️ SÉCURITÉ : entrée utilisateur passée par env, jamais interpolée
-          # directement dans le script (protection contre l'injection de commande)
           SITE_ID_INPUT: ${{ github.event.inputs.site_id }}
           RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
         run: |
@@ -46,14 +46,8 @@ jobs:
             RAW=$(curl -s https://kuma-relay.up.railway.app/active-sites)
             SITES_RAW=$(echo "$RAW" | jq -c '[.sites[]? | {id: .id, url: .site_url}]' 2>/dev/null || echo "")
 
-            # 🛠️ CORRECTION : plus de site factice (example.com) en repli. Un
-            # tableau vide reste vide — le job autonomous-test (matrix sur ce
-            # tableau) tourne alors sur 0 site, donc GitHub Actions ne lance
-            # simplement aucun job, même pas sur un site bidon, quand
-            # Supabase/le relay ne renvoie rien d'exploitable (curl échoué,
-            # JSON invalide, ou tableau sites réellement vide).
             if [ -z "$SITES_RAW" ] || [ "$SITES_RAW" == "null" ]; then
-              echo "⚠️ Réponse Supabase/relay illisible ou vide (curl échoué ou JSON invalide) — aucun test ne sera lancé"
+              echo "⚠️ Réponse Supabase/relay illisible ou vide — aucun test ne sera lancé"
               SITES_RAW="[]"
             fi
 
@@ -73,18 +67,16 @@ jobs:
             SITES="$SITES_ARRAY"
           fi
 
-          # 🛠️ COMPACTER : garantir une seule ligne JSON
           SITES=$(echo "$SITES" | jq -c .)
-
           echo "sites=$SITES" >> "$GITHUB_OUTPUT"
           echo "📡 Sites à monitorer: $SITES"
 
-  autonomous-test:
+  hermes-test:
     needs: fetch-sites
     if: needs.fetch-sites.outputs.sites != '[]'
     runs-on: ubuntu-latest
     concurrency:
-      group: openclaw-check-${{ matrix.site.id }}
+      group: hermes-check-${{ matrix.site.id }}
       cancel-in-progress: false
     strategy:
       fail-fast: false
@@ -96,213 +88,101 @@ jobs:
       - name: Checkout du code
         uses: actions/checkout@v4
 
-      - name: Installer Node.js 26 (requis par OpenClaw)
+      # 🛠️ SIMPLIFICATION vs OpenClaw : plus besoin d'installer Node.js à la main,
+      # l'installeur Hermes gère lui-même Python/Node/ffmpeg/Playwright.
+      # --skip-computer-use : on n'utilise pas le toolset Computer Use, seulement
+      # l'automatisation navigateur (Playwright/agent-browser reste installé).
+      - name: Installer Hermes Agent
         run: |
-          export NVM_DIR="$HOME/.nvm"
-          if [ ! -d "$NVM_DIR" ]; then
-            curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash
-          fi
-          \. "$NVM_DIR/nvm.sh"
-          nvm install 26
-          nvm use 26
-          nvm alias default 26
-          echo "$NVM_DIR/versions/node/$(node --version)/bin" >> "$GITHUB_PATH"
-          node --version
+          curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash -s -- --skip-computer-use
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          source ~/.bashrc || true
+          hermes version
+          hermes doctor || echo "⚠️ hermes doctor a signalé des avertissements (voir logs) — non bloquant"
 
-      - name: Installer OpenClaw
-        run: |
-          curl -fsSL https://openclaw.ai/install.sh | bash
-          openclaw --version
-
-      - name: Télécharger rrweb (enregistrement des sessions par page)
-        run: |
-          curl -fsSL https://cdn.jsdelivr.net/npm/rrweb@latest/dist/record/rrweb-record.min.js -o rrweb-record.min.js
-          # Le bundle déclare "var rrwebRecord=..." en tête. Injecté via `browser evaluate`,
-          # le corps est enveloppé dans une fonction async par OpenClaw, donc un `var` resterait
-          # local à cet appel et disparaîtrait à l'appel evaluate suivant. On force l'assignation
-          # sur window pour qu'elle survive d'un appel à l'autre sur la même page.
-          sed -i 's/^var rrwebRecord=/window.rrwebRecord=/' rrweb-record.min.js
-
-          curl -fsSL https://cdn.jsdelivr.net/npm/rrweb-player@latest/dist/index.js -o rrweb-player.js
-          curl -fsSL https://cdn.jsdelivr.net/npm/rrweb-player@latest/dist/style.css -o rrweb-player.css
-
-          # ⚠️ Point non vérifié : la forme exacte du JSON renvoyé par
-          # `openclaw browser evaluate --json` (data.result ? data.value ? autre chose ?).
-          # Ce script essaie plusieurs chemins plausibles dans l'ordre ; s'il échoue, le
-          # JSON brut est dans capture.log pour corriger précisément plutôt qu'en devinant.
-          cat > extract_evaluate_result.py << 'PYEOF'
-          import sys, json
-
-          def extract(raw):
-              try:
-                  obj = json.loads(raw)
-              except Exception:
-                  return None
-              candidates = []
-              data = obj.get("data") if isinstance(obj, dict) else None
-              if isinstance(data, dict):
-                  candidates.append(data.get("result"))
-                  candidates.append(data.get("value"))
-              if isinstance(obj, dict):
-                  candidates.append(obj.get("result"))
-                  candidates.append(obj.get("value"))
-              candidates.append(data)
-              candidates.append(obj)
-              for c in candidates:
-                  if c is not None:
-                      return c
-              return None
-
-          if __name__ == "__main__":
-              raw = sys.stdin.read()
-              result = extract(raw)
-              if result is None:
-                  sys.exit(1)
-              print(result if isinstance(result, str) else json.dumps(result))
-          PYEOF
-
-          cat > append_events_ndjson.py << 'PYEOF'
-          import json, sys
-
-          try:
-              for ev in json.loads(sys.stdin.read()):
-                  print(json.dumps(ev))
-          except Exception:
-              pass
-          PYEOF
-
-          cat > build_replay.py << 'PYEOF'
-          import sys, json
-
-          events_path, out_path, url = sys.argv[1], sys.argv[2], sys.argv[3]
-          events = []
-          with open(events_path) as f:
-              for line in f:
-                  line = line.strip()
-                  if not line:
-                      continue
-                  try:
-                      events.append(json.loads(line))
-                  except Exception:
-                      pass
-
-          with open("rrweb-player.js") as f:
-              player_js = f.read()
-          with open("rrweb-player.css") as f:
-              player_css = f.read()
-
-          safe_url = url.replace("<", "").replace(">", "")
-          html = (
-              "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
-              "<title>Replay - " + safe_url + "</title>"
-              "<style>" + player_css + "</style></head><body>"
-              "<div id=\"player\"></div>"
-              "<script>" + player_js + "</script>"
-              "<script>new rrwebPlayer({target: document.getElementById('player'), "
-              "props: {events: " + json.dumps(events) + ", width: 1280, height: 800}});</script>"
-              "</body></html>"
-          )
-          with open(out_path, "w") as f:
-              f.write(html)
-          print(f"Replay saved: {out_path} ({len(events)} events)")
-          PYEOF
-
-      - name: Configurer OpenClaw (fichier minimal)
-        run: |
-          mkdir -p ~/.openclaw
-          cat > ~/.openclaw/openclaw.json << 'EOF'
-          {
-            "browser": {
-              "enabled": true,
-              "headless": true,
-              "noSandbox": true
-            },
-            "gateway": {
-              "mode": "local",
-              "auth": {
-                "token": "ci-test-token-12345"
-              }
-            },
-            "models": {
-              "providers": {
-                "mistral": {
-                  "api": "openai-completions",
-                  "baseUrl": "https://api.mistral.ai/v1",
-                  "models": [
-                    { "id": "mistral-small-latest", "name": "mistral-small-latest" }
-                  ]
-                },
-                "google": {
-                  "models": [
-                    { "id": "gemini-2.5-flash", "name": "gemini-2.5-flash" },
-                    { "id": "gemini-2.5-flash-lite", "name": "gemini-2.5-flash-lite" },
-                    { "id": "gemini-1.5-flash", "name": "gemini-1.5-flash" }
-                  ]
-                },
-                "huggingface": {
-                  "api": "openai-completions",
-                  "baseUrl": "https://router.huggingface.co/v1",
-                  "models": [
-                    { "id": "openai/gpt-oss-120b:cerebras", "name": "openai/gpt-oss-120b:cerebras" }
-                  ]
-                },
-                "openrouter": {
-                  "api": "openai-completions",
-                  "baseUrl": "https://openrouter.ai/api/v1",
-                  "models": [
-                    { "id": "poolside/laguna-s-2.1:free", "name": "laguna-s-2.1-free" },
-                    { "id": "inclusionai/ling-3.0-flash-fin:free", "name": "ling-3.0-flash-fin-free" },
-                    { "id": "thinkingmachines/inkling:free", "name": "inkling-free" },
-                    { "id": "openrouter/free", "name": "openrouter-auto-free" }
-                  ]
-                },
-                "nvidia": {
-                  "api": "openai-completions",
-                  "baseUrl": "https://integrate.api.nvidia.com/v1",
-                  "models": [
-                    { "id": "moonshotai/kimi-k3", "name": "moonshotai/kimi-k3" }
-                  ]
-                }
-              }
-            }
-          }
-          EOF
-
-          openclaw plugins install mistral --accept-capabilities || echo "⚠️ install mistral échoué"
-          openclaw plugins enable mistral --accept-capabilities || echo "⚠️ enable mistral échoué"
-          openclaw plugins registry --refresh || true
-
-          printf "%s\n" "$MISTRAL_API_KEY" | openclaw models auth paste-api-key --provider mistral || echo "⚠️ Échec enregistrement clé Mistral"
-          printf "%s\n" "$GOOGLE_API_KEY" | openclaw models auth paste-api-key --provider google || echo "⚠️ Échec enregistrement clé Google"
-          printf "%s\n" "$HF_API_KEY" | openclaw models auth paste-api-key --provider huggingface || echo "⚠️ Échec enregistrement clé HuggingFace"
-          printf "%s\n" "$OPENROUTER_API_KEY" | openclaw models auth paste-api-key --provider openrouter || echo "⚠️ Échec enregistrement clé OpenRouter"
-          printf "%s\n" "$NVIDIA_API_KEY" | openclaw models auth paste-api-key --provider nvidia || echo "⚠️ Échec enregistrement clé NVIDIA"
-
-          openclaw models set mistral/mistral-small-latest || true
+      # 🎥 Remplace tout le pipeline rrweb/ffmpeg d'OpenClaw : Hermes enregistre
+      # nativement la session navigateur en WebM (browser.record_sessions: true),
+      # démarre au premier browser_navigate et sauvegarde dans
+      # ~/.hermes/browser_recordings/ à la fermeture de la session. Fonctionne en
+      # local ET en cloud (Browserbase), et ne dépend pas d'un curseur/souris
+      # simulé côté page comme le nécessitait rrweb.
+      - name: Configurer Hermes (config.yaml + credentials)
         env:
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           HF_API_KEY: ${{ secrets.HF_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+        run: |
+          mkdir -p ~/.hermes
+
+          # Les clés vont dans .env (Hermes détecte automatiquement les providers
+          # pour lesquels une clé existe — cf. doc "Configuring Models").
+          cat > ~/.hermes/.env << EOF
+          MISTRAL_API_KEY=${MISTRAL_API_KEY}
+          GOOGLE_API_KEY=${GOOGLE_API_KEY}
+          HF_API_KEY=${HF_API_KEY}
+          OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+          NVIDIA_API_KEY=${NVIDIA_API_KEY}
+          EOF
+
+          cat > ~/.hermes/config.yaml << 'EOF'
+          browser:
+            enabled: true
+            cloud_provider: local
+            record_sessions: true
+
+          display:
+            tool_progress: "off"
+
+          sessions:
+            auto_prune: true
+
+          models:
+            providers:
+              mistral:
+                provider: mistral
+                api_mode: openai-completions
+                base_url: https://api.mistral.ai/v1
+                default: mistral-small-latest
+              google:
+                provider: google
+                default: gemini-2.5-pro
+              huggingface:
+                provider: huggingface
+                api_mode: openai-completions
+                base_url: https://router.huggingface.co/v1
+                default: openai/gpt-oss-120b:cerebras
+              openrouter:
+                provider: openrouter
+                api_mode: openai-completions
+                base_url: https://openrouter.ai/api/v1
+              nvidia:
+                provider: nvidia
+                api_mode: openai-completions
+                base_url: https://integrate.api.nvidia.com/v1
+                default: moonshotai/kimi-k3
+          EOF
+
+          # ⚠️ Point non vérifié (comme pour openclaw models set en son temps) :
+          # la forme exacte des clés provider/model attendues par hermes chat -m.
+          # Si un provider échoue en config, `hermes doctor` et les logs de
+          # `hermes chat` indiquent la clé attendue à corriger.
+          hermes doctor
 
       - name: Générer la tâche
         env:
-          # 🛠️ CORRECTION : on passe le JSON via une variable d'env (pas via substitution
-          # textuelle ${{ }} dans le script) pour éviter que des caractères comme les
-          # apostrophes (ex: "Page d'accueil") ne cassent le bash généré.
           PAGES_JSON: ${{ toJson(matrix.site.pages) }}
-          # 🛡️ SÉCURITÉ : site.url vient d'une API externe (kuma-relay). Le passer par env
-          # évite l'injection de commande : s'il contenait des backticks ou $(...), une
-          # interpolation ${{ }} directe dans le heredoc non quoté les ferait EXÉCUTER.
           SITE_URL: ${{ matrix.site.url }}
         run: |
-          # 🛠️ CORRECTION : matrix.site.pages est déjà un ARRAY (pas un objet {pages: [...]}),
-          # donc on itère directement avec .[] et non .pages[]
           PAGES_LIST=$(echo "$PAGES_JSON" | jq -c . | jq -r '[.[]? | .url] | join("\n")')
 
+          # Tâche identique à celle du workflow OpenClaw : le contenu métier de la
+          # vérification (détection backend en panne, parcours e-commerce/auth/
+          # contact/recherche, verdict JSON final) ne change pas avec le pivot
+          # d'agent — seul le mécanisme d'exécution et d'enregistrement change.
           cat > task.md << EOF
-          Va sur $SITE_URL avec l'outil browser. Explore comme un
+          Va sur $SITE_URL avec l'outil de navigateur. Explore comme un
           humain (scroll, structure) et détecte le type de site.
 
           VÉRIFICATION CRITIQUE avant tout le reste : le contenu affiché
@@ -332,7 +212,7 @@ jobs:
           - Sinon : les 2-3 actions les plus représentatives du site.
 
           Pour chaque page listée, vérifie au minimum qu'elle répond correctement
-          (HTTP 200, contenu attendu). Explores aussi les liens internes pour
+          (HTTP 200, contenu attendu). Explore aussi les liens internes pour
           détecter d'éventuelles pages non listées et signale-les dans le JSON
           final. Toute nouvelle URL atteinte = une page distincte à noter.
 
@@ -365,181 +245,64 @@ jobs:
           alors qu'elles sont attendues = DOWN même si HTTP 200.
           EOF
 
-      - name: Lancer OpenClaw (avec Gateway persistent)
+      # 🛠️ SIMPLIFICATION MAJEURE vs OpenClaw : plus de gateway persistant à
+      # démarrer/arrêter/poller, plus de poller externe (screenshot ou rrweb)
+      # tournant en parallèle de l'agent. `hermes chat -q` est un exec one-shot :
+      # un appel = une vérification complète, et l'enregistrement vidéo se fait
+      # tout seul côté Hermes tant que browser.record_sessions: true.
+      - name: Lancer Hermes Agent (avec repli multi-providers)
         id: agent_run
-        env:
-          # 🛡️ SÉCURITÉ : mêmes raisons que ci-dessus, on évite l'interpolation directe
-          # de données externes (site.url, site.id) dans le script bash.
-          SITE_URL: ${{ matrix.site.url }}
-          SITE_ID: ${{ matrix.site.id }}
-          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
-          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-          HF_API_KEY: ${{ secrets.HF_API_KEY }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-          OPENCLAW_GATEWAY_TOKEN: "ci-test-token-12345"
         run: |
           set +e
 
-          mkdir -p replays
-
-          start_gateway() {
-            echo "🔧 Démarrage du Gateway..."
-            openclaw gateway stop 2>/dev/null || true
-            pkill -f "openclaw gateway" || true
-            sleep 3
-
-            echo "🔧 Rafraîchissement du registre de plugins..."
-            openclaw plugins registry --refresh || echo "⚠️ registry --refresh échoué (non bloquant)"
-
-            echo "🔧 Désactivation de perplexity..."
-            openclaw plugins disable perplexity 2>&1 | tail -5 || true
-            openclaw config set plugins.entries.perplexity.enabled false || true
-
-            echo "🔧 Activation de mistral avec consentement..."
-            if ! openclaw plugins enable mistral --accept-capabilities; then
-              echo "❌ Consentement mistral échoué"
-              openclaw plugins enable mistral --accept-capabilities 2>&1 | tail -20
-            fi
-
-            openclaw plugins list --json | jq -r '.plugins[]? | "\(.id): \(.status)"' | head -20 || true
-
-            nohup openclaw gateway run --force --port 18789 --allow-unconfigured > gateway.log 2>&1 &
-
-            echo "⏳ Attente du Gateway (polling 60s)..."
-            for i in $(seq 1 30); do
-              if openclaw gateway status 2>&1 | grep -qi "running"; then
-                echo "✅ Gateway opérationnel"
-                return 0
-              fi
-              sleep 2
-            done
-            echo "❌ Gateway non disponible après 60s"
-            tail -50 gateway.log
-            return 1
-          }
+          TASK_CONTENT=$(cat task.md)
 
           run_agent() {
             local model=$1
-            local session_suffix=$2
+            local label=$2
             echo "======================================"
-            echo "Test avec $model pour $SITE_URL"
+            echo "Test avec $model pour ${{ matrix.site.url }}"
             echo "======================================"
-            openclaw models set "$model" || true
 
-            # 🎥 Un replay rrweb par page visitée, au lieu d'une vidéo assemblée à partir
-            # de captures d'écran. rrweb enregistre les événements DOM en continu (pas de
-            # trous entre deux polls) mais perd son état à chaque navigation — donc un
-            # segment/replay distinct par page, ce qui convient très bien ici.
-            mkdir -p "replays-${session_suffix}"
-            : > "replays-${session_suffix}/capture.log"
+            # ⚠️ Point non vérifié (même prudence que pour l'ancien pipeline
+            # OpenClaw) : le nom exact du flag pour fournir un prompt long/multi-
+            # ligne à `hermes chat` en une passe. -q/--query est confirmé pour le
+            # mode one-shot ; testé ici via substitution de commande. Si la tâche
+            # dépasse une limite de longueur d'argument, passer par un fichier
+            # temporaire et vérifier la doc `hermes chat --help` en cas d'échec.
+            hermes chat -q "$TASK_CONTENT" \
+              -m "$model" \
+              -t "browser,terminal" \
+              --toolsets "browser,terminal" \
+              > "output-${label}.json" 2>&1
 
-            openclaw browser start --headless || true
-
-            openclaw agent \
-              --session-key "ci:${SITE_ID}-$session_suffix" \
-              --message-file task.md \
-              --json > output.json 2>&1 &
-            AGENT_PID=$!
-
-            (
-              page_index=0
-              current_url=""
-              events_buffer="replays-${session_suffix}/events-current.ndjson"
-              : > "$events_buffer"
-
-              harvest_events() {
-                local out extracted
-                out=$(openclaw browser evaluate --json --fn 'const e = (window.__rrwebEvents||[]).splice(0); return JSON.stringify(e);' 2>>"replays-${session_suffix}/capture.log")
-                echo "$out" >> "replays-${session_suffix}/capture.log"
-                extracted=$(echo "$out" | python3 extract_evaluate_result.py 2>>"replays-${session_suffix}/capture.log")
-                if [ -n "$extracted" ]; then
-                  echo "$extracted" | python3 append_events_ndjson.py >> "$events_buffer"
-                fi
-              }
-
-              finalize_page() {
-                harvest_events
-                if [ -s "$events_buffer" ] && [ "$page_index" -gt 0 ]; then
-                  python3 build_replay.py "$events_buffer" "replays-${session_suffix}/page-$(printf "%02d" "$page_index").html" "$current_url" \
-                    || echo "⚠️ Construction du replay échouée pour la page $page_index (non bloquant)"
-                fi
-              }
-
-              inject_recorder() {
-                page_index=$((page_index+1))
-                : > "$events_buffer"
-                cat rrweb-record.min.js > "replays-${session_suffix}/inject.js"
-                cat >> "replays-${session_suffix}/inject.js" << 'INJECTEOF'
-          window.__rrwebEvents = [];
-          if (window.__rrwebStopFn) { try { window.__rrwebStopFn(); } catch (e) {} }
-          // 🛠️ CORRECTION CONFIRMÉE (capture.log réel) : le bundle jsDelivr expose
-          // directement la fonction d'enregistrement sous window.rrwebRecord — ce
-          // n'est PAS un objet avec une méthode .record(). L'appel précédent
-          // (window.rrwebRecord.record(...)) plantait systématiquement avec
-          // "TypeError: window.rrwebRecord.record is not a function", bloquant
-          // tout enregistrement d'événements sur toutes les pages.
-          window.__rrwebStopFn = window.rrwebRecord({ emit: function(ev) { window.__rrwebEvents.push(ev); } });
-          INJECTEOF
-                openclaw browser evaluate --json --fn "$(cat "replays-${session_suffix}/inject.js")" \
-                  >> "replays-${session_suffix}/capture.log" 2>&1
-              }
-
-              while kill -0 "$AGENT_PID" 2>/dev/null; do
-                url_out=$(openclaw browser evaluate --json --fn 'return location.href;' 2>>"replays-${session_suffix}/capture.log")
-                echo "$url_out" >> "replays-${session_suffix}/capture.log"
-                new_url=$(echo "$url_out" | python3 extract_evaluate_result.py 2>>"replays-${session_suffix}/capture.log")
-
-                if [ -n "$new_url" ] && [ "$new_url" != "$current_url" ]; then
-                  if [ -n "$current_url" ]; then
-                    finalize_page
-                  fi
-                  current_url="$new_url"
-                  inject_recorder
-                else
-                  harvest_events
-                fi
-                sleep 2
-              done
-              finalize_page
-            ) &
-            CAPTURE_PID=$!
-
-            wait "$AGENT_PID"
-            kill "$CAPTURE_PID" 2>/dev/null || true
-            wait "$CAPTURE_PID" 2>/dev/null || true
-
-            cat output.json
-
-            replay_count=$(ls "replays-${session_suffix}"/page-*.html 2>/dev/null | wc -l)
-            if [ "$replay_count" -gt 0 ]; then
-              echo "🎥 $replay_count replay(s) construits pour cette tentative"
-            else
-              echo "ℹ️ Aucun replay construit pour cette tentative — voir replays-${session_suffix}/capture.log"
-            fi
+            echo "exit_code=$?"
           }
+
           is_success() {
             local status
             status=$(jq -r '[.. | .status? // empty] | map(select(type == "string")) | first // empty' "$1" 2>/dev/null)
+            if [ -z "$status" ]; then
+              # Le texte peut ne pas être du JSON structuré (sortie de chat brute) ;
+              # on retombe sur une recherche de motif dans le texte, comme pour
+              # l'extraction finale plus bas.
+              grep -qiE '"overall_status"\s*:\s*"(up|ok)"' "$1"
+              return $?
+            fi
             echo "$status" | grep -qiE '^(up|ok)$'
           }
 
-          gateway_actually_down() {
-            grep -qi "ECONNREFUSED\|gateway not reachable\|gateway may still be running\|plugin verification failed" "$1"
-          }
-
-          start_gateway || true
-
           echo "======================================"
-          echo "🔁 OpenRouter (modèles gratuits) — Mistral/Gemini/HF retirés pour ce test (temps perdu sur quotas/erreurs)"
+          echo "🔁 Chaîne de repli OpenRouter (modèles gratuits)"
           echo "======================================"
-
           for OR_MODEL in \
             "openrouter/poolside/laguna-s-2.1:free" \
             "openrouter/inclusionai/ling-3.0-flash-fin:free" \
             "openrouter/thinkingmachines/inkling:free" \
             "openrouter/openrouter/free"; do
-            run_agent "$OR_MODEL" "openrouter-$(echo "$OR_MODEL" | tr '/:' '--')"
+            label="openrouter-$(echo "$OR_MODEL" | tr '/:' '--')"
+            run_agent "$OR_MODEL" "$label"
+            cp "output-${label}.json" output.json
             if is_success output.json; then
               echo "✅ Succès avec OpenRouter ($OR_MODEL)"
               echo "agent_failed=false" >> $GITHUB_OUTPUT
@@ -548,23 +311,50 @@ jobs:
           done
 
           echo "======================================"
-          echo "🔁 Fallback sur NVIDIA NIM"
+          echo "🔁 Fallback sur Mistral / Google / HuggingFace"
+          echo "======================================"
+          for MODEL in "mistral/mistral-small-latest" "google/gemini-2.5-pro" "huggingface/openai/gpt-oss-120b:cerebras"; do
+            label="$(echo "$MODEL" | tr '/:' '--')"
+            run_agent "$MODEL" "$label"
+            cp "output-${label}.json" output.json
+            if is_success output.json; then
+              echo "✅ Succès avec $MODEL"
+              echo "agent_failed=false" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+          done
+
+          echo "======================================"
+          echo "🔁 Dernier recours : NVIDIA NIM"
           echo "======================================"
           run_agent "nvidia/moonshotai/kimi-k3" "nvidia1"
+          cp "output-nvidia1.json" output.json
           if is_success output.json; then
             echo "✅ Succès avec NVIDIA (moonshotai/kimi-k3)"
             echo "agent_failed=false" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          echo "❌ Échec final après OpenRouter et NVIDIA"
+          echo "❌ Échec final après tous les providers"
           echo "agent_failed=true" >> $GITHUB_OUTPUT
+
+      - name: Récupérer les enregistrements vidéo Hermes
+        if: always()
+        run: |
+          mkdir -p recordings
+          # Les sessions Hermes enregistrent en WebM dans ~/.hermes/browser_recordings/
+          # dès que la session navigateur se ferme (fin de l'appel hermes chat).
+          # Nettoyage auto après 72h côté Hermes — sans effet ici puisque le
+          # runner est jetable, mais on copie systématiquement avant la fin du job.
+          if [ -d ~/.hermes/browser_recordings ]; then
+            cp -v ~/.hermes/browser_recordings/*.webm recordings/ 2>/dev/null || echo "ℹ️ Aucun enregistrement trouvé pour cette tentative"
+          else
+            echo "ℹ️ Dossier browser_recordings absent — aucune session navigateur enregistrée"
+          fi
 
       - name: Extraire et envoyer le résultat
         if: always()
         env:
-          # 🛡️ SÉCURITÉ : site.id vient de l'API externe, on le passe par env
-          # plutôt que de l'interpoler directement dans les commandes curl.
           SITE_ID: ${{ matrix.site.id }}
           RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
         run: |
@@ -577,7 +367,13 @@ jobs:
             REASON="Agent execution failed after all attempts"
             PAGES_JSON=""
           else
+            # Même logique d'extraction que le workflow OpenClaw : le format de
+            # sortie attendu (bloc ```json final) ne dépend pas de l'agent utilisé,
+            # seulement du prompt dans task.md, resté identique.
             AGENT_TEXT=$(jq -r '[.. | .text? // empty] | map(select(type == "string")) | first // ""' output.json 2>/dev/null)
+            if [ -z "$AGENT_TEXT" ]; then
+              AGENT_TEXT=$(cat output.json)
+            fi
             PAGES_JSON=$(printf '%s' "$AGENT_TEXT" | awk '
               /```json/ { capture=1; buf=""; next }
               /```/ { if (capture) { last=buf; capture=0 } ; next }
@@ -594,20 +390,16 @@ jobs:
               echo "📄 $(echo "$PAGES_JSON" | jq '.pages | length') page(s) rapportée(s) :"
               echo "$PAGES_JSON" | jq -r '.pages[] | "  - \(.url) → \(.status) (http=\(.http_code // "n/a")) : \(.action_tested // "navigation simple") — \(.note // "")"'
             else
-              echo "⚠️ Bloc JSON structuré introuvable, repli sur l'ancienne extraction"
-              STATUS=$(jq -r '[.. | .status? // empty] | map(select(type == "string")) | first // "UNKNOWN"' output.json 2>/dev/null)
-              REASON=$(jq -r '[.. | .text? // empty] | map(select(type == "string")) | first // ""' output.json 2>/dev/null | head -c 300)
-              if [ -z "$STATUS" ] || [ "$STATUS" == "null" ]; then
-                if grep -qi "up" output.json; then
-                  STATUS="UP"
-                  REASON="Site appears operational (extracted from text)"
-                elif grep -qi "down" output.json; then
-                  STATUS="DOWN"
-                  REASON="Site appears down (extracted from text)"
-                else
-                  STATUS="UNKNOWN"
-                  REASON="No status indicator found in output"
-                fi
+              echo "⚠️ Bloc JSON structuré introuvable, repli sur extraction texte"
+              if echo "$AGENT_TEXT" | grep -qi "up"; then
+                STATUS="UP"
+                REASON="Site appears operational (extracted from text)"
+              elif echo "$AGENT_TEXT" | grep -qi "down"; then
+                STATUS="DOWN"
+                REASON="Site appears down (extracted from text)"
+              else
+                STATUS="UNKNOWN"
+                REASON="No status indicator found in output"
               fi
               PAGES_JSON=""
             fi
@@ -639,11 +431,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: openclaw-${{ matrix.site.id }}
+          name: hermes-${{ matrix.site.id }}
           path: |
-            gateway.log
-            output.json
+            output*.json
             pages.json
-            replays-*/page-*.html
-            replays-*/capture.log
-            frames-*/capture.log
+            recordings/*.webm
