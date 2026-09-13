@@ -176,13 +176,18 @@ jobs:
             provider: openrouter
             default: openrouter/free
 
-          custom_providers:
-            - name: mistral
-              base_url: https://api.mistral.ai/v1
-              key_env: MISTRAL_API_KEY
-          EOF
-
           hermes doctor
+
+          # 🛠️ AJOUTÉ après un hermes doctor réel montrant "Config version
+          # outdated (v0 → v44) (new settings available)" : nos clés
+          # browser.record_sessions/cloud_provider ont pu être écrites dans un
+          # schéma v0 obsolète et donc silencieusement ignorées par Hermes,
+          # comme ça a déjà été le cas avec `models: providers:` par le passé.
+          # --fix migre automatiquement vers le schéma courant sans bloquer si
+          # rien à corriger.
+          hermes doctor --fix || echo "⚠️ hermes doctor --fix a échoué ou n'a rien eu à corriger — non bloquant"
+          echo "--- config.yaml après migration éventuelle ---"
+          cat ~/.hermes/config.yaml
 
       - name: Générer la tâche
         env:
@@ -290,10 +295,18 @@ jobs:
             # que -m et --provider sont deux flags distincts : --provider sélectionne
             # le provider défini dans config.yaml, -m prend l'ID brut listé dans ses
             # models: [...] (ex: mistral-small-latest, poolside/laguna-s-2.1:free).
+            # 🛠️ AJOUTÉ "browser-cdp" au toolset : hermes doctor liste ce tool
+            # séparément de "browser" avec "⚠ system dependency not met" — si
+            # c'est lui le mécanisme réel derrière l'enregistrement vidéo de
+            # session, ne jamais le solliciter expliquerait pourquoi
+            # ~/.hermes/browser_recordings n'est même jamais créé. En le
+            # demandant explicitement ici, on verra soit une vidéo apparaître,
+            # soit une erreur de dépendance système plus explicite dans les
+            # logs qu'un simple silence.
             hermes -z "$TASK_CONTENT" \
               --provider "$provider" \
               -m "$model" \
-              -t "browser,terminal" \
+              -t "browser,browser-cdp,terminal" \
               --yolo \
               > "output-${label}.json" 2>&1
 
