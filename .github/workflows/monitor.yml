@@ -144,30 +144,59 @@ jobs:
                 provider: mistral
                 api_mode: openai-completions
                 base_url: https://api.mistral.ai/v1
+                models:
+                  - id: mistral-small-latest
+                    name: mistral-small-latest
                 default: mistral-small-latest
               google:
                 provider: google
+                models:
+                  - id: gemini-2.5-pro
+                    name: gemini-2.5-pro
                 default: gemini-2.5-pro
               huggingface:
                 provider: huggingface
                 api_mode: openai-completions
                 base_url: https://router.huggingface.co/v1
+                models:
+                  - id: openai/gpt-oss-120b:cerebras
+                    name: openai/gpt-oss-120b:cerebras
                 default: openai/gpt-oss-120b:cerebras
               openrouter:
                 provider: openrouter
                 api_mode: openai-completions
                 base_url: https://openrouter.ai/api/v1
+                # 🛠️ CORRIGÉ après un run réel (erreur "HTTP 400: ... is not a
+                # valid model ID") : un base_url + api_mode ne suffit pas à faire
+                # reconnaître un ID de modèle par Hermes — chaque modèle utilisable
+                # via -m doit être listé explicitement ici, comme c'était déjà le
+                # cas pour OpenClaw.
+                models:
+                  - id: poolside/laguna-s-2.1:free
+                    name: laguna-s-2.1-free
+                  - id: inclusionai/ling-3.0-flash-fin:free
+                    name: ling-3.0-flash-fin-free
+                  - id: thinkingmachines/inkling:free
+                    name: inkling-free
+                  - id: openrouter/free
+                    name: openrouter-auto-free
               nvidia:
                 provider: nvidia
                 api_mode: openai-completions
                 base_url: https://integrate.api.nvidia.com/v1
+                models:
+                  - id: moonshotai/kimi-k3
+                    name: moonshotai/kimi-k3
                 default: moonshotai/kimi-k3
           EOF
 
-          # ⚠️ Point non vérifié (comme pour openclaw models set en son temps) :
-          # la forme exacte des clés provider/model attendues par hermes chat -m.
-          # Si un provider échoue en config, `hermes doctor` et les logs de
-          # `hermes chat` indiquent la clé attendue à corriger.
+          # ⚠️ Point non vérifié : la sous-commande exacte pour lister les modèles
+          # enregistrés (probablement `hermes model` ou `hermes model list`).
+          # Affiché en diagnostic non-bloquant pour repérer un ID de modèle mal
+          # enregistré AVANT de lancer toute la chaîne de repli — c'est ce qui a
+          # manqué au run précédent (erreur "not a valid model ID" découverte
+          # seulement après coup, dans la sortie de `hermes -z`).
+          hermes model list 2>&1 || hermes model 2>&1 || echo "⚠️ Impossible de lister les modèles (non bloquant)"
           hermes doctor
 
       - name: Générer la tâche
