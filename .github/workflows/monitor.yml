@@ -461,7 +461,13 @@ jobs:
                 cat >> "replays-${session_suffix}/inject.js" << 'INJECTEOF'
           window.__rrwebEvents = [];
           if (window.__rrwebStopFn) { try { window.__rrwebStopFn(); } catch (e) {} }
-          window.__rrwebStopFn = window.rrwebRecord.record({ emit: function(ev) { window.__rrwebEvents.push(ev); } });
+          // 🛠️ CORRECTION CONFIRMÉE (capture.log réel) : le bundle jsDelivr expose
+          // directement la fonction d'enregistrement sous window.rrwebRecord — ce
+          // n'est PAS un objet avec une méthode .record(). L'appel précédent
+          // (window.rrwebRecord.record(...)) plantait systématiquement avec
+          // "TypeError: window.rrwebRecord.record is not a function", bloquant
+          // tout enregistrement d'événements sur toutes les pages.
+          window.__rrwebStopFn = window.rrwebRecord({ emit: function(ev) { window.__rrwebEvents.push(ev); } });
           INJECTEOF
                 openclaw browser evaluate --json --fn "$(cat "replays-${session_suffix}/inject.js")" \
                   >> "replays-${session_suffix}/capture.log" 2>&1
