@@ -16,8 +16,6 @@ jobs:
     outputs:
       sites: ${{ steps.get-sites.outputs.sites }}
     steps:
-      # Job inchangé par rapport au workflow OpenClaw : la découverte des sites/pages
-      # via kuma-relay ne dépend pas de l'agent utilisé pour la vérification.
       - name: Récupérer les sites actifs et leurs pages
         id: get-sites
         env:
@@ -75,11 +73,6 @@ jobs:
     needs: fetch-sites
     if: needs.fetch-sites.outputs.sites != '[]'
     runs-on: ubuntu-latest
-    # 🛠️ NOUVEAU : déclaré au niveau du job pour que TOUTES les étapes (hermes
-    # doctor, hermes -z) voient l'endpoint CDP lancé par le step dédié ci-dessous.
-    # Hermes n'expose le tool browser-cdp que si un endpoint est joignable au
-    # démarrage de session — son absence est affichée à tort comme « system
-    # dependency not met » (issue #25753).
     env:
       BROWSER_CDP_URL: http://127.0.0.1:9222
     concurrency:
@@ -95,54 +88,49 @@ jobs:
       - name: Checkout du code
         uses: actions/checkout@v4
 
-      # 🛠️ SIMPLIFICATION vs OpenClaw : plus besoin d'installer Node.js à la main,
-      # l'installeur Hermes gère lui-même Python/Node/ffmpeg/Playwright.
-      # (--skip-computer-use a été retiré et l'hypothèse associée a été
-      # INVALIDÉE par un run réel : le dossier recordings n'apparaissait pas
-      # plus avec le module Computer Use installé.)
       - name: Installer Hermes Agent
         run: |
           curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           source ~/.bashrc || true
           hermes --version
-          hermes doctor || echo "⚠️ hermes doctor a signalé des avertissements (voir logs) — non bloquant"
 
-      # 🛠️ NOUVEAU — cause racine identifiée : « browser-cdp ⚠ system dependency
-      # not met » ne signifie PAS qu'il manque une lib système, mais qu'aucun
-      # endpoint CDP n'est joignable au démarrage de session (label trompeur,
-      # issue #25753). Aucune des hypothèses précédentes (auto_prune,
-      # --skip-computer-use, schéma config) ne pouvait créer un tel endpoint.
-      # On en crée un ICI, avant tout appel Hermes, et on vérifie par curl.
-      - name: Lancer Chromium avec endpoint CDP
+      # 🛠️ FIX ACTUEL — les 2 dernières dépendances système plausibles, en un
+      # seul run au lieu d'une hypothèse par run :
+      # 1) ffmpeg : ABSENT de la section External Tools du doctor (qui liste
+      #    git/ripgrep/docker/Node/agent-browser, PAS ffmpeg) alors qu'un
+      #    enregistreur WebM a structurellement besoin d'un encodeur. Suspect
+      #    n°1 pour « system dependency not met » ET pour l'absence TOTALE du
+      #    dossier recordings (échec silencieux avant même sa création).
+      # 2) binaire « chromium » : le runner n'a que google-chrome ; si le
+      #    check teste littéralement which("chromium"), le symlink suffit.
+      # L'endpoint CDP est conservé (config + env confirmés bons), et le
+      # npm install -g agent-browser est RETIRÉ : le doctor montre que
+      # l'installeur Hermes fournit déjà le sien (✓), le paquet npm étant le
+      # projet Vercel sans lien avec le tool Hermes.
+      - name: Dépendances système + Chromium CDP
         run: |
           set -e
 
-          # Chrome stable est préinstallé sur les runners ubuntu-latest ;
-          # chromium-browser est un paquet-snap sur 22.04+, capricieux en CI.
-          CHROME_BIN=""
-          for candidate in google-chrome google-chrome-stable chromium chromium-browser; do
-            if command -v "$candidate" >/dev/null 2>&1; then
-              CHROME_BIN="$candidate"
-              break
-            fi
-          done
-          if [ -z "$CHROME_BIN" ]; then
-            echo "Aucun navigateur détecté, installation apt…"
-            sudo apt-get update
-            sudo apt-get install -y chromium-browser || sudo apt-get install -y chromium || true
-            CHROME_BIN="$(command -v chromium-browser || command -v chromium || true)"
+          echo "=== ffmpeg ==="
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            echo "ffmpeg absent → installation apt…"
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq ffmpeg
           fi
-          if [ -z "$CHROME_BIN" ]; then
-            echo "❌ Aucun navigateur Chromium-family disponible sur le runner"
-            exit 1
+          ffmpeg -version 2>/dev/null | head -1 || echo "❌ ffmpeg toujours absent après install"
+
+          echo "=== symlink chromium ==="
+          if ! command -v chromium >/dev/null 2>&1 && command -v google-chrome >/dev/null 2>&1; then
+            sudo ln -sf "$(command -v google-chrome)" /usr/local/bin/chromium
+            echo "🔗 chromium → $(command -v google-chrome)"
           fi
+          command -v chromium && chromium --version
+
+          echo "=== Chromium CDP ==="
+          CHROME_BIN="$(command -v chromium)"
           echo "🌐 Navigateur : $CHROME_BIN ($("$CHROME_BIN" --version))"
 
-          # ⚠️ Profil DÉDIÉ obligatoire : sur les Chrome récents,
-          # --remote-debugging-port est silencieusement IGNORÉ avec le profil
-          # par défaut — LE piège classique qui fait croire à un bug CDP.
-          # La doc Hermes recommande explicitement un profil séparé.
           mkdir -p "$HOME/.hermes/chrome-debug"
 
           "$CHROME_BIN" \
@@ -157,8 +145,6 @@ jobs:
             --no-default-browser-check \
             about:blank > /tmp/chromium.log 2>&1 &
 
-          # Attente active 30 s max, puis échec DUR : fini les runs « tout
-          # silencieux » — si CDP ne monte pas, le job plante ICI avec le log.
           CDP_OK=0
           for i in $(seq 1 30); do
             if curl --fail --silent http://127.0.0.1:9222/json/version > /tmp/cdp-version.json 2>/dev/null; then
@@ -168,26 +154,12 @@ jobs:
             sleep 1
           done
           if [ "$CDP_OK" != "1" ]; then
-            echo "❌ Endpoint CDP jamais monté sur 127.0.0.1:9222 — log Chromium :"
+            echo "❌ Endpoint CDP jamais monté — log Chromium :"
             cat /tmp/chromium.log || true
             exit 1
           fi
-          echo "✅ Endpoint CDP opérationnel :"
-          cat /tmp/cdp-version.json
+          echo "✅ Endpoint CDP opérationnel"
 
-          # 🛠️ Issue #15952 : sur certaines versions (dont possiblement 0.21.2),
-          # le check browser-cdp exige agent-browser MÊME avec cdp_url configuré.
-          # Installation best-effort — si le paquet n'existe pas, non bloquant :
-          # le grep doctor à l'étape suivante dira si c'était nécessaire.
-          npm install -g agent-browser >/dev/null 2>&1 \
-            || echo "ℹ️ agent-browser non installé via npm (non bloquant)"
-
-      # 🎥 Remplace tout le pipeline rrweb/ffmpeg d'OpenClaw : Hermes enregistre
-      # nativement la session navigateur en WebM (browser.record_sessions: true),
-      # démarre au premier browser_navigate et sauvegarde dans
-      # ~/.hermes/browser_recordings/ à la fermeture de la session. Fonctionne en
-      # local ET en cloud (Browserbase), et ne dépend pas d'un curseur/souris
-      # simulé côté page comme le nécessitait rrweb.
       - name: Configurer Hermes (config.yaml + credentials)
         env:
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
@@ -198,10 +170,6 @@ jobs:
         run: |
           mkdir -p ~/.hermes
 
-          # 🛠️ Hugging Face attend HF_TOKEN, pas HF_API_KEY (erreur confirmée :
-          # "No usable credentials found for provider 'huggingface'. Set
-          # HF_TOKEN."). Le secret GitHub reste nommé HF_API_KEY, on l'expose
-          # aussi sous le nom que Hermes attend.
           cat > ~/.hermes/.env << EOF
           MISTRAL_API_KEY=${MISTRAL_API_KEY}
           GOOGLE_API_KEY=${GOOGLE_API_KEY}
@@ -210,16 +178,6 @@ jobs:
           NVIDIA_API_KEY=${NVIDIA_API_KEY}
           EOF
 
-          # 🛠️ RÈGLE DE LA MAISON (confirmée par un run réel cassé) : AUCUN
-          # commentaire shell entre l'ouverture du heredoc et son EOF de
-          # fermeture — un patch précédent avait avalé tout le reste du script.
-          #
-          # 🛠️ MODIFIÉ : ajout de browser.cdp_url pointant vers le Chromium
-          # lancé par le step précédent. C'est LA clé qui fait passer le check
-          # browser-cdp de ⚠ à ✓ (avec BROWSER_CDP_URL en filet au niveau job).
-          # browser.record_sessions/cloud_provider ont survécu intactes à la
-          # migration v0→v44 (confirmé par doctor --fix), elles n'étaient pas
-          # le problème — l'absence d'endpoint CDP si.
           cat > ~/.hermes/config.yaml << 'EOF'
           browser:
             enabled: true
@@ -243,18 +201,33 @@ jobs:
               key_env: MISTRAL_API_KEY
           EOF
 
-          hermes doctor
+          hermes doctor || true
 
-          # Migration automatique du schéma si obsolète (v0 → v44), non bloquante.
-          hermes doctor --fix || echo "⚠️ hermes doctor --fix a échoué ou n'a rien eu à corriger — non bloquant"
-          echo "--- config.yaml après migration éventuelle ---"
+          hermes doctor --fix || echo "⚠️ doctor --fix non bloquant"
+          echo "--- config.yaml après migration ---"
           cat ~/.hermes/config.yaml
 
-          # 🛠️ NOUVEAU : réponse IMMÉDIATE dans les logs à la question qui
-          # bloque depuis plusieurs runs — browser-cdp est-il enfin ✓ ?
-          echo "--- État de browser-cdp avec l'endpoint CDP actif ---"
+          echo "--- État de browser-cdp avec ffmpeg + chromium + CDP actif ---"
           hermes doctor 2>&1 | grep -i -A1 "browser-cdp" \
             || echo "(browser-cdp absent de la sortie doctor)"
+
+          # 🛠️ ASSURANCE (automatique, ne rien faire si le fix marche) : si
+          # browser-cdp reste ⚠ malgré ffmpeg + chromium + endpoint, ces greps
+          # du source installé nommeront la dépendance exacte testée — fini
+          # les hypothèses, la réponse sera dans le log.
+          HERMES_SRC="$HOME/.hermes/hermes-agent"
+          SITE_PKG=$(find "$HOME/.hermes" -maxdepth 7 -name site-packages -type d 2>/dev/null | head -1)
+          EXC="--exclude-dir=node_modules --exclude-dir=venv --exclude-dir=.git"
+          for SRC in "$HERMES_SRC" "$SITE_PKG"; do
+            [ -n "$SRC" ] && [ -d "$SRC" ] || continue
+            echo "=== Source : $SRC ==="
+            echo "--- refs browser-cdp / cdp_url ---"
+            grep -rn $EXC -iE "browser.cdp|browser_cdp|cdp_url|BROWSER_CDP_URL" "$SRC" 2>/dev/null | head -40
+            echo "--- origine du label 'system dependency not met' ---"
+            grep -rn $EXC "system dependency not met" "$SRC" 2>/dev/null | head -10
+            echo "--- conditions d'écriture des recordings ---"
+            grep -rn $EXC -iE "browser_recordings|record_sessions" "$SRC" 2>/dev/null | head -30
+          done
 
       - name: Générer la tâche
         env:
@@ -263,10 +236,6 @@ jobs:
         run: |
           PAGES_LIST=$(echo "$PAGES_JSON" | jq -c . | jq -r '[.[]? | .url] | join("\n")')
 
-          # Tâche identique à celle du workflow OpenClaw : le contenu métier de la
-          # vérification (détection backend en panne, parcours e-commerce/auth/
-          # contact/recherche, verdict JSON final) ne change pas avec le pivot
-          # d'agent — seul le mécanisme d'exécution et d'enregistrement change.
           cat > task.md << EOF
           Va sur $SITE_URL avec l'outil de navigateur. Explore comme un
           humain (scroll, structure) et détecte le type de site.
@@ -331,7 +300,6 @@ jobs:
           alors qu'elles sont attendues = DOWN même si HTTP 200.
           EOF
 
-      # `hermes -z` est un exec one-shot : un appel = une vérification complète.
       - name: Lancer Hermes Agent (avec repli multi-providers)
         id: agent_run
         run: |
@@ -349,57 +317,39 @@ jobs:
             echo "Test avec $provider/$model pour ${{ matrix.site.url }}"
             echo "======================================"
 
-            # -m et --provider sont deux flags distincts : --provider sélectionne
-            # le provider défini dans config.yaml, -m prend l'ID brut listé dans
-            # ses models: [...] (pas de préfixe provider/).
-            # 🛠️ Toolset "browser,browser-cdp,terminal" : demander explicitement
-            # browser-cdp maintenant qu'un endpoint existe (BROWSER_CDP_URL +
-            # cdp_url config) — si un problème de dépendance subsiste, on aura
-            # enfin une erreur explicite au lieu du silence.
+            # 🛠️ CORRIGÉ : retrait de browser-cdp du toolset — le CLI l'a
+            # rejeté explicitement (« ignoring unknown --toolsets entries:
+            # browser-cdp »). Le tool browser-cdp du doctor et le toolset -t
+            # sont deux mécanismes distincts ; c'était un no-op.
             hermes -z "$TASK_CONTENT" \
               --provider "$provider" \
               -m "$model" \
-              -t "browser,browser-cdp,terminal" \
+              -t "browser,terminal" \
               --yolo \
               > "output-${label}.json" 2>&1
 
             echo "exit_code=$?"
 
-            # Détection du cas « verdict complet mais JSON final tronqué » :
-            # l'agent a terminé sa vérification mais n'a jamais imprimé le bloc
-            # JSON (réponse coupée). Signalé distinctement dans les logs pour ne
-            # pas confondre avec un échec d'API.
             if ! grep -qiE '"overall_status"\s*:\s*"(up|down)"' "output-${label}.json" \
                && grep -qiE 'bloc json|json (ci-dessus|généré|generated above)' "output-${label}.json"; then
-              echo "⚠️ ${label} : l'agent a terminé sa vérification (voir texte) mais n'a jamais imprimé le bloc JSON final — réponse probablement tronquée. Ce run sera compté comme échec faute de JSON exploitable, mais consultez output-${label}.json pour le résumé texte."
+              echo "⚠️ ${label} : vérification terminée mais bloc JSON final tronqué — voir output-${label}.json"
             fi
 
-            # Copier la vidéo de CETTE tentative précise, avant qu'elle ne se
-            # retrouve mélangée avec celle d'une autre tentative. Hermes
-            # finalise l'enregistrement à la fermeture de la session, donc au
-            # moment où `hermes -z ...` rend la main, le fichier est écrit.
             latest_webm=$(ls -t ~/.hermes/browser_recordings/*.webm 2>/dev/null | head -n1)
             if [ -n "$latest_webm" ]; then
               cp -v "$latest_webm" "recordings/${label}.webm"
             else
-              echo "ℹ️ Aucune vidéo trouvée pour la tentative ${label}"
-              # Diagnostic : dossier absent = Hermes n'essaie pas du tout
-              # d'enregistrer ; dossier présent mais vide = il essaie mais
-              # échoue silencieusement (cause différente à chercher).
+              echo "ℹ️ Aucune vidéo pour la tentative ${label}"
               if [ -d ~/.hermes/browser_recordings ]; then
-                echo "   (le dossier ~/.hermes/browser_recordings existe mais est vide — Hermes tente d'enregistrer mais échoue)"
+                echo "   (dossier présent mais vide — Hermes tente, échoue silencieusement)"
                 ls -la ~/.hermes/browser_recordings/ || true
               else
-                echo "   (le dossier ~/.hermes/browser_recordings n'existe pas du tout — Hermes n'a jamais tenté d'enregistrer)"
+                echo "   (dossier inexistant — Hermes n'a jamais tenté d'enregistrer)"
               fi
             fi
           }
 
           is_success() {
-            # Un verdict DOWN est un résultat aussi valide qu'un UP : un run est
-            # un succès dès qu'un bloc ```json avec overall_status (UP ou DOWN)
-            # est présent — sinon la boucle écrase un bon résultat par l'échec
-            # 429 d'un provider suivant.
             grep -qiE '"overall_status"\s*:\s*"(up|down)"' "$1"
           }
 
@@ -425,9 +375,6 @@ jobs:
           echo "======================================"
           echo "🔁 Fallback sur Mistral / Gemini / HuggingFace"
           echo "======================================"
-          # Séparateur '|' car les noms provider/model contiennent déjà des ':'.
-          # custom:mistral passe par custom_providers: (Mistral n'est pas un
-          # provider intégré), Google s'appelle "gemini".
           for PAIR in "custom:mistral|mistral-small-latest" "gemini|gemini-3.1-pro-preview" "huggingface|openai/gpt-oss-120b:cerebras"; do
             provider="${PAIR%%|*}"
             model="${PAIR#*|}"
@@ -472,9 +419,6 @@ jobs:
             REASON="Agent execution failed after all attempts"
             PAGES_JSON=""
           else
-            # Hermes ne sort que du texte brut (verdict + bloc ```json final) —
-            # pas d'enveloppe JSON structurée, donc pas de jq ici (le jq .text
-            # hérité d'OpenClaw tuait tout le step en exit 5 avec pipefail).
             AGENT_TEXT=$(cat output.json)
             PAGES_JSON=$(printf '%s' "$AGENT_TEXT" | awk '
               /```json/ { capture=1; buf=""; next }
@@ -484,8 +428,6 @@ jobs:
             ')
 
             if echo "$PAGES_JSON" | jq -e '.overall_status and .pages' > /dev/null 2>&1; then
-              # Normalisation en MAJUSCULES : la contrainte CHECK SQL côté relay
-              # n'accepte que UP/DOWN/ERROR/UNKNOWN en majuscules.
               STATUS=$(echo "$PAGES_JSON" | jq -r '.overall_status // "UNKNOWN"' | tr '[:lower:]' '[:upper:]')
               SITE_TYPE=$(echo "$PAGES_JSON" | jq -r '.site_type // "non détecté"')
               PAGES_JSON=$(echo "$PAGES_JSON" | jq -c '.pages |= map(.status |= (if . then ascii_upcase else "UNKNOWN" end))')
@@ -532,10 +474,6 @@ jobs:
             -d @- \
             || echo "⚠️ Envoi mark-crawled échoué"
 
-      # 🛠️ NOUVEAU : élargit la collecte au cas où la doc mentirait sur le
-      # chemin des enregistrements. Si un .webm/.mp4 existe quelque part sous
-      # ~/.hermes, ce find le trouvera — sinon, on aura la preuve définitive
-      # que l'enregistreur ne produit rien même avec un endpoint CDP ✓.
       - name: Collecter les enregistrements bruts Hermes
         if: always()
         run: |
@@ -545,11 +483,6 @@ jobs:
           echo "--- Tous fichiers vidéo trouvés sous ~/.hermes ---"
           find "$HOME/.hermes" -type f \( -name '*.webm' -o -name '*.mp4' -o -name '*.mkv' \) \
             -printf '%p %s bytes\n' 2>/dev/null | head -50 || true
-
-          # Preuve que Hermes est bien passé par NOTRE Chromium : les tabs
-          # ouverts via CDP apparaissent dans /json/list.
-          echo "--- Tabs CDP restants ---"
-          curl -s --max-time 5 http://127.0.0.1:9222/json/list | head -40 || true
 
           mkdir -p hermes-raw
           cp -r ~/.hermes/browser_recordings/* hermes-raw/ 2>/dev/null || true
