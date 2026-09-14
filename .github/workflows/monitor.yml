@@ -93,43 +93,40 @@ jobs:
           source ~/.bashrc || true
           hermes --version
 
-      - name: Dépendances système (ffmpeg + binaire chromium)
+      - name: Dépendances système (ffmpeg + chromium + agent-browser global)
         run: |
           set -e
-
+          
           echo "=== ffmpeg (requis pour l'enregistrement vidéo .webm) ==="
           if ! command -v ffmpeg >/dev/null 2>&1; then
-            echo "ffmpeg absent → installation apt…"
             sudo apt-get update -qq
             sudo apt-get install -y -qq ffmpeg
           fi
-          ffmpeg -version 2>/dev/null | head -1 || echo "❌ ffmpeg toujours absent après install"
-
-          echo "=== symlink chromium (Hermes cherche ce binaire) ==="
+          ffmpeg -version 2>/dev/null | head -1
+          
+          echo "=== symlink chromium ==="
           if ! command -v chromium >/dev/null 2>&1 && command -v google-chrome >/dev/null 2>&1; then
             sudo ln -sf "$(command -v google-chrome)" /usr/local/bin/chromium
-            echo "🔗 chromium → $(command -v google-chrome)"
           fi
           command -v chromium && chromium --version
+          
+          echo "=== Installation GLOBALE de agent-browser (fix npx CI) ==="
+          npm install -g agent-browser || echo "⚠️ npm install failed, will rely on npx"
+          which agent-browser && agent-browser --version || true
 
-      - name: Configurer Hermes avec DEBUG INTENSIF
+      - name: Configurer Hermes + Debug Tools
         env:
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           HF_API_KEY: ${{ secrets.HF_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-          AGENT_BROWSER_ARGS: "--headless=new,--no-sandbox,--disable-dev-shm-usage,--disable-gpu,--window-size=1280,800,--no-first-run,--no-default-browser-check"
+          AGENT_BROWSER_ARGS: "--headless=new,--no-sandbox,--disable-dev-shm-usage,--disable-gpu,--disable-blink-features=AutomationControlled,--window-size=1280,800,--no-first-run,--no-default-browser-check"
         run: |
           mkdir -p ~/.hermes
 
-          # ✅ Supprimer toute variable d'environnement qui pourrait forcer un cloud provider
           unset BROWSERBASE_API_KEY || true
           unset BROWSER_USE_API_KEY || true
-          unset BROWSERBASE_PROXIES || true
-          unset BROWSERBASE_ADVANCED_STEALTH || true
-          unset BROWSERBASE_KEEP_ALIVE || true
-          unset BROWSERBASE_SESSION_TIMEOUT || true
 
           cat > ~/.hermes/.env << EOF
           MISTRAL_API_KEY=${MISTRAL_API_KEY}
@@ -139,14 +136,21 @@ jobs:
           NVIDIA_API_KEY=${NVIDIA_API_KEY}
           EOF
 
-          # ✅ CRITIQUE : forcer cloud_provider: local pour éviter l'auto-détection cloud
           cat > ~/.hermes/config.yaml << 'EOF'
           browser:
             enabled: true
             cloud_provider: local
             record_sessions: true
+            engine: auto
             inactivity_timeout: 120
             command_timeout: 30
+
+          toolsets:
+            - browser
+            - browser-use
+            - terminal
+            - web_search
+            - web_extract
 
           display:
             tool_progress: "off"
@@ -164,38 +168,16 @@ jobs:
               key_env: MISTRAL_API_KEY
           EOF
 
-          echo "=== Contenu exact du config.yaml ==="
-          cat ~/.hermes/config.yaml
-          
-          echo "=== Contenu exact du .env ==="
-          cat ~/.hermes/.env
-          
-          echo "=== Variables d'environnement browser ==="
-          env | grep -i browser || echo "(aucune variable browser)"
-          
-          echo "=== hermes config get browser ==="
-          hermes config get browser || echo "❌ Impossible de lire browser config"
-          
-          echo "=== hermes config get browser.record_sessions ==="
-          hermes config get browser.record_sessions || echo "❌ Impossible de lire record_sessions"
-          
-          echo "=== hermes config get browser.cloud_provider ==="
-          hermes config get browser.cloud_provider || echo "❌ Impossible de lire cloud_provider"
-          
-          echo "=== hermes doctor (complet) ==="
-          hermes doctor
-          
           echo "=== hermes doctor --fix ==="
-          hermes doctor --fix || echo "⚠️ doctor --fix non bloquant"
+          hermes doctor --fix || true
           
-          echo "=== Vérification des variables après doctor ==="
-          hermes config get browser.record_sessions
-          hermes config get browser.cloud_provider
+          echo "=== hermes tools (Vérification des outils chargés) ==="
+          hermes tools
           
-          echo "=== Test manuel : créer le dossier recordings ==="
-          mkdir -p ~/.hermes/browser_recordings
-          ls -la ~/.hermes/
-          ls -la ~/.hermes/browser_recordings/
+          echo "=== Logs Hermes (erreurs d'initialisation) ==="
+          if [ -d ~/.hermes/logs ]; then
+            cat ~/.hermes/logs/errors.log 2>/dev/null || echo "(pas d'errors.log)"
+          fi
 
       - name: Générer la tâche
         env:
@@ -226,7 +208,7 @@ jobs:
             bien dans le panier (nom/qté/prix) — ces données viennent du
             backend, vérifie qu'elles sont réelles et pas un état vide/figé.
           - Compte utilisateur : inscris-toi avec des données fictives
-            (test+ci-<horodatage>@example.com), puis connecte-toi avec ces
+          (test+ci-<horodatage>@example.com), puis connecte-toi avec ces
             identifiants. Si compte existant seulement, teste juste qu'un
             login invalide donne une erreur propre (pas de vraie connexion).
           - Formulaire de contact : soumets-le en indiquant "TEST AUTOMATISÉ"
@@ -267,27 +249,6 @@ jobs:
           par défaut d'hébergeur ou des données backend manquantes/vides
           alors qu'elles sont attendues = DOWN même si HTTP 200.
           EOF
-
-      - name: Test manuel d'enregistrement vidéo AVANT le run principal
-        run: |
-          echo "=== Test manuel : Hermes peut-il enregistrer une vidéo ? ==="
-          echo "État initial de browser_recordings :"
-          ls -la ~/.hermes/browser_recordings/ 2>/dev/null || echo "(dossier vide ou inexistant)"
-          
-          echo "Lancement d'un test minimal avec browser_navigate"
-          cat > test_record.md << 'EOF'
-          Utilise l'outil browser_navigate pour aller sur https://example.com, puis ferme la session.
-          EOF
-          
-          hermes -z "$(cat test_record.md)" --provider openrouter -m "openrouter/free" -t "browser" --yolo > test_output.log 2>&1 || true
-          
-          echo "=== Résultat du test manuel ==="
-          echo "Contenu de browser_recordings après test :"
-          ls -lah ~/.hermes/browser_recordings/ 2>/dev/null || echo "(toujours vide)"
-          find ~/.hermes/browser_recordings/ -name "*.webm" -ls 2>/dev/null || echo "(aucun .webm)"
-          
-          echo "=== Logs du test manuel ==="
-          cat test_output.log | grep -iE "record|video|browser|error|ffmpeg" | tail -20 || true
 
       - name: Lancer Hermes Agent (avec repli multi-providers)
         id: agent_run
