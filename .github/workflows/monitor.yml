@@ -21,12 +21,13 @@ jobs:
         env:
           SITE_ID_INPUT: ${{ github.event.inputs.site_id }}
           RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
+          RELAY_URL: ${{ secrets.RELAY_URL }}
         run: |
           SITE_ID="$SITE_ID_INPUT"
 
           if [ -n "$SITE_ID" ]; then
             echo "🔍 Test ciblé sur le site $SITE_ID"
-            DETAIL=$(curl -s -H "x-relay-secret: $RELAY_SECRET" "https://kuma-relay.up.railway.app/monitors/$SITE_ID")
+            DETAIL=$(curl -s -H "x-relay-secret: $RELAY_SECRET" "$RELAY_URL/monitors/$SITE_ID")
 
             MONITOR=$(echo "$DETAIL" | jq -c '.monitor | if .type == "http" then {id: .parent, url: .url, name: .parentName} else {id: .id, url: .url, name: .name} end')
 
@@ -36,12 +37,12 @@ jobs:
               exit 0
             fi
 
-            ALL_MONITORS=$(curl -s -H "x-relay-secret: $RELAY_SECRET" "https://kuma-relay.up.railway.app/monitors")
+            ALL_MONITORS=$(curl -s -H "x-relay-secret: $RELAY_SECRET" "$RELAY_URL/monitors")
             PAGES=$(echo "$ALL_MONITORS" | jq -c --arg sid "$(echo "$MONITOR" | jq -r '.id')" '[.monitors[]? | select(.type == "http" and (.parent|tostring) == $sid) | {url: .url, name: .name}]')
 
             SITES=$(jq -cn --argjson mon "$MONITOR" --argjson pages "$PAGES" '[{id: $mon.id, url: $mon.url, name: $mon.name, pages: $pages}]')
           else
-            RAW=$(curl -s https://kuma-relay.up.railway.app/active-sites)
+            RAW=$(curl -s "$RELAY_URL/active-sites")
             SITES_RAW=$(echo "$RAW" | jq -c '[.sites[]? | {id: .id, url: .site_url}]' 2>/dev/null || echo "")
 
             if [ -z "$SITES_RAW" ] || [ "$SITES_RAW" == "null" ]; then
@@ -57,7 +58,7 @@ jobs:
             while IFS= read -r site; do
               [ -z "$site" ] && continue
               sid=$(echo "$site" | jq -r '.id')
-              all=$(curl -s -H "x-relay-secret: $RELAY_SECRET" "https://kuma-relay.up.railway.app/monitors")
+              all=$(curl -s -H "x-relay-secret: $RELAY_SECRET" "$RELAY_URL/monitors")
               pages=$(echo "$all" | jq -c --arg sid "$sid" '[.monitors[]? | select(.type == "http" and (.parent|tostring) == $sid) | {url: .url, name: .name}]')
               site_with_pages=$(echo "$site" | jq -c --argjson pages "$pages" '. + {pages: $pages}')
               SITES_ARRAY=$(echo "$SITES_ARRAY" | jq -c --argjson site "$site_with_pages" '. + [$site]')
@@ -388,6 +389,7 @@ jobs:
         env:
           SITE_ID: ${{ matrix.site.id }}
           RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
+          RELAY_URL: ${{ secrets.RELAY_URL }}
           WINNING_LABEL: ${{ steps.agent_run.outputs.winning_label }}
         run: |
           if [ ! -f output.json ] || [ ! -s output.json ]; then
@@ -436,14 +438,14 @@ jobs:
           echo "Message: $REASON"
 
           if [ -n "$PAGES_JSON" ] && echo "$PAGES_JSON" | jq -e '.pages' > /dev/null 2>&1; then
-            echo "📤 Envoi du rapport pages à /pages-report"
+            echo "📤 Envoi du rapport pages à /sites/$SITE_ID/pages-report"
             echo "$PAGES_JSON" | jq -c '{pages: .pages}' > pages_payload.json
-            curl -X POST "https://kuma-relay.up.railway.app/pages-report" -H "x-relay-secret: $RELAY_SECRET" -H "Content-Type: application/json" -d @pages_payload.json || echo "⚠️ Échec envoi pages-report (endpoint peut ne pas exister)"
+            curl -X POST "$RELAY_URL/sites/$SITE_ID/pages-report" -H "x-relay-secret: $RELAY_SECRET" -H "Content-Type: application/json" -d @pages_payload.json || echo "⚠️ Échec envoi pages-report"
           fi
 
-          echo "📤 Envoi du statut global à /status"
-          jq -nc --arg id "$SITE_ID" --arg status "$STATUS" --arg reason "$REASON" --arg label "${WINNING_LABEL:-unknown}" '{site_id: $id, status: $status, reason: $reason, agent_label: $label}' > status_payload.json
-          curl -X POST "https://kuma-relay.up.railway.app/status" -H "x-relay-secret: $RELAY_SECRET" -H "Content-Type: application/json" -d @status_payload.json || echo "⚠️ Échec envoi status (endpoint peut ne pas exister)"
+          echo "📤 Envoi du statut global à /sites/$SITE_ID/mark-crawled"
+          jq -nc --arg status "$STATUS" --arg message "$REASON" '{status: $status, message: $message}' > status_payload.json
+          curl -X POST "$RELAY_URL/sites/$SITE_ID/mark-crawled" -H "x-relay-secret: $RELAY_SECRET" -H "Content-Type: application/json" -d @status_payload.json || echo "⚠️ Échec envoi mark-crawled"
 
       - name: Uploader la vidéo (artifact)
         if: always()
