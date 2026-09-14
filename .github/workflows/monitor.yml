@@ -93,7 +93,7 @@ jobs:
           source ~/.bashrc || true
           hermes --version
 
-      - name: Dépendances système (ffmpeg + chromium + agent-browser + Playwright)
+      - name: Dépendances système (ffmpeg + chromium + agent-browser + Playwright + Xvfb)
         run: |
           set -e
           
@@ -119,26 +119,15 @@ jobs:
           npx playwright install chromium || echo "⚠️ playwright install chromium failed"
           
           echo "=== Vérifier que Xvfb est bien installé ==="
-          which Xvfb && Xvfb -version 2>&1 | head -1 || echo "❌ Xvfb absent"
+          which Xvfb && echo "✅ Xvfb présent" || echo "❌ Xvfb absent"
 
-      - name: 🔍 Diagnostic code d'enregistrement Hermes
-        run: |
-          SRC="$HOME/.hermes/hermes-agent"
-          echo "=== Recherche du mécanisme record_sessions ==="
-          grep -rn "record_sessions\|recordVideo\|browser_recordings\|record start" "$SRC" --include="*.py" 2>/dev/null | head -40
-          
-          echo ""
-          echo "=== Recherche de la logique de démarrage d'enregistrement ==="
-          grep -rn "recordVideo\|screencast\|start_screencast\|Page.screencast" "$SRC" --include="*.py" 2>/dev/null | head -20
-
-      - name: Démarrer Xvfb + Configurer Hermes + Réchauffer agent-browser
+      - name: Démarrer Xvfb + Configurer Hermes
         env:
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           HF_API_KEY: ${{ secrets.HF_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-          DISPLAY: ":99"
           AGENT_BROWSER_ARGS: "--headless=new,--no-sandbox,--disable-dev-shm-usage,--disable-gpu,--disable-blink-features=AutomationControlled,--window-size=1280,800,--no-first-run,--no-default-browser-check"
         run: |
           mkdir -p ~/.hermes
@@ -154,9 +143,11 @@ jobs:
           sleep 2
           if kill -0 $XVFB_PID 2>/dev/null; then
             echo "✅ Xvfb actif sur DISPLAY=:99"
+            echo "XVFB_PID=$XVFB_PID" >> $GITHUB_ENV
           else
             echo "❌ Xvfb n'a pas démarré"
             cat /tmp/xvfb.log
+            exit 1
           fi
 
           cat > ~/.hermes/.env << EOF
@@ -202,25 +193,6 @@ jobs:
 
           echo "=== hermes doctor --fix ==="
           hermes doctor --fix || true
-
-          echo "=== Réchauffement : session agent-browser avec enregistrement ==="
-          export DISPLAY=:99
-          agent-browser open "https://example.com" || true
-          
-          echo "=== Test manuel d'enregistrement video ==="
-          agent-browser record start "/tmp/test-recording.webm" "https://example.com" || echo "⚠️ record start failed"
-          sleep 3
-          agent-browser record stop || echo "⚠️ record stop failed"
-          agent-browser close --all || true
-          
-          if [ -f /tmp/test-recording.webm ]; then
-            echo "✅ agent-browser record fonctionne ! Taille :"
-            ls -lah /tmp/test-recording.webm
-          else
-            echo "❌ agent-browser record n'a pas créé de fichier vidéo"
-            echo "=== Logs Xvfb ==="
-            cat /tmp/xvfb.log | tail -20
-          fi
 
       - name: Générer la tâche
         env:
@@ -293,7 +265,7 @@ jobs:
           alors qu'elles sont attendues = DOWN même si HTTP 200.
           EOF
 
-      - name: Lancer Hermes Agent (avec Xvfb actif)
+      - name: Lancer Hermes Agent avec enregistrement manuel
         id: agent_run
         env:
           DISPLAY: ":99"
@@ -319,9 +291,24 @@ jobs:
             echo "======================================"
 
             export DISPLAY=:99
+            
+            # ✅ ENREGISTREMENT MANUEL : démarrer avant Hermes
+            echo "🎥 Démarrage de l'enregistrement vidéo..."
+            RECORDING_PATH="$HOME/.hermes/browser_recordings/${label}.webm"
+            agent-browser record start "$RECORDING_PATH" || echo "⚠️ record start failed"
+            
+            # Lancer Hermes
             hermes -z "$TASK_CONTENT" --provider "$provider" -m "$model" -t "browser,terminal" --yolo > "output-${label}.json" 2>&1
+            HERMES_EXIT=$?
+            
+            # ✅ ENREGISTREMENT MANUEL : arrêter après Hermes
+            echo "🎥 Arrêt de l'enregistrement vidéo..."
+            agent-browser record stop || echo "⚠️ record stop failed"
+            
+            # Fermer la session navigateur
+            agent-browser close --all || true
 
-            echo "exit_code=$?"
+            echo "exit_code=$HERMES_EXIT"
 
             if ! grep -qiE '"overall_status"\s*:\s*"(up|down)"' "output-${label}.json" && grep -qiE 'bloc json|json (ci-dessus|généré|generated above)' "output-${label}.json"; then
               echo "⚠️ ${label} : vérification terminée mais bloc JSON final tronqué — voir output-${label}.json"
@@ -335,15 +322,11 @@ jobs:
               echo "❌ Dossier ~/.hermes/browser_recordings/ n'existe pas"
             fi
 
-            echo "=== Warnings check_fn browser ==="
-            grep -i "check_fn.*browser" "output-${label}.json" | head -5 || echo "(aucun warning browser)"
-
-            latest_webm=$(ls -t ~/.hermes/browser_recordings/*.webm 2>/dev/null | head -n1)
-            if [ -n "$latest_webm" ]; then
-              cp -v "$latest_webm" "recordings/${label}.webm"
-              echo "✅ Vidéo enregistrée : recordings/${label}.webm"
+            if [ -f "$RECORDING_PATH" ]; then
+              cp -v "$RECORDING_PATH" "recordings/${label}.webm"
+              echo "✅ Vidéo enregistrée : recordings/${label}.webm ($(ls -lh "$RECORDING_PATH" | awk '{print $5}'))"
             else
-              echo "ℹ️ Aucune vidéo pour la tentative ${label}"
+              echo "❌ Aucune vidéo créée pour la tentative ${label}"
               echo "=== Dernières lignes des logs ==="
               tail -50 "output-${label}.json" || true
             fi
