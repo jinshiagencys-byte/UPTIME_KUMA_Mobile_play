@@ -93,7 +93,7 @@ jobs:
           source ~/.bashrc || true
           hermes --version
 
-      - name: Dépendances système (ffmpeg + chromium + agent-browser global)
+      - name: Dépendances système complètes (ffmpeg + chromium + agent-browser + Playwright deps)
         run: |
           set -e
           
@@ -110,11 +110,24 @@ jobs:
           fi
           command -v chromium && chromium --version
           
-          echo "=== Installation GLOBALE de agent-browser (fix npx CI) ==="
+          echo "=== Installation GLOBALE de agent-browser ==="
           npm install -g agent-browser || echo "⚠️ npm install failed, will rely on npx"
           which agent-browser && agent-browser --version || true
+          
+          echo "=== 🔑 CRITIQUE : Installation des dépendances Playwright pour Chromium ==="
+          echo "Sans ces libs système (libnss3, libgbm1, etc.), Chromium ne peut pas se lancer"
+          echo "et tous les outils browser_* seront désactivés par Hermes."
+          sudo npx playwright install-deps chromium || echo "⚠️ playwright install-deps failed"
+          
+          echo "=== Installation du binaire Playwright Chromium ==="
+          npx playwright install chromium || echo "⚠️ playwright install chromium failed"
+          
+          echo "=== Test de lancement du navigateur ==="
+          mkdir -p ~/.hermes
+          echo "Lancement test de agent-browser..."
+          agent-browser --help || true
 
-      - name: Configurer Hermes + Debug Tools
+      - name: Configurer Hermes + Test Navigateur
         env:
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
@@ -124,6 +137,7 @@ jobs:
           AGENT_BROWSER_ARGS: "--headless=new,--no-sandbox,--disable-dev-shm-usage,--disable-gpu,--disable-blink-features=AutomationControlled,--window-size=1280,800,--no-first-run,--no-default-browser-check"
         run: |
           mkdir -p ~/.hermes
+          mkdir -p ~/.hermes/browser_recordings
 
           unset BROWSERBASE_API_KEY || true
           unset BROWSER_USE_API_KEY || true
@@ -175,12 +189,21 @@ jobs:
           echo "browser.enabled: $(hermes config get browser.enabled)"
           echo "browser.cloud_provider: $(hermes config get browser.cloud_provider)"
           echo "browser.record_sessions: $(hermes config get browser.record_sessions)"
-          echo "toolsets:"
-          hermes config get toolsets || echo "(toolsets non défini explicitement)"
           
-          echo "=== Logs Hermes (erreurs d'initialisation) ==="
+          echo "=== Logs Hermes AVANT le run principal ==="
           if [ -d ~/.hermes/logs ]; then
-            cat ~/.hermes/logs/errors.log 2>/dev/null || echo "(pas d'errors.log)"
+            cat ~/.hermes/logs/errors.log 2>/dev/null | head -50 || echo "(pas d'errors.log)"
+          fi
+          
+          echo "=== Test manuel de navigation avec agent-browser ==="
+          echo "Si cette commande échoue, c'est que les dépendances navigateur ne sont pas OK"
+          agent-browser navigate "https://example.com" --output /tmp/test-browser.json 2>&1 | head -30 || echo "⚠️ agent-browser navigate failed"
+          
+          if [ -f /tmp/test-browser.json ]; then
+            echo "✅ agent-browser a pu naviguer ! Fichier créé :"
+            ls -la /tmp/test-browser.json
+          else
+            echo "❌ agent-browser n'a pas pu créer le fichier - problème de navigateur"
           fi
 
       - name: Générer la tâche
@@ -292,6 +315,8 @@ jobs:
               echo "✅ Vidéo enregistrée : recordings/${label}.webm"
             else
               echo "ℹ️ Aucune vidéo pour la tentative ${label}"
+              echo "=== Vérification des outils browser dans les logs ==="
+              grep -i "check_browser" "output-${label}.json" 2>/dev/null | head -5 || echo "(pas de check_browser warnings)"
               echo "=== Dernières lignes des logs ==="
               tail -50 "output-${label}.json" || true
             fi
