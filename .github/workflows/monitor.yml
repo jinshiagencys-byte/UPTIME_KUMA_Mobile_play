@@ -119,9 +119,6 @@ jobs:
           HF_API_KEY: ${{ secrets.HF_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-          # ✅ FIX : on passe les flags Chromium via cette variable pour que
-          # Hermes les injecte lors du lancement du navigateur, tout en conservant
-          # la main sur le contexte (indispensable pour que recordVideo/ffmpeg fonctionne).
           AGENT_BROWSER_ARGS: "--headless=new,--no-sandbox,--disable-dev-shm-usage,--disable-gpu,--window-size=1280,800,--no-first-run,--no-default-browser-check"
         run: |
           mkdir -p ~/.hermes
@@ -134,11 +131,6 @@ jobs:
           NVIDIA_API_KEY=${NVIDIA_API_KEY}
           EOF
 
-          # ✅ FIX CRITIQUE : retrait total de `cdp_url` et `cloud_provider`
-          # pour laisser Hermes lancer lui-même le navigateur local.
-          # C'est cette prise de contrôle du cycle de vie qui permet au moteur
-          # sous-jacent (Playwright/agent-browser) d'attacher l'enregistreur
-          # vidéo (ffmpeg) au contexte navigateur.
           cat > ~/.hermes/config.yaml << 'EOF'
           browser:
             enabled: true
@@ -197,7 +189,7 @@ jobs:
             bien dans le panier (nom/qté/prix) — ces données viennent du
             backend, vérifie qu'elles sont réelles et pas un état vide/figé.
           - Compte utilisateur : inscris-toi avec des données fictives
-            (test+ci-<horodatage>@example.com), puis connecte-toi avec ces
+          (test+ci-<horodatage>@example.com), puis connecte-toi avec ces
             identifiants. Si compte existant seulement, teste juste qu'un
             login invalide donne une erreur propre (pas de vraie connexion).
           - Formulaire de contact : soumets-le en indiquant "TEST AUTOMATISÉ"
@@ -256,21 +248,14 @@ jobs:
             echo "Test avec $provider/$model pour ${{ matrix.site.url }}"
             echo "======================================"
 
-            hermes -z "$TASK_CONTENT" \
-              --provider "$provider" \
-              -m "$model" \
-              -t "browser,terminal" \
-              --yolo \
-              > "output-${label}.json" 2>&1
+            hermes -z "$TASK_CONTENT" --provider "$provider" -m "$model" -t "browser,terminal" --yolo > "output-${label}.json" 2>&1
 
             echo "exit_code=$?"
 
-            if ! grep -qiE '"overall_status"\s*:\s*"(up|down)"' "output-${label}.json" \
-               && grep -qiE 'bloc json|json (ci-dessus|généré|generated above)' "output-${label}.json"; then
+            if ! grep -qiE '"overall_status"\s*:\s*"(up|down)"' "output-${label}.json" && grep -qiE 'bloc json|json (ci-dessus|généré|generated above)' "output-${label}.json"; then
               echo "⚠️ ${label} : vérification terminée mais bloc JSON final tronqué — voir output-${label}.json"
             fi
 
-            # Récupération de la vidéo générée par record_sessions
             latest_webm=$(ls -t ~/.hermes/browser_recordings/*.webm 2>/dev/null | head -n1)
             if [ -n "$latest_webm" ]; then
               cp -v "$latest_webm" "recordings/${label}.webm"
@@ -293,11 +278,7 @@ jobs:
           echo "======================================"
           echo "🔁 Chaîne de repli OpenRouter (modèles gratuits)"
           echo "======================================"
-          for OR_MODEL in \
-            "poolside/laguna-s-2.1:free" \
-            "inclusionai/ling-3.0-flash-fin:free" \
-            "thinkingmachines/inkling:free" \
-            "openrouter/free"; do
+          for OR_MODEL in "poolside/laguna-s-2.1:free" "inclusionai/ling-3.0-flash-fin:free" "thinkingmachines/inkling:free" "openrouter/free"; do
             label="openrouter-$(echo "$OR_MODEL" | tr '/:' '--')"
             run_agent "openrouter" "$OR_MODEL" "$label"
             cp "output-${label}.json" output.json
@@ -358,12 +339,7 @@ jobs:
             PAGES_JSON=""
           else
             AGENT_TEXT=$(cat output.json)
-            PAGES_JSON=$(printf '%s' "$AGENT_TEXT" | awk '
-              /```json/ { capture=1; buf=""; next }
-              /```/ { if (capture) { last=buf; capture=0 } ; next }
-              capture { buf = buf $0 "\n" }
-              END { printf "%s", last }
-            ')
+            PAGES_JSON=$(printf '%s' "$AGENT_TEXT" | awk '/```json/ { capture=1; buf=""; next } /```/ { if (capture) { last=buf; capture=0 } ; next } capture { buf = buf $0 "\n" } END { printf "%s", last }')
 
             if echo "$PAGES_JSON" | jq -e '.overall_status and .pages' > /dev/null 2>&1; then
               STATUS=$(echo "$PAGES_JSON" | jq -r '.overall_status // "UNKNOWN"' | tr '[:lower:]' '[:upper:]')
@@ -395,24 +371,13 @@ jobs:
 
           if [ -n "$PAGES_JSON" ] && echo "$PAGES_JSON" | jq -e '.pages' > /dev/null 2>&1; then
             echo "📤 Envoi du rapport pages à /pages-report"
-            echo "$PAGES_JSON" | jq -c '{pages: .pages}' | \
-            curl -X POST "https://kuma-relay.up.railway.app/pages-report" \
-              -H "x-relay-secret: $RELAY_SECRET" \
-              -H "Content-Type: application/json" \
-              -d @- || echo "⚠️ Échec envoi pages-report"
+            echo "$PAGES_JSON" | jq -c '{pages: .pages}' > pages_payload.json
+            curl -X POST "https://kuma-relay.up.railway.app/pages-report" -H "x-relay-secret: $RELAY_SECRET" -H "Content-Type: application/json" -d @pages_payload.json || echo "⚠️ Échec envoi pages-report"
           fi
 
           echo "📤 Envoi du statut global à /status"
-          curl -X POST "https://kuma-relay.up.railway.app/status" \
-            -H "x-relay-secret: $RELAY_SECRET" \
-            -H "Content-Type: application/json" \
-            -d "$(jq -nc \
-              --arg id "$SITE_ID" \
-              --arg status "$STATUS" \
-              --arg reason "$REASON" \
-              --arg label "${WINNING_LABEL:-unknown}" \
-              '{site_id: $id, status: $status, reason: $reason, agent_label: $label}')" \
-            || echo "⚠️ Échec envoi status"
+          jq -nc --arg id "$SITE_ID" --arg status "$STATUS" --arg reason "$REASON" --arg label "${WINNING_LABEL:-unknown}" '{site_id: $id, status: $status, reason: $reason, agent_label: $label}' > status_payload.json
+          curl -X POST "https://kuma-relay.up.railway.app/status" -H "x-relay-secret: $RELAY_SECRET" -H "Content-Type: application/json" -d @status_payload.json || echo "⚠️ Échec envoi status"
 
       - name: Uploader la vidéo (artifact)
         if: always()
@@ -421,469 +386,4 @@ jobs:
           name: hermes-recordings-${{ matrix.site.id }}
           path: recordings/*.webm
           if-no-files-found: ignore
-          retention-days: 7            fi
-
-            ALL_MONITORS=$(curl -s -H "x-relay-secret: $RELAY_SECRET" "https://kuma-relay.up.railway.app/monitors")
-            PAGES=$(echo "$ALL_MONITORS" | jq -c --arg sid "$(echo "$MONITOR" | jq -r '.id')" '[.monitors[]? | select(.type == "http" and (.parent|tostring) == $sid) | {url: .url, name: .name}]')
-
-            SITES=$(jq -cn --argjson mon "$MONITOR" --argjson pages "$PAGES" '[{id: $mon.id, url: $mon.url, name: $mon.name, pages: $pages}]')
-          else
-            RAW=$(curl -s https://kuma-relay.up.railway.app/active-sites)
-            SITES_RAW=$(echo "$RAW" | jq -c '[.sites[]? | {id: .id, url: .site_url}]' 2>/dev/null || echo "")
-
-            if [ -z "$SITES_RAW" ] || [ "$SITES_RAW" == "null" ]; then
-              echo "⚠️ Réponse Supabase/relay illisible ou vide — aucun test ne sera lancé"
-              SITES_RAW="[]"
-            fi
-
-            if [ "$SITES_RAW" == "[]" ]; then
-              echo "ℹ️ Aucun site actif trouvé sur Supabase — aucun run de vérification ce cycle"
-            fi
-
-            SITES_ARRAY="[]"
-            while IFS= read -r site; do
-              [ -z "$site" ] && continue
-              sid=$(echo "$site" | jq -r '.id')
-              all=$(curl -s -H "x-relay-secret: $RELAY_SECRET" "https://kuma-relay.up.railway.app/monitors")
-              pages=$(echo "$all" | jq -c --arg sid "$sid" '[.monitors[]? | select(.type == "http" and (.parent|tostring) == $sid) | {url: .url, name: .name}]')
-              site_with_pages=$(echo "$site" | jq -c --argjson pages "$pages" '. + {pages: $pages}')
-              SITES_ARRAY=$(echo "$SITES_ARRAY" | jq -c --argjson site "$site_with_pages" '. + [$site]')
-            done <<< "$(echo "$SITES_RAW" | jq -c '.[]?')"
-            SITES="$SITES_ARRAY"
-          fi
-
-          SITES=$(echo "$SITES" | jq -c .)
-          echo "sites=$SITES" >> "$GITHUB_OUTPUT"
-          echo "📡 Sites à monitorer: $SITES"
-
-  hermes-test:
-    needs: fetch-sites
-    if: needs.fetch-sites.outputs.sites != '[]'
-    runs-on: ubuntu-latest
-    env:
-      BROWSER_CDP_URL: http://127.0.0.1:9222
-    concurrency:
-      group: hermes-check-${{ matrix.site.id }}
-      cancel-in-progress: false
-    strategy:
-      fail-fast: false
-      max-parallel: 1
-      matrix:
-        site: ${{ fromJson(needs.fetch-sites.outputs.sites) }}
-
-    steps:
-      - name: Checkout du code
-        uses: actions/checkout@v4
-
-      - name: Installer Hermes Agent
-        run: |
-          curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          source ~/.bashrc || true
-          hermes --version
-
-      # 🛠️ FIX ACTUEL — les 2 dernières dépendances système plausibles, en un
-      # seul run au lieu d'une hypothèse par run :
-      # 1) ffmpeg : ABSENT de la section External Tools du doctor (qui liste
-      #    git/ripgrep/docker/Node/agent-browser, PAS ffmpeg) alors qu'un
-      #    enregistreur WebM a structurellement besoin d'un encodeur. Suspect
-      #    n°1 pour « system dependency not met » ET pour l'absence TOTALE du
-      #    dossier recordings (échec silencieux avant même sa création).
-      # 2) binaire « chromium » : le runner n'a que google-chrome ; si le
-      #    check teste littéralement which("chromium"), le symlink suffit.
-      # L'endpoint CDP est conservé (config + env confirmés bons), et le
-      # npm install -g agent-browser est RETIRÉ : le doctor montre que
-      # l'installeur Hermes fournit déjà le sien (✓), le paquet npm étant le
-      # projet Vercel sans lien avec le tool Hermes.
-      - name: Dépendances système + Chromium CDP
-        run: |
-          set -e
-
-          echo "=== ffmpeg ==="
-          if ! command -v ffmpeg >/dev/null 2>&1; then
-            echo "ffmpeg absent → installation apt…"
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq ffmpeg
-          fi
-          ffmpeg -version 2>/dev/null | head -1 || echo "❌ ffmpeg toujours absent après install"
-
-          echo "=== symlink chromium ==="
-          if ! command -v chromium >/dev/null 2>&1 && command -v google-chrome >/dev/null 2>&1; then
-            sudo ln -sf "$(command -v google-chrome)" /usr/local/bin/chromium
-            echo "🔗 chromium → $(command -v google-chrome)"
-          fi
-          command -v chromium && chromium --version
-
-          echo "=== Chromium CDP ==="
-          CHROME_BIN="$(command -v chromium)"
-          echo "🌐 Navigateur : $CHROME_BIN ($("$CHROME_BIN" --version))"
-
-          mkdir -p "$HOME/.hermes/chrome-debug"
-
-          "$CHROME_BIN" \
-            --headless=new \
-            --no-sandbox \
-            --disable-dev-shm-usage \
-            --disable-gpu \
-            --remote-debugging-port=9222 \
-            --user-data-dir="$HOME/.hermes/chrome-debug" \
-            --window-size=1280,800 \
-            --no-first-run \
-            --no-default-browser-check \
-            about:blank > /tmp/chromium.log 2>&1 &
-
-          CDP_OK=0
-          for i in $(seq 1 30); do
-            if curl --fail --silent http://127.0.0.1:9222/json/version > /tmp/cdp-version.json 2>/dev/null; then
-              CDP_OK=1
-              break
-            fi
-            sleep 1
-          done
-          if [ "$CDP_OK" != "1" ]; then
-            echo "❌ Endpoint CDP jamais monté — log Chromium :"
-            cat /tmp/chromium.log || true
-            exit 1
-          fi
-          echo "✅ Endpoint CDP opérationnel"
-
-      - name: Configurer Hermes (config.yaml + credentials)
-        env:
-          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
-          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-          HF_API_KEY: ${{ secrets.HF_API_KEY }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-        run: |
-          mkdir -p ~/.hermes
-
-          cat > ~/.hermes/.env << EOF
-          MISTRAL_API_KEY=${MISTRAL_API_KEY}
-          GOOGLE_API_KEY=${GOOGLE_API_KEY}
-          HF_TOKEN=${HF_API_KEY}
-          OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
-          NVIDIA_API_KEY=${NVIDIA_API_KEY}
-          EOF
-
-          cat > ~/.hermes/config.yaml << 'EOF'
-          browser:
-            enabled: true
-            cloud_provider: local
-            record_sessions: true
-            cdp_url: http://127.0.0.1:9222
-
-          display:
-            tool_progress: "off"
-
-          sessions:
-            auto_prune: false
-
-          model:
-            provider: openrouter
-            default: openrouter/free
-
-          custom_providers:
-            - name: mistral
-              base_url: https://api.mistral.ai/v1
-              key_env: MISTRAL_API_KEY
-          EOF
-
-          hermes doctor || true
-
-          hermes doctor --fix || echo "⚠️ doctor --fix non bloquant"
-          echo "--- config.yaml après migration ---"
-          cat ~/.hermes/config.yaml
-
-          echo "--- État de browser-cdp avec ffmpeg + chromium + CDP actif ---"
-          hermes doctor 2>&1 | grep -i -A1 "browser-cdp" \
-            || echo "(browser-cdp absent de la sortie doctor)"
-
-          # 🛠️ ASSURANCE (automatique, ne rien faire si le fix marche) : si
-          # browser-cdp reste ⚠ malgré ffmpeg + chromium + endpoint, ces greps
-          # du source installé nommeront la dépendance exacte testée — fini
-          # les hypothèses, la réponse sera dans le log.
-          HERMES_SRC="$HOME/.hermes/hermes-agent"
-          SITE_PKG=$(find "$HOME/.hermes" -maxdepth 7 -name site-packages -type d 2>/dev/null | head -1)
-          EXC="--exclude-dir=node_modules --exclude-dir=venv --exclude-dir=.git"
-          for SRC in "$HERMES_SRC" "$SITE_PKG"; do
-            [ -n "$SRC" ] && [ -d "$SRC" ] || continue
-            echo "=== Source : $SRC ==="
-            echo "--- refs browser-cdp / cdp_url ---"
-            grep -rn $EXC -iE "browser.cdp|browser_cdp|cdp_url|BROWSER_CDP_URL" "$SRC" 2>/dev/null | head -40
-            echo "--- origine du label 'system dependency not met' ---"
-            grep -rn $EXC "system dependency not met" "$SRC" 2>/dev/null | head -10
-            echo "--- conditions d'écriture des recordings ---"
-            grep -rn $EXC -iE "browser_recordings|record_sessions" "$SRC" 2>/dev/null | head -30
-          done
-
-      - name: Générer la tâche
-        env:
-          PAGES_JSON: ${{ toJson(matrix.site.pages) }}
-          SITE_URL: ${{ matrix.site.url }}
-        run: |
-          PAGES_LIST=$(echo "$PAGES_JSON" | jq -c . | jq -r '[.[]? | .url] | join("\n")')
-
-          cat > task.md << EOF
-          Va sur $SITE_URL avec l'outil de navigateur. Explore comme un
-          humain (scroll, structure) et détecte le type de site.
-
-          VÉRIFICATION CRITIQUE avant tout le reste : le contenu affiché
-          correspond-il vraiment au site attendu, ou est-ce une page par
-          défaut d'hébergeur/registrar (ex: "o2switch", "It works!", page de
-          parking de domaine, message DNS/SSL non configuré) ? Si le frontend
-          affiche des sections censées recevoir des données du backend
-          (liste de produits, résultats, profil, prix, etc.) mais qu'elles
-          restent vides, bloquées en chargement, ou affichent une erreur/
-          "undefined"/"null" à la place des vraies données, c'est un backend
-          en panne : DOWN, même si la page HTTP répond 200.
-
-          PAGES À VÉRIFIER OBLIGATOIREMENT :
-          $PAGES_LIST
-
-          Choisis 2-3 actions à tester selon le type détecté :
-          - E-commerce : ajoute un produit au panier, VÉRIFIE qu'il apparaît
-            bien dans le panier (nom/qté/prix) — ces données viennent du
-            backend, vérifie qu'elles sont réelles et pas un état vide/figé.
-          - Compte utilisateur : inscris-toi avec des données fictives
-            (test+ci-<horodatage>@example.com), puis connecte-toi avec ces
-            identifiants. Si compte existant seulement, teste juste qu'un
-            login invalide donne une erreur propre (pas de vraie connexion).
-          - Formulaire de contact : soumets-le en indiquant "TEST AUTOMATISÉ"
-            dans le message.
-          - Recherche : vérifie que des résultats s'affichent réellement.
-          - Sinon : les 2-3 actions les plus représentatives du site.
-
-          Pour chaque page listée, vérifie au minimum qu'elle répond correctement
-          (HTTP 200, contenu attendu). Explore aussi les liens internes pour
-          détecter d'éventuelles pages non listées et signale-les dans le JSON
-          final. Toute nouvelle URL atteinte = une page distincte à noter.
-
-          Termine par ton verdict en langage naturel (type de site + parcours
-          testés, en précisant si le contenu venait bien du backend ou si
-          c'était un placeholder/backend en panne), puis ce bloc JSON exact
-          en toute fin (rien d'autre dedans) :
-
-          \`\`\`json
-          {
-            "overall_status": "UP",
-            "site_type": "ecommerce",
-            "pages": [
-              {
-                "url": "URL exacte",
-                "status": "UP",
-                "http_code": 200,
-                "action_tested": "action testée ou null",
-                "note": "explication en une sentence"
-              }
-            ]
-          }
-          \`\`\`
-          Règles : status/overall_status = "UP" ou "DOWN" uniquement.
-          site_type = ecommerce|auth|vitrine|blog|autre. Une entrée par page
-          visitée (départ + chaque URL distincte, y compris erreurs/404). Un
-          parcours métier qui échoue (panier vide après ajout, recherche sans
-          résultat, form qui ne soumet rien) = DOWN même si HTTP 200. Une page
-          par défaut d'hébergeur ou des données backend manquantes/vides
-          alors qu'elles sont attendues = DOWN même si HTTP 200.
-          EOF
-
-      - name: Lancer Hermes Agent (avec repli multi-providers)
-        id: agent_run
-        run: |
-          set +e
-
-          TASK_CONTENT=$(cat task.md)
-
-          mkdir -p recordings
-
-          run_agent() {
-            local provider=$1
-            local model=$2
-            local label=$3
-            echo "======================================"
-            echo "Test avec $provider/$model pour ${{ matrix.site.url }}"
-            echo "======================================"
-
-            # 🛠️ CORRIGÉ : retrait de browser-cdp du toolset — le CLI l'a
-            # rejeté explicitement (« ignoring unknown --toolsets entries:
-            # browser-cdp »). Le tool browser-cdp du doctor et le toolset -t
-            # sont deux mécanismes distincts ; c'était un no-op.
-            hermes -z "$TASK_CONTENT" \
-              --provider "$provider" \
-              -m "$model" \
-              -t "browser,terminal" \
-              --yolo \
-              > "output-${label}.json" 2>&1
-
-            echo "exit_code=$?"
-
-            if ! grep -qiE '"overall_status"\s*:\s*"(up|down)"' "output-${label}.json" \
-               && grep -qiE 'bloc json|json (ci-dessus|généré|generated above)' "output-${label}.json"; then
-              echo "⚠️ ${label} : vérification terminée mais bloc JSON final tronqué — voir output-${label}.json"
-            fi
-
-            latest_webm=$(ls -t ~/.hermes/browser_recordings/*.webm 2>/dev/null | head -n1)
-            if [ -n "$latest_webm" ]; then
-              cp -v "$latest_webm" "recordings/${label}.webm"
-            else
-              echo "ℹ️ Aucune vidéo pour la tentative ${label}"
-              if [ -d ~/.hermes/browser_recordings ]; then
-                echo "   (dossier présent mais vide — Hermes tente, échoue silencieusement)"
-                ls -la ~/.hermes/browser_recordings/ || true
-              else
-                echo "   (dossier inexistant — Hermes n'a jamais tenté d'enregistrer)"
-              fi
-            fi
-          }
-
-          is_success() {
-            grep -qiE '"overall_status"\s*:\s*"(up|down)"' "$1"
-          }
-
-          echo "======================================"
-          echo "🔁 Chaîne de repli OpenRouter (modèles gratuits)"
-          echo "======================================"
-          for OR_MODEL in \
-            "poolside/laguna-s-2.1:free" \
-            "inclusionai/ling-3.0-flash-fin:free" \
-            "thinkingmachines/inkling:free" \
-            "openrouter/free"; do
-            label="openrouter-$(echo "$OR_MODEL" | tr '/:' '--')"
-            run_agent "openrouter" "$OR_MODEL" "$label"
-            cp "output-${label}.json" output.json
-            if is_success output.json; then
-              echo "✅ Succès avec OpenRouter ($OR_MODEL)"
-              echo "agent_failed=false" >> $GITHUB_OUTPUT
-              echo "winning_label=${label}" >> $GITHUB_OUTPUT
-              exit 0
-            fi
-          done
-
-          echo "======================================"
-          echo "🔁 Fallback sur Mistral / Gemini / HuggingFace"
-          echo "======================================"
-          for PAIR in "custom:mistral|mistral-small-latest" "gemini|gemini-3.1-pro-preview" "huggingface|openai/gpt-oss-120b:cerebras"; do
-            provider="${PAIR%%|*}"
-            model="${PAIR#*|}"
-            label="$(echo "${provider}-${model}" | tr '/:' '--')"
-            run_agent "$provider" "$model" "$label"
-            cp "output-${label}.json" output.json
-            if is_success output.json; then
-              echo "✅ Succès avec $provider/$model"
-              echo "agent_failed=false" >> $GITHUB_OUTPUT
-              echo "winning_label=${label}" >> $GITHUB_OUTPUT
-              exit 0
-            fi
-          done
-
-          echo "======================================"
-          echo "🔁 Dernier recours : NVIDIA NIM"
-          echo "======================================"
-          run_agent "nvidia" "moonshotai/kimi-k3" "nvidia1"
-          cp "output-nvidia1.json" output.json
-          if is_success output.json; then
-            echo "✅ Succès avec NVIDIA (moonshotai/kimi-k3)"
-            echo "agent_failed=false" >> $GITHUB_OUTPUT
-            echo "winning_label=nvidia1" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          echo "❌ Échec final après tous les providers"
-          echo "agent_failed=true" >> $GITHUB_OUTPUT
-
-      - name: Extraire et envoyer le résultat
-        if: always()
-        env:
-          SITE_ID: ${{ matrix.site.id }}
-          RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
-        run: |
-          if [ ! -f output.json ] || [ ! -s output.json ]; then
-            STATUS="ERROR"
-            REASON="Agent output missing or empty"
-            PAGES_JSON=""
-          elif [ "${{ steps.agent_run.outputs.agent_failed }}" == "true" ]; then
-            STATUS="ERROR"
-            REASON="Agent execution failed after all attempts"
-            PAGES_JSON=""
-          else
-            AGENT_TEXT=$(cat output.json)
-            PAGES_JSON=$(printf '%s' "$AGENT_TEXT" | awk '
-              /```json/ { capture=1; buf=""; next }
-              /```/ { if (capture) { last=buf; capture=0 } ; next }
-              capture { buf = buf $0 "\n" }
-              END { printf "%s", last }
-            ')
-
-            if echo "$PAGES_JSON" | jq -e '.overall_status and .pages' > /dev/null 2>&1; then
-              STATUS=$(echo "$PAGES_JSON" | jq -r '.overall_status // "UNKNOWN"' | tr '[:lower:]' '[:upper:]')
-              SITE_TYPE=$(echo "$PAGES_JSON" | jq -r '.site_type // "non détecté"')
-              PAGES_JSON=$(echo "$PAGES_JSON" | jq -c '.pages |= map(.status |= (if . then ascii_upcase else "UNKNOWN" end))')
-              REASON=$(echo "$PAGES_JSON" | jq -c '.pages')
-              echo "$PAGES_JSON" > pages.json
-              echo "🏷️ Type de site détecté : $SITE_TYPE"
-              echo "📄 $(echo "$PAGES_JSON" | jq '.pages | length') page(s) rapportée(s) :"
-              echo "$PAGES_JSON" | jq -r '.pages[] | "  - \(.url) → \(.status) (http=\(.http_code // "n/a")) : \(.action_tested // "navigation simple") — \(.note // "")"'
-            else
-              echo "⚠️ Bloc JSON structuré introuvable, repli sur extraction texte"
-              if echo "$AGENT_TEXT" | grep -qi "up"; then
-                STATUS="UP"
-                REASON="Site appears operational (extracted from text)"
-              elif echo "$AGENT_TEXT" | grep -qi "down"; then
-                STATUS="DOWN"
-                REASON="Site appears down (extracted from text)"
-              else
-                STATUS="UNKNOWN"
-                REASON="No status indicator found in output"
-              fi
-              PAGES_JSON=""
-            fi
-          fi
-
-          echo "Statut final: $STATUS"
-          echo "Message: $REASON"
-
-          if [ -n "$PAGES_JSON" ] && echo "$PAGES_JSON" | jq -e '.pages' > /dev/null 2>&1; then
-            echo "📤 Envoi du rapport pages à /pages-report"
-            echo "$PAGES_JSON" | jq -c '{pages: .pages}' | \
-            curl -X POST "https://kuma-relay.up.railway.app/sites/${SITE_ID}/pages-report" \
-              -H "x-relay-secret: $RELAY_SECRET" \
-              -H "Content-Type: application/json" \
-              -d @- \
-              || echo "⚠️ Envoi pages-report échoué"
-          else
-            echo "ℹ️ Aucun rapport pages structuré à envoyer"
-          fi
-
-          jq -n --arg status "$STATUS" --arg message "$REASON" '{status: $status, message: $message}' | \
-          curl -X POST "https://kuma-relay.up.railway.app/sites/${SITE_ID}/mark-crawled" \
-            -H "x-relay-secret: $RELAY_SECRET" \
-            -H "Content-Type: application/json" \
-            -d @- \
-            || echo "⚠️ Envoi mark-crawled échoué"
-
-      - name: Collecter les enregistrements bruts Hermes
-        if: always()
-        run: |
-          echo "--- ~/.hermes/browser_recordings ---"
-          ls -la ~/.hermes/browser_recordings/ 2>/dev/null || echo "(dossier inexistant)"
-
-          echo "--- Tous fichiers vidéo trouvés sous ~/.hermes ---"
-          find "$HOME/.hermes" -type f \( -name '*.webm' -o -name '*.mp4' -o -name '*.mkv' \) \
-            -printf '%p %s bytes\n' 2>/dev/null | head -50 || true
-
-          mkdir -p hermes-raw
-          cp -r ~/.hermes/browser_recordings/* hermes-raw/ 2>/dev/null || true
-          cp -v /tmp/chromium.log hermes-raw/ 2>/dev/null || true
-          cp -v /tmp/cdp-version.json hermes-raw/ 2>/dev/null || true
-          cp -v ~/.hermes/config.yaml hermes-raw/ 2>/dev/null || true
-
-      - name: Upload des artefacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: hermes-${{ matrix.site.id }}
-          path: |
-            output*.json
-            pages.json
-            recordings/*.webm
-            hermes-raw/**
+          retention-days: 7
