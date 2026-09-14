@@ -171,8 +171,12 @@ jobs:
           echo "=== hermes doctor --fix ==="
           hermes doctor --fix || true
           
-          echo "=== hermes tools (Vérification des outils chargés) ==="
-          hermes tools
+          echo "=== hermes config get (vérification finale) ==="
+          echo "browser.enabled: $(hermes config get browser.enabled)"
+          echo "browser.cloud_provider: $(hermes config get browser.cloud_provider)"
+          echo "browser.record_sessions: $(hermes config get browser.record_sessions)"
+          echo "toolsets:"
+          hermes config get toolsets || echo "(toolsets non défini explicitement)"
           
           echo "=== Logs Hermes (erreurs d'initialisation) ==="
           if [ -d ~/.hermes/logs ]; then
