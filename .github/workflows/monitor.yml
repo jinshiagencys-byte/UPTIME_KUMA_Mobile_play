@@ -25,21 +25,34 @@ jobs:
           SITE_ID="$SITE_ID_INPUT"
 
           if [ -n "$SITE_ID" ]; then
+            echo "🔍 Test ciblé sur le site $SITE_ID"
             DETAIL=$(curl -s -H "x-relay-secret: $RELAY_SECRET" "https://kuma-relay.up.railway.app/monitors/$SITE_ID")
+
             MONITOR=$(echo "$DETAIL" | jq -c '.monitor | if .type == "http" then {id: .parent, url: .url, name: .parentName} else {id: .id, url: .url, name: .name} end')
+
             if [ -z "$MONITOR" ] || [ "$MONITOR" == "null" ]; then
+              echo "❌ Site $SITE_ID introuvable ou erreur relay"
               echo "sites=[]" >> "$GITHUB_OUTPUT"
               exit 0
             fi
+
             ALL_MONITORS=$(curl -s -H "x-relay-secret: $RELAY_SECRET" "https://kuma-relay.up.railway.app/monitors")
             PAGES=$(echo "$ALL_MONITORS" | jq -c --arg sid "$(echo "$MONITOR" | jq -r '.id')" '[.monitors[]? | select(.type == "http" and (.parent|tostring) == $sid) | {url: .url, name: .name}]')
+
             SITES=$(jq -cn --argjson mon "$MONITOR" --argjson pages "$PAGES" '[{id: $mon.id, url: $mon.url, name: $mon.name, pages: $pages}]')
           else
             RAW=$(curl -s https://kuma-relay.up.railway.app/active-sites)
             SITES_RAW=$(echo "$RAW" | jq -c '[.sites[]? | {id: .id, url: .site_url}]' 2>/dev/null || echo "")
+
             if [ -z "$SITES_RAW" ] || [ "$SITES_RAW" == "null" ]; then
+              echo "⚠️ Réponse Supabase/relay illisible ou vide — aucun test ne sera lancé"
               SITES_RAW="[]"
             fi
+
+            if [ "$SITES_RAW" == "[]" ]; then
+              echo "ℹ️ Aucun site actif trouvé sur Supabase — aucun run de vérification ce cycle"
+            fi
+
             SITES_ARRAY="[]"
             while IFS= read -r site; do
               [ -z "$site" ] && continue
@@ -51,8 +64,10 @@ jobs:
             done <<< "$(echo "$SITES_RAW" | jq -c '.[]?')"
             SITES="$SITES_ARRAY"
           fi
+
           SITES=$(echo "$SITES" | jq -c .)
           echo "sites=$SITES" >> "$GITHUB_OUTPUT"
+          echo "📡 Sites à monitorer: $SITES"
 
   hermes-test:
     needs: fetch-sites
@@ -68,7 +83,8 @@ jobs:
         site: ${{ fromJson(needs.fetch-sites.outputs.sites) }}
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout du code
+        uses: actions/checkout@v4
 
       - name: Installer Hermes Agent
         run: |
@@ -77,39 +93,42 @@ jobs:
           source ~/.bashrc || true
           hermes --version
 
-      - name: Dépendances système
+      - name: Dépendances système (ffmpeg + chromium + agent-browser + Playwright)
         run: |
           set -e
-          command -v ffmpeg >/dev/null 2>&1 || sudo apt-get install -y -qq ffmpeg
+          
+          echo "=== ffmpeg (requis pour l'enregistrement vidéo .webm) ==="
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq ffmpeg
+          fi
+          ffmpeg -version 2>/dev/null | head -1
+          
+          echo "=== symlink chromium ==="
           if ! command -v chromium >/dev/null 2>&1 && command -v google-chrome >/dev/null 2>&1; then
             sudo ln -sf "$(command -v google-chrome)" /usr/local/bin/chromium
           fi
-          npm install -g agent-browser || true
-          sudo npx playwright install-deps chromium || true
-          npx playwright install chromium || true
+          command -v chromium && chromium --version
+          
+          echo "=== Installation GLOBALE de agent-browser ==="
+          npm install -g agent-browser || echo "⚠️ npm install failed, will rely on npx"
+          which agent-browser && agent-browser --version || true
+          
+          echo "=== Installation des dépendances Playwright ==="
+          sudo npx playwright install-deps chromium || echo "⚠️ playwright install-deps failed"
+          npx playwright install chromium || echo "⚠️ playwright install chromium failed"
 
-      - name: Diagnostic des check_fn browser
-        run: |
-          SRC="$HOME/.hermes/hermes-agent"
-          echo "=== Recherche check_browser_requirements ==="
-          grep -rn "def check_browser_requirements" "$SRC" --include="*.py" | head -5
-          echo ""
-          echo "=== Corps de la fonction ==="
-          grep -A 30 "def check_browser_requirements" "$SRC" -r --include="*.py" | head -50
-          echo ""
-          echo "=== Recherche check_browser_navigate_requirements ==="
-          grep -A 30 "def check_browser_navigate_requirements" "$SRC" -r --include="*.py" | head -50
-
-      - name: Configurer Hermes
+      - name: Configurer Hermes + Réchauffer agent-browser
         env:
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           HF_API_KEY: ${{ secrets.HF_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-          AGENT_BROWSER_ARGS: "--headless=new,--no-sandbox,--disable-dev-shm-usage,--disable-gpu,--disable-blink-features=AutomationControlled,--window-size=1280,800"
+          AGENT_BROWSER_ARGS: "--headless=new,--no-sandbox,--disable-dev-shm-usage,--disable-gpu,--disable-blink-features=AutomationControlled,--window-size=1280,800,--no-first-run,--no-default-browser-check"
         run: |
-          mkdir -p ~/.hermes ~/.hermes/browser_recordings
+          mkdir -p ~/.hermes
+          mkdir -p ~/.hermes/browser_recordings
 
           unset BROWSERBASE_API_KEY || true
           unset BROWSER_USE_API_KEY || true
@@ -120,10 +139,13 @@ jobs:
           HF_TOKEN=${HF_API_KEY}
           OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
           NVIDIA_API_KEY=${NVIDIA_API_KEY}
-          AGENT_BROWSER_ENGINE=chrome
-          AGENT_BROWSER_HEADED=false
           EOF
 
+          # ✅ FIX CRITIQUE : retrait de `browser-use` des toolsets.
+          # La présence de browser-use active le mode CLI qui fait retourner
+          # check_browser_requirements() à False et désactive TOUTE la surface
+          # browser_* (navigate, click, etc.). Sans ces outils, pas de navigateur
+          # Playwright, donc pas de vidéo enregistrée.
           cat > ~/.hermes/config.yaml << 'EOF'
           browser:
             enabled: true
@@ -156,94 +178,161 @@ jobs:
               key_env: MISTRAL_API_KEY
           EOF
 
-          echo "=== Réchauffement agent-browser ==="
-          agent-browser open "https://example.com" || true
-          agent-browser close --all || true
-
           echo "=== hermes doctor --fix ==="
           hermes doctor --fix || true
+          
+          echo "=== hermes config get (vérification finale) ==="
+          echo "browser.enabled: $(hermes config get browser.enabled)"
+          echo "browser.cloud_provider: $(hermes config get browser.cloud_provider)"
+          echo "browser.record_sessions: $(hermes config get browser.record_sessions)"
+          echo "browser.engine: $(hermes config get browser.engine)"
+          echo "toolsets:"
+          hermes config get toolsets
+          
+          echo "=== Réchauffement : créer une session agent-browser ==="
+          agent-browser open "https://example.com" || true
+          agent-browser close --all || true
+          echo "✅ agent-browser fonctionne en local"
 
-      - name: Générer tâche
+      - name: Générer la tâche
         env:
           PAGES_JSON: ${{ toJson(matrix.site.pages) }}
           SITE_URL: ${{ matrix.site.url }}
         run: |
           PAGES_LIST=$(echo "$PAGES_JSON" | jq -c . | jq -r '[.[]? | .url] | join("\n")')
 
-          cat > task.md << 'EOF'
-          Va sur SITE_URL_PLACEHOLDER avec l'outil de navigateur. Explore comme un humain et détecte le type de site.
+          cat > task.md << EOF
+          Va sur $SITE_URL avec l'outil de navigateur. Explore comme un
+          humain (scroll, structure) et détecte le type de site.
 
-          VÉRIFICATION CRITIQUE : le contenu correspond-il vraiment au site attendu ou est-ce une page par défaut d'hébergeur ?
-          Si le frontend affiche des sections censées recevoir des données du backend mais qu'elles restent vides, c'est DOWN.
+          VÉRIFICATION CRITIQUE avant tout le reste : le contenu affiché
+          correspond-il vraiment au site attendu, ou est-ce une page par
+          défaut d'hébergeur/registrar (ex: "o2switch", "It works!", page de
+          parking de domaine, message DNS/SSL non configuré) ? Si le frontend
+          affiche des sections censées recevoir des données du backend
+          (liste de produits, résultats, profil, prix, etc.) mais qu'elles
+          restent vides, bloquées en chargement, ou affichent une erreur/
+          "undefined"/"null" à la place des vraies données, c'est un backend
+          en panne : DOWN, même si la page HTTP répond 200.
 
-          PAGES À VÉRIFIER :
-          PAGES_LIST_PLACEHOLDER
+          PAGES À VÉRIFIER OBLIGATOIREMENT :
+          $PAGES_LIST
 
-          Choisis 2-3 actions selon le type détecté (e-commerce: panier ; auth: signup/login ; contact: form ; recherche).
+          Choisis 2-3 actions à tester selon le type détecté :
+          - E-commerce : ajoute un produit au panier, VÉRIFIE qu'il apparaît
+            bien dans le panier (nom/qté/prix) — ces données viennent du
+            backend, vérifie qu'elles sont réelles et pas un état vide/figé.
+          - Compte utilisateur : inscris-toi avec des données fictives
+            (test+ci-<horodatage>@example.com), puis connecte-toi avec ces
+            identifiants. Si compte existant seulement, teste juste qu'un
+            login invalide donne une erreur propre (pas de vraie connexion).
+          - Formulaire de contact : soumets-le en indiquant "TEST AUTOMATISÉ"
+            dans le message.
+          - Recherche : vérifie que des résultats s'affichent réellement.
+          - Sinon : les 2-3 actions les plus représentatives du site.
 
-          Termine par un verdict puis ce bloc JSON exact :
+          Pour chaque page listée, vérifie au minimum qu'elle répond correctement
+          (HTTP 200, contenu attendu). Explore aussi les liens internes pour
+          détecter d'éventuelles pages non listées et signale-les dans le JSON
+          final. Toute nouvelle URL atteinte = une page distincte à noter.
 
-          ```json
+          Termine par ton verdict en langage naturel (type de site + parcours
+          testés, en précisant si le contenu venait bien du backend ou si
+          c'était un placeholder/backend en panne), puis ce bloc JSON exact
+          en toute fin (rien d'autre dedans) :
+
+          \`\`\`json
           {
             "overall_status": "UP",
             "site_type": "ecommerce",
-            "pages": [{"url": "URL", "status": "UP", "http_code": 200, "action_tested": "action", "note": "note"}]
+            "pages": [
+              {
+                "url": "URL exacte",
+                "status": "UP",
+                "http_code": 200,
+                "action_tested": "action testée ou null",
+                "note": "explication en une sentence"
+              }
+            ]
           }
-          ```
+          \`\`\`
+          Règles : status/overall_status = "UP" ou "DOWN" uniquement.
+          site_type = ecommerce|auth|vitrine|blog|autre. Une entrée par page
+          visitée (départ + chaque URL distincte, y compris erreurs/404). Un
+          parcours métier qui échoue (panier vide après ajout, recherche sans
+          résultat, form qui ne soumet rien) = DOWN même si HTTP 200. Une page
+          par défaut d'hébergeur ou des données backend manquantes/vides
+          alors qu'elles sont attendues = DOWN même si HTTP 200.
           EOF
 
-          sed -i "s|SITE_URL_PLACEHOLDER|$SITE_URL|g" task.md
-          sed -i "s|PAGES_LIST_PLACEHOLDER|$PAGES_LIST|g" task.md
-
-      - name: Lancer Hermes Agent
+      - name: Lancer Hermes Agent (avec repli multi-providers)
         id: agent_run
-        env:
-          HERMES_DEBUG: "1"
-          HERMES_LOG_LEVEL: "DEBUG"
         run: |
           set +e
+
           TASK_CONTENT=$(cat task.md)
           mkdir -p recordings
 
           run_agent() {
-            local provider=$1 model=$2 label=$3
-            echo "=== Test $provider/$model ==="
-            
+            local provider=$1
+            local model=$2
+            local label=$3
+            echo "======================================"
+            echo "Test avec $provider/$model pour ${{ matrix.site.url }}"
+            echo "======================================"
+
             hermes -z "$TASK_CONTENT" --provider "$provider" -m "$model" -t "browser,terminal" --yolo > "output-${label}.json" 2>&1
+
             echo "exit_code=$?"
 
-            if [ -d ~/.hermes/browser_recordings ]; then
-              echo "=== Contenu browser_recordings ==="
-              ls -lah ~/.hermes/browser_recordings/
+            if ! grep -qiE '"overall_status"\s*:\s*"(up|down)"' "output-${label}.json" && grep -qiE 'bloc json|json (ci-dessus|généré|generated above)' "output-${label}.json"; then
+              echo "⚠️ ${label} : vérification terminée mais bloc JSON final tronqué — voir output-${label}.json"
             fi
+
+            echo "=== État de browser_recordings après exécution ==="
+            if [ -d ~/.hermes/browser_recordings ]; then
+              ls -lah ~/.hermes/browser_recordings/ || echo "(dossier vide)"
+              find ~/.hermes/browser_recordings/ -name "*.webm" -ls 2>/dev/null || echo "(aucun .webm)"
+            else
+              echo "❌ Dossier ~/.hermes/browser_recordings/ n'existe toujours pas"
+            fi
+
+            echo "=== Warnings check_fn browser ==="
+            grep -i "check_fn.*browser" "output-${label}.json" | head -5 || echo "(aucun warning browser)"
 
             latest_webm=$(ls -t ~/.hermes/browser_recordings/*.webm 2>/dev/null | head -n1)
             if [ -n "$latest_webm" ]; then
               cp -v "$latest_webm" "recordings/${label}.webm"
-              echo "✅ Vidéo enregistrée : ${label}.webm"
+              echo "✅ Vidéo enregistrée : recordings/${label}.webm"
+            else
+              echo "ℹ️ Aucune vidéo pour la tentative ${label}"
+              echo "=== Dernières lignes des logs ==="
+              tail -50 "output-${label}.json" || true
             fi
-
-            echo "=== Warnings check_fn browser ==="
-            grep -i "check_fn.*browser" "output-${label}.json" | head -5 || true
           }
 
           is_success() {
             grep -qiE '"overall_status"\s*:\s*"(up|down)"' "$1"
           }
 
-          echo "=== Chaîne OpenRouter ==="
+          echo "======================================"
+          echo "🔁 Chaîne de repli OpenRouter (modèles gratuits)"
+          echo "======================================"
           for OR_MODEL in "poolside/laguna-s-2.1:free" "inclusionai/ling-3.0-flash-fin:free" "thinkingmachines/inkling:free" "openrouter/free"; do
             label="openrouter-$(echo "$OR_MODEL" | tr '/:' '--')"
             run_agent "openrouter" "$OR_MODEL" "$label"
             cp "output-${label}.json" output.json
             if is_success output.json; then
+              echo "✅ Succès avec OpenRouter ($OR_MODEL)"
               echo "agent_failed=false" >> $GITHUB_OUTPUT
               echo "winning_label=${label}" >> $GITHUB_OUTPUT
               exit 0
             fi
           done
 
-          echo "=== Fallback providers ==="
+          echo "======================================"
+          echo "🔁 Fallback sur Mistral / Gemini / HuggingFace"
+          echo "======================================"
           for PAIR in "custom:mistral|mistral-small-latest" "gemini|gemini-3.1-pro-preview" "huggingface|openai/gpt-oss-120b:cerebras"; do
             provider="${PAIR%%|*}"
             model="${PAIR#*|}"
@@ -251,51 +340,91 @@ jobs:
             run_agent "$provider" "$model" "$label"
             cp "output-${label}.json" output.json
             if is_success output.json; then
+              echo "✅ Succès avec $provider/$model"
               echo "agent_failed=false" >> $GITHUB_OUTPUT
               echo "winning_label=${label}" >> $GITHUB_OUTPUT
               exit 0
             fi
           done
 
-          echo "=== NVIDIA ==="
+          echo "======================================"
+          echo "🔁 Dernier recours : NVIDIA NIM"
+          echo "======================================"
           run_agent "nvidia" "moonshotai/kimi-k3" "nvidia1"
           cp "output-nvidia1.json" output.json
           if is_success output.json; then
+            echo "✅ Succès avec NVIDIA (moonshotai/kimi-k3)"
             echo "agent_failed=false" >> $GITHUB_OUTPUT
             echo "winning_label=nvidia1" >> $GITHUB_OUTPUT
             exit 0
           fi
 
+          echo "❌ Échec final après tous les providers"
           echo "agent_failed=true" >> $GITHUB_OUTPUT
 
-      - name: Extraire et envoyer résultat
+      - name: Extraire et envoyer le résultat
         if: always()
         env:
           SITE_ID: ${{ matrix.site.id }}
           RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
           WINNING_LABEL: ${{ steps.agent_run.outputs.winning_label }}
         run: |
-          if [ -f output.json ] && [ -s output.json ]; then
+          if [ ! -f output.json ] || [ ! -s output.json ]; then
+            STATUS="ERROR"
+            REASON="Agent output missing or empty"
+            PAGES_JSON=""
+          elif [ "${{ steps.agent_run.outputs.agent_failed }}" == "true" ]; then
+            STATUS="ERROR"
+            REASON="Agent execution failed after all attempts"
+            PAGES_JSON=""
+          else
             AGENT_TEXT=$(cat output.json)
-            PAGES_JSON=$(printf '%s' "$AGENT_TEXT" | awk 'BEGIN{c=0;b=""} /```json/{c=1;b="";next} /```/{if(c){l=b;c=0};next} c{b=b $0 "\n"} END{printf "%s",l}')
+            PAGES_JSON=$(printf '%s' "$AGENT_TEXT" | awk '
+              /```json/ { capture=1; buf=""; next }
+              /```/ { if (capture) { last=buf; capture=0 } ; next }
+              capture { buf = buf $0 "\n" }
+              END { printf "%s", last }
+            ')
+
             if echo "$PAGES_JSON" | jq -e '.overall_status and .pages' > /dev/null 2>&1; then
               STATUS=$(echo "$PAGES_JSON" | jq -r '.overall_status // "UNKNOWN"' | tr '[:lower:]' '[:upper:]')
+              SITE_TYPE=$(echo "$PAGES_JSON" | jq -r '.site_type // "non détecté"')
+              PAGES_JSON=$(echo "$PAGES_JSON" | jq -c '.pages |= map(.status |= (if . then ascii_upcase else "UNKNOWN" end))')
               REASON=$(echo "$PAGES_JSON" | jq -c '.pages')
-              echo "$PAGES_JSON" | jq -c '{pages: .pages}' > pp.json
-              curl -s -X POST "https://kuma-relay.up.railway.app/pages-report" -H "x-relay-secret: $RELAY_SECRET" -H "Content-Type: application/json" -d @pp.json || true
+              echo "$PAGES_JSON" > pages.json
+              echo "🏷️ Type de site détecté : $SITE_TYPE"
+              echo "📄 $(echo "$PAGES_JSON" | jq '.pages | length') page(s) rapportée(s) :"
+              echo "$PAGES_JSON" | jq -r '.pages[] | "  - \(.url) → \(.status) (http=\(.http_code // "n/a")) : \(.action_tested // "navigation simple") — \(.note // "")"'
             else
-              STATUS="UNKNOWN"
-              REASON="No JSON block"
+              echo "⚠️ Bloc JSON structuré introuvable, repli sur extraction texte"
+              if echo "$AGENT_TEXT" | grep -qi "up"; then
+                STATUS="UP"
+                REASON="Site appears operational (extracted from text)"
+              elif echo "$AGENT_TEXT" | grep -qi "down"; then
+                STATUS="DOWN"
+                REASON="Site appears down (extracted from text)"
+              else
+                STATUS="UNKNOWN"
+                REASON="No status indicator found in output"
+              fi
+              PAGES_JSON=""
             fi
-          else
-            STATUS="ERROR"
-            REASON="No output"
           fi
-          
-          jq -nc --arg id "$SITE_ID" --arg s "$STATUS" --arg r "$REASON" --arg l "${WINNING_LABEL:-unknown}" '{site_id: $id, status: $s, reason: $r, agent_label: $l}' > sp.json
-          curl -s -X POST "https://kuma-relay.up.railway.app/status" -H "x-relay-secret: $RELAY_SECRET" -H "Content-Type: application/json" -d @sp.json || true
 
-      - name: Uploader vidéo
+          echo "Statut final: $STATUS"
+          echo "Message: $REASON"
+
+          if [ -n "$PAGES_JSON" ] && echo "$PAGES_JSON" | jq -e '.pages' > /dev/null 2>&1; then
+            echo "📤 Envoi du rapport pages à /pages-report"
+            echo "$PAGES_JSON" | jq -c '{pages: .pages}' > pages_payload.json
+            curl -X POST "https://kuma-relay.up.railway.app/pages-report" -H "x-relay-secret: $RELAY_SECRET" -H "Content-Type: application/json" -d @pages_payload.json || echo "⚠️ Échec envoi pages-report (endpoint peut ne pas exister)"
+          fi
+
+          echo "📤 Envoi du statut global à /status"
+          jq -nc --arg id "$SITE_ID" --arg status "$STATUS" --arg reason "$REASON" --arg label "${WINNING_LABEL:-unknown}" '{site_id: $id, status: $status, reason: $reason, agent_label: $label}' > status_payload.json
+          curl -X POST "https://kuma-relay.up.railway.app/status" -H "x-relay-secret: $RELAY_SECRET" -H "Content-Type: application/json" -d @status_payload.json || echo "⚠️ Échec envoi status (endpoint peut ne pas exister)"
+
+      - name: Uploader la vidéo (artifact)
         if: always()
         uses: actions/upload-artifact@v4
         with:
