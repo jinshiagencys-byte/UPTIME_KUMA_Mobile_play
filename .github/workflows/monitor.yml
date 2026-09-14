@@ -112,7 +112,7 @@ jobs:
           fi
           command -v chromium && chromium --version
 
-      - name: Configurer Hermes (config.yaml + credentials + flags navigateur)
+      - name: Configurer Hermes avec DEBUG INTENSIF
         env:
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
@@ -123,6 +123,14 @@ jobs:
         run: |
           mkdir -p ~/.hermes
 
+          # ✅ Supprimer toute variable d'environnement qui pourrait forcer un cloud provider
+          unset BROWSERBASE_API_KEY || true
+          unset BROWSER_USE_API_KEY || true
+          unset BROWSERBASE_PROXIES || true
+          unset BROWSERBASE_ADVANCED_STEALTH || true
+          unset BROWSERBASE_KEEP_ALIVE || true
+          unset BROWSERBASE_SESSION_TIMEOUT || true
+
           cat > ~/.hermes/.env << EOF
           MISTRAL_API_KEY=${MISTRAL_API_KEY}
           GOOGLE_API_KEY=${GOOGLE_API_KEY}
@@ -131,10 +139,14 @@ jobs:
           NVIDIA_API_KEY=${NVIDIA_API_KEY}
           EOF
 
+          # ✅ CRITIQUE : forcer cloud_provider: local pour éviter l'auto-détection cloud
           cat > ~/.hermes/config.yaml << 'EOF'
           browser:
             enabled: true
+            cloud_provider: local
             record_sessions: true
+            inactivity_timeout: 120
+            command_timeout: 30
 
           display:
             tool_progress: "off"
@@ -152,13 +164,38 @@ jobs:
               key_env: MISTRAL_API_KEY
           EOF
 
-          hermes doctor || true
-          hermes doctor --fix || echo "⚠️ doctor --fix non bloquant"
-
-          echo "--- config.yaml final ---"
+          echo "=== Contenu exact du config.yaml ==="
           cat ~/.hermes/config.yaml
-          echo "--- AGENT_BROWSER_ARGS actif ---"
-          echo "$AGENT_BROWSER_ARGS"
+          
+          echo "=== Contenu exact du .env ==="
+          cat ~/.hermes/.env
+          
+          echo "=== Variables d'environnement browser ==="
+          env | grep -i browser || echo "(aucune variable browser)"
+          
+          echo "=== hermes config get browser ==="
+          hermes config get browser || echo "❌ Impossible de lire browser config"
+          
+          echo "=== hermes config get browser.record_sessions ==="
+          hermes config get browser.record_sessions || echo "❌ Impossible de lire record_sessions"
+          
+          echo "=== hermes config get browser.cloud_provider ==="
+          hermes config get browser.cloud_provider || echo "❌ Impossible de lire cloud_provider"
+          
+          echo "=== hermes doctor (complet) ==="
+          hermes doctor
+          
+          echo "=== hermes doctor --fix ==="
+          hermes doctor --fix || echo "⚠️ doctor --fix non bloquant"
+          
+          echo "=== Vérification des variables après doctor ==="
+          hermes config get browser.record_sessions
+          hermes config get browser.cloud_provider
+          
+          echo "=== Test manuel : créer le dossier recordings ==="
+          mkdir -p ~/.hermes/browser_recordings
+          ls -la ~/.hermes/
+          ls -la ~/.hermes/browser_recordings/
 
       - name: Générer la tâche
         env:
@@ -189,7 +226,7 @@ jobs:
             bien dans le panier (nom/qté/prix) — ces données viennent du
             backend, vérifie qu'elles sont réelles et pas un état vide/figé.
           - Compte utilisateur : inscris-toi avec des données fictives
-          (test+ci-<horodatage>@example.com), puis connecte-toi avec ces
+            (test+ci-<horodatage>@example.com), puis connecte-toi avec ces
             identifiants. Si compte existant seulement, teste juste qu'un
             login invalide donne une erreur propre (pas de vraie connexion).
           - Formulaire de contact : soumets-le en indiquant "TEST AUTOMATISÉ"
@@ -231,13 +268,33 @@ jobs:
           alors qu'elles sont attendues = DOWN même si HTTP 200.
           EOF
 
+      - name: Test manuel d'enregistrement vidéo AVANT le run principal
+        run: |
+          echo "=== Test manuel : Hermes peut-il enregistrer une vidéo ? ==="
+          echo "État initial de browser_recordings :"
+          ls -la ~/.hermes/browser_recordings/ 2>/dev/null || echo "(dossier vide ou inexistant)"
+          
+          echo "Lancement d'un test minimal avec browser_navigate"
+          cat > test_record.md << 'EOF'
+          Utilise l'outil browser_navigate pour aller sur https://example.com, puis ferme la session.
+          EOF
+          
+          hermes -z "$(cat test_record.md)" --provider openrouter -m "openrouter/free" -t "browser" --yolo > test_output.log 2>&1 || true
+          
+          echo "=== Résultat du test manuel ==="
+          echo "Contenu de browser_recordings après test :"
+          ls -lah ~/.hermes/browser_recordings/ 2>/dev/null || echo "(toujours vide)"
+          find ~/.hermes/browser_recordings/ -name "*.webm" -ls 2>/dev/null || echo "(aucun .webm)"
+          
+          echo "=== Logs du test manuel ==="
+          cat test_output.log | grep -iE "record|video|browser|error|ffmpeg" | tail -20 || true
+
       - name: Lancer Hermes Agent (avec repli multi-providers)
         id: agent_run
         run: |
           set +e
 
           TASK_CONTENT=$(cat task.md)
-
           mkdir -p recordings
 
           run_agent() {
@@ -256,18 +313,22 @@ jobs:
               echo "⚠️ ${label} : vérification terminée mais bloc JSON final tronqué — voir output-${label}.json"
             fi
 
+            echo "=== État de browser_recordings après exécution ==="
+            if [ -d ~/.hermes/browser_recordings ]; then
+              ls -lah ~/.hermes/browser_recordings/ || echo "(dossier vide)"
+              find ~/.hermes/browser_recordings/ -name "*.webm" -ls 2>/dev/null || echo "(aucun .webm)"
+            else
+              echo "❌ Dossier ~/.hermes/browser_recordings/ n'existe toujours pas"
+            fi
+
             latest_webm=$(ls -t ~/.hermes/browser_recordings/*.webm 2>/dev/null | head -n1)
             if [ -n "$latest_webm" ]; then
               cp -v "$latest_webm" "recordings/${label}.webm"
               echo "✅ Vidéo enregistrée : recordings/${label}.webm"
             else
               echo "ℹ️ Aucune vidéo pour la tentative ${label}"
-              if [ -d ~/.hermes/browser_recordings ]; then
-                echo "   (dossier présent mais vide — échec silencieux d'enregistrement)"
-                ls -la ~/.hermes/browser_recordings/ || true
-              else
-                echo "   (dossier inexistant — Hermes n'a jamais tenté d'enregistrer)"
-              fi
+              echo "=== Dernières lignes des logs ==="
+              tail -50 "output-${label}.json" || true
             fi
           }
 
@@ -372,12 +433,12 @@ jobs:
           if [ -n "$PAGES_JSON" ] && echo "$PAGES_JSON" | jq -e '.pages' > /dev/null 2>&1; then
             echo "📤 Envoi du rapport pages à /pages-report"
             echo "$PAGES_JSON" | jq -c '{pages: .pages}' > pages_payload.json
-            curl -X POST "https://kuma-relay.up.railway.app/pages-report" -H "x-relay-secret: $RELAY_SECRET" -H "Content-Type: application/json" -d @pages_payload.json || echo "⚠️ Échec envoi pages-report"
+            curl -X POST "https://kuma-relay.up.railway.app/pages-report" -H "x-relay-secret: $RELAY_SECRET" -H "Content-Type: application/json" -d @pages_payload.json || echo "⚠️ Échec envoi pages-report (endpoint peut ne pas exister)"
           fi
 
           echo "📤 Envoi du statut global à /status"
           jq -nc --arg id "$SITE_ID" --arg status "$STATUS" --arg reason "$REASON" --arg label "${WINNING_LABEL:-unknown}" '{site_id: $id, status: $status, reason: $reason, agent_label: $label}' > status_payload.json
-          curl -X POST "https://kuma-relay.up.railway.app/status" -H "x-relay-secret: $RELAY_SECRET" -H "Content-Type: application/json" -d @status_payload.json || echo "⚠️ Échec envoi status"
+          curl -X POST "https://kuma-relay.up.railway.app/status" -H "x-relay-secret: $RELAY_SECRET" -H "Content-Type: application/json" -d @status_payload.json || echo "⚠️ Échec envoi status (endpoint peut ne pas exister)"
 
       - name: Uploader la vidéo (artifact)
         if: always()
