@@ -122,14 +122,19 @@ jobs:
           echo "=== Vérifier que Xvfb est bien installé ==="
           which Xvfb && echo "✅ Xvfb présent" || echo "❌ Xvfb absent"
 
-      - name: Démarrer Xvfb + Configurer Hermes
+      - name: Démarrer Xvfb + Configurer Hermes (navigateur HEADED)
         env:
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           HF_API_KEY: ${{ secrets.HF_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-          AGENT_BROWSER_ARGS: "--headless=new,--no-sandbox,--disable-dev-shm-usage,--disable-gpu,--disable-blink-features=AutomationControlled,--window-size=1280,800,--no-first-run,--no-default-browser-check"
+          DISPLAY: ":99"
+          # ✅ FIX VIDÉO BLANCHE : plus de --headless=new ni --disable-gpu.
+          # Le navigateur doit dessiner de vrais pixels sur le display Xvfb :99,
+          # sinon le screencast ne capture que des frames blanches.
+          AGENT_BROWSER_HEADED: "1"
+          AGENT_BROWSER_ARGS: "--no-sandbox,--disable-dev-shm-usage,--disable-blink-features=AutomationControlled,--window-size=1280,800,--no-first-run,--no-default-browser-check"
         run: |
           mkdir -p ~/.hermes
           mkdir -p ~/.hermes/browser_recordings
@@ -137,7 +142,7 @@ jobs:
           unset BROWSERBASE_API_KEY || true
           unset BROWSER_USE_API_KEY || true
 
-          echo "=== Démarrage de Xvfb (display virtuel pour capture vidéo) ==="
+          echo "=== Démarrage de Xvfb (display virtuel) ==="
           Xvfb :99 -screen 0 1280x800x24 -ac +extension GLX +render -noreset > /tmp/xvfb.log 2>&1 &
           XVFB_PID=$!
           echo "Xvfb démarré avec PID $XVFB_PID"
@@ -158,6 +163,7 @@ jobs:
           OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
           NVIDIA_API_KEY=${NVIDIA_API_KEY}
           DISPLAY=:99
+          AGENT_BROWSER_HEADED=1
           EOF
 
           cat > ~/.hermes/config.yaml << 'EOF'
@@ -166,8 +172,8 @@ jobs:
             cloud_provider: local
             record_sessions: true
             engine: chrome
-            headed: false
-            inactivity_timeout: 120
+            headed: true
+            inactivity_timeout: 300
             command_timeout: 30
 
           toolsets:
@@ -194,6 +200,15 @@ jobs:
 
           echo "=== hermes doctor --fix ==="
           hermes doctor --fix || true
+          
+          echo "=== Test : navigateur headed sur Xvfb ==="
+          agent-browser open "https://example.com" || true
+          agent-browser screenshot /tmp/test-headed.png || echo "⚠️ screenshot failed"
+          if [ -f /tmp/test-headed.png ]; then
+            echo "✅ Navigateur headed fonctionne (screenshot créé)"
+            ls -lah /tmp/test-headed.png
+          fi
+          agent-browser close --all || true
 
       - name: Générer la tâche
         env:
@@ -266,10 +281,12 @@ jobs:
           alors qu'elles sont attendues = DOWN même si HTTP 200.
           EOF
 
-      - name: Lancer Hermes Agent avec enregistrement manuel
+      - name: Lancer Hermes Agent avec enregistrement vidéo
         id: agent_run
         env:
           DISPLAY: ":99"
+          AGENT_BROWSER_HEADED: "1"
+          AGENT_BROWSER_ARGS: "--no-sandbox,--disable-dev-shm-usage,--disable-blink-features=AutomationControlled,--window-size=1280,800,--no-first-run,--no-default-browser-check"
         run: |
           set +e
 
@@ -292,21 +309,45 @@ jobs:
             echo "======================================"
 
             export DISPLAY=:99
-            
-            # ✅ ENREGISTREMENT MANUEL : démarrer avant Hermes
-            echo "🎥 Démarrage de l'enregistrement vidéo..."
-            RECORDING_PATH="$HOME/.hermes/browser_recordings/${label}.webm"
-            agent-browser record start "$RECORDING_PATH" || echo "⚠️ record start failed"
-            
+            RECORDING_PATH="recordings/${label}.webm"
+            SCREEN_PATH="recordings/${label}-xvfb.webm"
+
+            # 🎥 CAPTURE DE SECOURS : ffmpeg enregistre le display Xvfb :99
+            # (le navigateur headed y dessine sa fenêtre → pixels garantis)
+            echo "🎥 Démarrage capture ffmpeg de secours sur :99..."
+            ffmpeg -y -f x11grab -video_size 1280x800 -framerate 15 \
+              -i :99.0 \
+              -c:v libvpx-vp9 -b:v 1M -pix_fmt yuv420p \
+              -preset ultrafast -an \
+              "$SCREEN_PATH" > /tmp/ffmpeg-${label}.log 2>&1 &
+            FFMPEG_PID=$!
+            sleep 1
+            if kill -0 $FFMPEG_PID 2>/dev/null; then
+              echo "✅ ffmpeg de secours actif (PID $FFMPEG_PID)"
+            else
+              echo "⚠️ ffmpeg de secours n'a pas démarré"
+              cat /tmp/ffmpeg-${label}.log | tail -10
+            fi
+
+            # 🎥 ENREGISTREMENT PRINCIPAL : agent-browser record, démarré
+            # directement sur l'URL du site (pas de page blanche initiale)
+            echo "🎥 Démarrage de l'enregistrement agent-browser..."
+            agent-browser record start "$RECORDING_PATH" "${{ matrix.site.url }}" || echo "⚠️ record start failed"
+
             # Lancer Hermes
             hermes -z "$TASK_CONTENT" --provider "$provider" -m "$model" -t "browser,terminal" --yolo > "output-${label}.json" 2>&1
             HERMES_EXIT=$?
-            
-            # ✅ ENREGISTREMENT MANUEL : arrêter après Hermes
-            echo "🎥 Arrêt de l'enregistrement vidéo..."
+
+            # 🎥 Arrêt des deux captures
+            echo "🎥 Arrêt de l'enregistrement agent-browser..."
             agent-browser record stop || echo "⚠️ record stop failed"
-            
-            # Fermer la session navigateur
+
+            if kill -0 $FFMPEG_PID 2>/dev/null; then
+              kill -INT $FFMPEG_PID
+              wait $FFMPEG_PID 2>/dev/null || true
+              echo "✅ ffmpeg de secours arrêté"
+            fi
+
             agent-browser close --all || true
 
             echo "exit_code=$HERMES_EXIT"
@@ -315,21 +356,18 @@ jobs:
               echo "⚠️ ${label} : vérification terminée mais bloc JSON final tronqué — voir output-${label}.json"
             fi
 
-            echo "=== État de browser_recordings après exécution ==="
-            if [ -d ~/.hermes/browser_recordings ]; then
-              ls -lah ~/.hermes/browser_recordings/ || echo "(dossier vide)"
-              find ~/.hermes/browser_recordings/ -name "*.webm" -ls 2>/dev/null || echo "(aucun .webm)"
-            else
-              echo "❌ Dossier ~/.hermes/browser_recordings/ n'existe pas"
-            fi
+            echo "=== Fichiers vidéo produits ==="
+            ls -lah recordings/ || echo "(rien)"
 
-            if [ -f "$RECORDING_PATH" ]; then
-              cp -v "$RECORDING_PATH" "recordings/${label}.webm"
-              echo "✅ Vidéo enregistrée : recordings/${label}.webm ($(ls -lh "$RECORDING_PATH" | awk '{print $5}'))"
+            if [ -f "$RECORDING_PATH" ] && [ -s "$RECORDING_PATH" ]; then
+              echo "✅ Vidéo principale : $RECORDING_PATH ($(ls -lh "$RECORDING_PATH" | awk '{print $5}'))"
             else
-              echo "❌ Aucune vidéo créée pour la tentative ${label}"
-              echo "=== Dernières lignes des logs ==="
-              tail -50 "output-${label}.json" || true
+              echo "❌ Vidéo principale absente/vide"
+            fi
+            if [ -f "$SCREEN_PATH" ] && [ -s "$SCREEN_PATH" ]; then
+              echo "✅ Vidéo secours Xvfb : $SCREEN_PATH ($(ls -lh "$SCREEN_PATH" | awk '{print $5}'))"
+            else
+              echo "❌ Vidéo secours absente/vide"
             fi
           }
 
@@ -447,7 +485,7 @@ jobs:
           jq -nc --arg status "$STATUS" --arg message "$REASON" '{status: $status, message: $message}' > status_payload.json
           curl -X POST "$RELAY_URL/sites/$SITE_ID/mark-crawled" -H "x-relay-secret: $RELAY_SECRET" -H "Content-Type: application/json" -d @status_payload.json || echo "⚠️ Échec envoi mark-crawled"
 
-      - name: Uploader la vidéo (artifact)
+      - name: Uploader les vidéos (artifacts)
         if: always()
         uses: actions/upload-artifact@v4
         with:
