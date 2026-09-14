@@ -21,13 +21,12 @@ jobs:
         env:
           SITE_ID_INPUT: ${{ github.event.inputs.site_id }}
           RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
-          RELAY_URL: ${{ secrets.RELAY_URL }}
         run: |
           SITE_ID="$SITE_ID_INPUT"
 
           if [ -n "$SITE_ID" ]; then
             echo "🔍 Test ciblé sur le site $SITE_ID"
-            DETAIL=$(curl -s -H "x-relay-secret: $RELAY_SECRET" "$RELAY_URL/monitors/$SITE_ID")
+            DETAIL=$(curl -s -H "x-relay-secret: $RELAY_SECRET" "https://kuma-relay.up.railway.app/monitors/$SITE_ID")
 
             MONITOR=$(echo "$DETAIL" | jq -c '.monitor | if .type == "http" then {id: .parent, url: .url, name: .parentName} else {id: .id, url: .url, name: .name} end')
 
@@ -37,12 +36,12 @@ jobs:
               exit 0
             fi
 
-            ALL_MONITORS=$(curl -s -H "x-relay-secret: $RELAY_SECRET" "$RELAY_URL/monitors")
+            ALL_MONITORS=$(curl -s -H "x-relay-secret: $RELAY_SECRET" "https://kuma-relay.up.railway.app/monitors")
             PAGES=$(echo "$ALL_MONITORS" | jq -c --arg sid "$(echo "$MONITOR" | jq -r '.id')" '[.monitors[]? | select(.type == "http" and (.parent|tostring) == $sid) | {url: .url, name: .name}]')
 
             SITES=$(jq -cn --argjson mon "$MONITOR" --argjson pages "$PAGES" '[{id: $mon.id, url: $mon.url, name: $mon.name, pages: $pages}]')
           else
-            RAW=$(curl -s "$RELAY_URL/active-sites")
+            RAW=$(curl -s "https://kuma-relay.up.railway.app/active-sites")
             SITES_RAW=$(echo "$RAW" | jq -c '[.sites[]? | {id: .id, url: .site_url}]' 2>/dev/null || echo "")
 
             if [ -z "$SITES_RAW" ] || [ "$SITES_RAW" == "null" ]; then
@@ -58,7 +57,7 @@ jobs:
             while IFS= read -r site; do
               [ -z "$site" ] && continue
               sid=$(echo "$site" | jq -r '.id')
-              all=$(curl -s -H "x-relay-secret: $RELAY_SECRET" "$RELAY_URL/monitors")
+              all=$(curl -s -H "x-relay-secret: $RELAY_SECRET" "https://kuma-relay.up.railway.app/monitors")
               pages=$(echo "$all" | jq -c --arg sid "$sid" '[.monitors[]? | select(.type == "http" and (.parent|tostring) == $sid) | {url: .url, name: .name}]')
               site_with_pages=$(echo "$site" | jq -c --argjson pages "$pages" '. + {pages: $pages}')
               SITES_ARRAY=$(echo "$SITES_ARRAY" | jq -c --argjson site "$site_with_pages" '. + [$site]')
@@ -266,14 +265,13 @@ jobs:
           alors qu'elles sont attendues = DOWN même si HTTP 200.
           EOF
 
-      - name: Lancer Hermes Agent avec enregistrement manuel
+      - name: Lancer Hermes Agent avec capture vidéo directe (ffmpeg)
         id: agent_run
         env:
           DISPLAY: ":99"
         run: |
           set +e
 
-          # S'assurer que Xvfb tourne toujours
           if ! pgrep -f "Xvfb :99" > /dev/null; then
             echo "⚠️ Xvfb arrêté, redémarrage..."
             Xvfb :99 -screen 0 1280x800x24 -ac +extension GLX +render -noreset > /tmp/xvfb.log 2>&1 &
@@ -292,44 +290,48 @@ jobs:
             echo "======================================"
 
             export DISPLAY=:99
+            RECORDING_PATH="recordings/${label}.webm"
             
-            # ✅ ENREGISTREMENT MANUEL : démarrer avant Hermes
-            echo "🎥 Démarrage de l'enregistrement vidéo..."
-            RECORDING_PATH="$HOME/.hermes/browser_recordings/${label}.webm"
-            agent-browser record start "$RECORDING_PATH" || echo "⚠️ record start failed"
+            echo "🎥 Démarrage capture ffmpeg sur DISPLAY=:99..."
+            ffmpeg -y -f x11grab -video_size 1280x800 -framerate 15 \
+              -i :99.0 \
+              -c:v libvpx-vp9 -b:v 1M -pix_fmt yuv420p \
+              -preset ultrafast -an \
+              "$RECORDING_PATH" > /tmp/ffmpeg-${label}.log 2>&1 &
+            FFMPEG_PID=$!
+            echo "ffmpeg PID: $FFMPEG_PID"
+            sleep 2
             
-            # Lancer Hermes
+            if ! kill -0 $FFMPEG_PID 2>/dev/null; then
+              echo "❌ ffmpeg n'a pas démarré. Log :"
+              cat /tmp/ffmpeg-${label}.log
+            else
+              echo "✅ ffmpeg actif"
+            fi
+            
             hermes -z "$TASK_CONTENT" --provider "$provider" -m "$model" -t "browser,terminal" --yolo > "output-${label}.json" 2>&1
             HERMES_EXIT=$?
             
-            # ✅ ENREGISTREMENT MANUEL : arrêter après Hermes
-            echo "🎥 Arrêt de l'enregistrement vidéo..."
-            agent-browser record stop || echo "⚠️ record stop failed"
-            
-            # Fermer la session navigateur
-            agent-browser close --all || true
+            echo "🎥 Arrêt de ffmpeg..."
+            if kill -0 $FFMPEG_PID 2>/dev/null; then
+              kill -INT $FFMPEG_PID
+              wait $FFMPEG_PID 2>/dev/null || true
+              echo "✅ ffmpeg arrêté"
+            fi
 
             echo "exit_code=$HERMES_EXIT"
 
             if ! grep -qiE '"overall_status"\s*:\s*"(up|down)"' "output-${label}.json" && grep -qiE 'bloc json|json (ci-dessus|généré|generated above)' "output-${label}.json"; then
-              echo "⚠️ ${label} : vérification terminée mais bloc JSON final tronqué — voir output-${label}.json"
+              echo "⚠️ ${label} : vérification terminée mais bloc JSON final tronqué"
             fi
 
-            echo "=== État de browser_recordings après exécution ==="
-            if [ -d ~/.hermes/browser_recordings ]; then
-              ls -lah ~/.hermes/browser_recordings/ || echo "(dossier vide)"
-              find ~/.hermes/browser_recordings/ -name "*.webm" -ls 2>/dev/null || echo "(aucun .webm)"
+            if [ -f "$RECORDING_PATH" ] && [ -s "$RECORDING_PATH" ]; then
+              FILE_SIZE=$(ls -lh "$RECORDING_PATH" | awk '{print $5}')
+              echo "✅ Vidéo enregistrée : $RECORDING_PATH ($FILE_SIZE)"
             else
-              echo "❌ Dossier ~/.hermes/browser_recordings/ n'existe pas"
-            fi
-
-            if [ -f "$RECORDING_PATH" ]; then
-              cp -v "$RECORDING_PATH" "recordings/${label}.webm"
-              echo "✅ Vidéo enregistrée : recordings/${label}.webm ($(ls -lh "$RECORDING_PATH" | awk '{print $5}'))"
-            else
-              echo "❌ Aucune vidéo créée pour la tentative ${label}"
-              echo "=== Dernières lignes des logs ==="
-              tail -50 "output-${label}.json" || true
+              echo "❌ Fichier vidéo absent ou vide"
+              echo "=== Log ffmpeg ==="
+              cat /tmp/ffmpeg-${label}.log | tail -30
             fi
           }
 
@@ -338,7 +340,7 @@ jobs:
           }
 
           echo "======================================"
-          echo "🔁 Chaîne de repli OpenRouter (modèles gratuits)"
+          echo "🔁 Chaîne OpenRouter (gratuits)"
           echo "======================================"
           for OR_MODEL in "poolside/laguna-s-2.1:free" "inclusionai/ling-3.0-flash-fin:free" "thinkingmachines/inkling:free" "openrouter/free"; do
             label="openrouter-$(echo "$OR_MODEL" | tr '/:' '--')"
@@ -353,7 +355,7 @@ jobs:
           done
 
           echo "======================================"
-          echo "🔁 Fallback sur Mistral / Gemini / HuggingFace"
+          echo "🔁 Fallback Mistral / Gemini / HF"
           echo "======================================"
           for PAIR in "custom:mistral|mistral-small-latest" "gemini|gemini-3.1-pro-preview" "huggingface|openai/gpt-oss-120b:cerebras"; do
             provider="${PAIR%%|*}"
@@ -370,18 +372,18 @@ jobs:
           done
 
           echo "======================================"
-          echo "🔁 Dernier recours : NVIDIA NIM"
+          echo "🔁 NVIDIA NIM"
           echo "======================================"
           run_agent "nvidia" "moonshotai/kimi-k3" "nvidia1"
           cp "output-nvidia1.json" output.json
           if is_success output.json; then
-            echo "✅ Succès avec NVIDIA (moonshotai/kimi-k3)"
+            echo "✅ Succès avec NVIDIA"
             echo "agent_failed=false" >> $GITHUB_OUTPUT
             echo "winning_label=nvidia1" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          echo "❌ Échec final après tous les providers"
+          echo "❌ Échec final"
           echo "agent_failed=true" >> $GITHUB_OUTPUT
 
       - name: Extraire et envoyer le résultat
@@ -389,7 +391,6 @@ jobs:
         env:
           SITE_ID: ${{ matrix.site.id }}
           RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
-          RELAY_URL: ${{ secrets.RELAY_URL }}
           WINNING_LABEL: ${{ steps.agent_run.outputs.winning_label }}
         run: |
           if [ ! -f output.json ] || [ ! -s output.json ]; then
@@ -440,12 +441,12 @@ jobs:
           if [ -n "$PAGES_JSON" ] && echo "$PAGES_JSON" | jq -e '.pages' > /dev/null 2>&1; then
             echo "📤 Envoi du rapport pages à /sites/$SITE_ID/pages-report"
             echo "$PAGES_JSON" | jq -c '{pages: .pages}' > pages_payload.json
-            curl -X POST "$RELAY_URL/sites/$SITE_ID/pages-report" -H "x-relay-secret: $RELAY_SECRET" -H "Content-Type: application/json" -d @pages_payload.json || echo "⚠️ Échec envoi pages-report"
+            curl -X POST "https://kuma-relay.up.railway.app/sites/$SITE_ID/pages-report" -H "x-relay-secret: $RELAY_SECRET" -H "Content-Type: application/json" -d @pages_payload.json || echo "⚠️ Échec envoi pages-report"
           fi
 
-          echo "📤 Envoi du statut global à /sites/$SITE_ID/mark-crawled"
-          jq -nc --arg status "$STATUS" --arg message "$REASON" '{status: $status, message: $message}' > status_payload.json
-          curl -X POST "$RELAY_URL/sites/$SITE_ID/mark-crawled" -H "x-relay-secret: $RELAY_SECRET" -H "Content-Type: application/json" -d @status_payload.json || echo "⚠️ Échec envoi mark-crawled"
+          echo "📤 Envoi du statut global à /status"
+          jq -nc --arg id "$SITE_ID" --arg status "$STATUS" --arg reason "$REASON" --arg label "${WINNING_LABEL:-unknown}" '{site_id: $id, status: $status, reason: $reason, agent_label: $label}' > status_payload.json
+          curl -X POST "https://kuma-relay.up.railway.app/status" -H "x-relay-secret: $RELAY_SECRET" -H "Content-Type: application/json" -d @status_payload.json || echo "⚠️ Échec envoi status"
 
       - name: Uploader la vidéo (artifact)
         if: always()
