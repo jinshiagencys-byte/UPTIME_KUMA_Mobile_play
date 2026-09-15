@@ -119,7 +119,7 @@ jobs:
           sudo npx playwright install-deps chromium || echo "⚠️ playwright install-deps failed"
           npx playwright install chromium || echo "⚠️ playwright install chromium failed"
           
-          echo "=== Xvfb + gestionnaire de fenêtres (fenêtre maximisée, pas de bandes noires) ==="
+          echo "=== Xvfb + gestionnaire de fenêtres ==="
           sudo apt-get install -y -qq matchbox-window-manager || echo "⚠️ matchbox non installé"
           which Xvfb && echo "✅ Xvfb présent" || echo "❌ Xvfb absent"
 
@@ -132,7 +132,16 @@ jobs:
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
           DISPLAY: ":99"
           AGENT_BROWSER_HEADED: "1"
-          AGENT_BROWSER_ARGS: "--no-sandbox,--disable-dev-shm-usage,--disable-blink-features=AutomationControlled,--window-size=1280,800,--start-maximized,--no-first-run,--no-default-browser-check"
+          # ✅ FIX : séparateur newline au lieu de virgule pour éviter que
+          # --window-size=1280,800 ne soit coupé en deux arguments
+          AGENT_BROWSER_ARGS: |
+            --no-sandbox
+            --disable-dev-shm-usage
+            --disable-blink-features=AutomationControlled
+            --window-size=1280,800
+            --start-maximized
+            --no-first-run
+            --no-default-browser-check
         run: |
           mkdir -p ~/.hermes
           mkdir -p ~/.hermes/browser_recordings
@@ -282,12 +291,19 @@ jobs:
           alors qu'elles sont attendues = DOWN même si HTTP 200.
           EOF
 
-      - name: Lancer Hermes Agent avec capture vidéo + watchdog de focus
+      - name: Lancer Hermes Agent avec capture vidéo
         id: agent_run
         env:
           DISPLAY: ":99"
           AGENT_BROWSER_HEADED: "1"
-          AGENT_BROWSER_ARGS: "--no-sandbox,--disable-dev-shm-usage,--disable-blink-features=AutomationControlled,--window-size=1280,800,--start-maximized,--no-first-run,--no-default-browser-check"
+          AGENT_BROWSER_ARGS: |
+            --no-sandbox
+            --disable-dev-shm-usage
+            --disable-blink-features=AutomationControlled
+            --window-size=1280,800
+            --start-maximized
+            --no-first-run
+            --no-default-browser-check
         run: |
           set +e
 
@@ -303,23 +319,6 @@ jobs:
 
           TASK_CONTENT=$(cat task.md)
           mkdir -p recordings
-
-          # 🐕 WATCHDOG : toutes les 3 s, active le DERNIER onglet ouvert.
-          # Les onglets créés via CDP ne prennent pas le focus à l'écran ;
-          # sans ce watchdog, la capture Xvfb filmerait un onglet mort
-          # (ex: 0.0.3.32) pendant que le vrai travail se fait en arrière-plan.
-          start_watchdog() {
-            (
-              while true; do
-                LAST=$(agent-browser tab list 2>/dev/null | awk '/^[[:space:]]*[0-9]+/ {n=$1} END {print n}')
-                if [ -n "$LAST" ]; then
-                  agent-browser tab "$LAST" >/dev/null 2>&1
-                fi
-                sleep 3
-              done
-            ) &
-            echo $!
-          }
 
           run_agent() {
             local provider=$1
@@ -347,16 +346,8 @@ jobs:
               cat /tmp/ffmpeg-${label}.log | tail -10
             fi
 
-            echo "🐕 Démarrage du watchdog de focus..."
-            WATCHDOG_PID=$(start_watchdog)
-            echo "watchdog PID: $WATCHDOG_PID"
-
             hermes -z "$TASK_CONTENT" --provider "$provider" -m "$model" -t "browser,terminal" --yolo > "output-${label}.json" 2>&1
             HERMES_EXIT=$?
-
-            echo "🐕 Arrêt du watchdog..."
-            kill $WATCHDOG_PID 2>/dev/null || true
-            wait $WATCHDOG_PID 2>/dev/null || true
 
             echo "🎥 Arrêt de ffmpeg..."
             if kill -0 $FFMPEG_PID 2>/dev/null; then
