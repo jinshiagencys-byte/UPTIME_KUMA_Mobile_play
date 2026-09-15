@@ -1,4 +1,4 @@
-name: Hermes Agent - Monitoring Autonome Multi-Sites
+name: Agent Q - Monitoring Autonome Multi-Sites
 
 on:
   workflow_dispatch:
@@ -7,553 +7,1364 @@ on:
         description: 'ID du site à tester spécifiquement (optionnel)'
         required: false
         type: string
+
   schedule:
     - cron: "0 */6 * * *"
 
+permissions:
+  contents: read
+
 jobs:
+
+  # ============================================================
+  # 1. RÉCUPÉRER LES SITES
+  # ============================================================
   fetch-sites:
     runs-on: ubuntu-latest
+
     outputs:
       sites: ${{ steps.get-sites.outputs.sites }}
+
     steps:
       - name: Récupérer les sites actifs et leurs pages
         id: get-sites
+
         env:
           SITE_ID_INPUT: ${{ github.event.inputs.site_id }}
           RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
           RELAY_URL: ${{ secrets.RELAY_URL }}
+
+        shell: bash
+
         run: |
-          SITE_ID="$SITE_ID_INPUT"
+          set -euo pipefail
+
+          SITE_ID="${SITE_ID_INPUT:-}"
+
+          echo "======================================"
+          echo "🔎 RÉCUPÉRATION DES SITES"
+          echo "======================================"
 
           if [ -n "$SITE_ID" ]; then
+
             echo "🔍 Test ciblé sur le site $SITE_ID"
-            DETAIL=$(curl -s -H "x-relay-secret: $RELAY_SECRET" "$RELAY_URL/monitors/$SITE_ID")
 
-            MONITOR=$(echo "$DETAIL" | jq -c '.monitor | if .type == "http" then {id: .parent, url: .url, name: .parentName} else {id: .id, url: .url, name: .name} end')
+            DETAIL=$(curl -fsS \
+              --retry 3 \
+              --retry-delay 2 \
+              -H "x-relay-secret: $RELAY_SECRET" \
+              "$RELAY_URL/monitors/$SITE_ID")
 
-            if [ -z "$MONITOR" ] || [ "$MONITOR" == "null" ]; then
+            MONITOR=$(echo "$DETAIL" | jq -c '
+              .monitor
+              | if .type == "http"
+                then {
+                    id: .parent,
+                    url: .url,
+                    name: .parentName
+                  }
+                else {
+                    id: .id,
+                    url: .url,
+                    name: .name
+                  }
+                end
+            ')
+
+            if [ -z "$MONITOR" ] || [ "$MONITOR" = "null" ]; then
               echo "❌ Site $SITE_ID introuvable ou erreur relay"
               echo "sites=[]" >> "$GITHUB_OUTPUT"
               exit 0
             fi
 
-            ALL_MONITORS=$(curl -s -H "x-relay-secret: $RELAY_SECRET" "$RELAY_URL/monitors")
-            PAGES=$(echo "$ALL_MONITORS" | jq -c --arg sid "$(echo "$MONITOR" | jq -r '.id')" '[.monitors[]? | select(.type == "http" and (.parent|tostring) == $sid) | {url: .url, name: .name}]')
+            ALL_MONITORS=$(curl -fsS \
+              --retry 3 \
+              --retry-delay 2 \
+              -H "x-relay-secret: $RELAY_SECRET" \
+              "$RELAY_URL/monitors")
 
-            SITES=$(jq -cn --argjson mon "$MONITOR" --argjson pages "$PAGES" '[{id: $mon.id, url: $mon.url, name: $mon.name, pages: $pages}]')
+            PAGES=$(echo "$ALL_MONITORS" | jq -c \
+              --arg sid "$(echo "$MONITOR" | jq -r '.id')" '
+              [
+                .monitors[]?
+                | select(
+                    .type == "http"
+                    and (.parent | tostring) == $sid
+                  )
+                | {
+                    url: .url,
+                    name: .name
+                  }
+              ]
+            ')
+
+            SITES=$(jq -cn \
+              --argjson mon "$MONITOR" \
+              --argjson pages "$PAGES" '
+              [
+                {
+                  id: $mon.id,
+                  url: $mon.url,
+                  name: $mon.name,
+                  pages: $pages
+                }
+              ]
+            ')
+
           else
-            RAW=$(curl -s "$RELAY_URL/active-sites")
-            SITES_RAW=$(echo "$RAW" | jq -c '[.sites[]? | {id: .id, url: .site_url}]' 2>/dev/null || echo "")
 
-            if [ -z "$SITES_RAW" ] || [ "$SITES_RAW" == "null" ]; then
-              echo "⚠️ Réponse Supabase/relay illisible ou vide — aucun test ne sera lancé"
+            echo "📡 Récupération de tous les sites actifs..."
+
+            RAW=$(curl -fsS \
+              --retry 3 \
+              --retry-delay 2 \
+              -H "x-relay-secret: $RELAY_SECRET" \
+              "$RELAY_URL/active-sites")
+
+            SITES_RAW=$(echo "$RAW" \
+              | jq -c '
+                  [
+                    .sites[]?
+                    | {
+                        id: .id,
+                        url: .site_url
+                      }
+                  ]
+                ' \
+              2>/dev/null || echo "[]")
+
+            if [ -z "$SITES_RAW" ] || [ "$SITES_RAW" = "null" ]; then
+              echo "⚠️ Réponse Supabase/relay illisible ou vide"
               SITES_RAW="[]"
             fi
 
-            if [ "$SITES_RAW" == "[]" ]; then
-              echo "ℹ️ Aucun site actif trouvé sur Supabase — aucun run de vérification ce cycle"
+            if [ "$SITES_RAW" = "[]" ]; then
+              echo "ℹ️ Aucun site actif trouvé"
             fi
 
             SITES_ARRAY="[]"
+
             while IFS= read -r site; do
               [ -z "$site" ] && continue
-              sid=$(echo "$site" | jq -r '.id')
-              all=$(curl -s -H "x-relay-secret: $RELAY_SECRET" "$RELAY_URL/monitors")
-              pages=$(echo "$all" | jq -c --arg sid "$sid" '[.monitors[]? | select(.type == "http" and (.parent|tostring) == $sid) | {url: .url, name: .name}]')
-              site_with_pages=$(echo "$site" | jq -c --argjson pages "$pages" '. + {pages: $pages}')
-              SITES_ARRAY=$(echo "$SITES_ARRAY" | jq -c --argjson site "$site_with_pages" '. + [$site]')
+
+              SID=$(echo "$site" | jq -r '.id')
+
+              echo "--------------------------------------"
+              echo "🌐 Site : $SID"
+              echo "--------------------------------------"
+
+              ALL_MONITORS=$(curl -fsS \
+                --retry 3 \
+                --retry-delay 2 \
+                -H "x-relay-secret: $RELAY_SECRET" \
+                "$RELAY_URL/monitors")
+
+              PAGES=$(echo "$ALL_MONITORS" | jq -c \
+                --arg sid "$SID" '
+                [
+                  .monitors[]?
+                  | select(
+                      .type == "http"
+                      and (.parent | tostring) == $sid
+                    )
+                  | {
+                      url: .url,
+                      name: .name
+                    }
+                ]
+              ')
+
+              SITE_WITH_PAGES=$(echo "$site" \
+                | jq -c \
+                  --argjson pages "$PAGES" \
+                  '. + {pages: $pages}')
+
+              SITES_ARRAY=$(echo "$SITES_ARRAY" \
+                | jq -c \
+                  --argjson site "$SITE_WITH_PAGES" \
+                  '. + [$site]')
+
             done <<< "$(echo "$SITES_RAW" | jq -c '.[]?')"
+
             SITES="$SITES_ARRAY"
+
           fi
 
           SITES=$(echo "$SITES" | jq -c .)
-          echo "sites=$SITES" >> "$GITHUB_OUTPUT"
-          echo "📡 Sites à monitorer: $SITES"
 
-  hermes-test:
+          echo "sites=$SITES" >> "$GITHUB_OUTPUT"
+
+          echo "======================================"
+          echo "📡 SITES À MONITORER"
+          echo "======================================"
+
+          echo "$SITES" | jq .
+
+
+  # ============================================================
+  # 2. AGENT Q
+  # ============================================================
+  agent-q-test:
+
     needs: fetch-sites
+
     if: needs.fetch-sites.outputs.sites != '[]'
+
     runs-on: ubuntu-latest
+
+    timeout-minutes: 45
+
     concurrency:
-      group: hermes-check-${{ matrix.site.id }}
+      group: agent-q-check-${{ matrix.site.id }}
       cancel-in-progress: false
+
     strategy:
       fail-fast: false
       max-parallel: 1
+
       matrix:
         site: ${{ fromJson(needs.fetch-sites.outputs.sites) }}
 
+    env:
+      # ========================================================
+      # MODÈLE UNIQUE — AUCUN FALLBACK
+      # ========================================================
+      AGENT_Q_MODEL: "openrouter/thinkingmachines/inkling:free"
+
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+
+      SITE_ID: ${{ matrix.site.id }}
+      SITE_URL: ${{ matrix.site.url }}
+
     steps:
-      - name: Checkout du code
+
+      # ========================================================
+      # CHECKOUT
+      # ========================================================
+      - name: Checkout du repository
         uses: actions/checkout@v4
 
-      - name: Installer Hermes Agent
+
+      # ========================================================
+      # PYTHON
+      # ========================================================
+      - name: Installer Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+
+
+      # ========================================================
+      # CLONER AGENT Q
+      # ========================================================
+      - name: Cloner Agent Q
         run: |
-          curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          source ~/.bashrc || true
-          hermes --version
+          set -euo pipefail
 
-      - name: Dépendances système (ffmpeg + chromium + agent-browser + Playwright + Xvfb + WM)
+          git clone --depth 1 \
+            https://github.com/Top-Q/agent-q.git \
+            agent-q
+
+          echo "======================================"
+          echo "🤖 AGENT Q"
+          echo "======================================"
+
+          cd agent-q
+
+          echo "Commit :"
+          git rev-parse HEAD
+
+          echo
+          echo "Python :"
+          python --version
+
+
+      # ========================================================
+      # CACHE DU CODE STORE AGENT Q
+      #
+      # Agent Q stocke les scripts réussis dans code_store.
+      # GitHub Actions étant éphémère, on conserve ce dossier
+      # entre les exécutions.
+      # ========================================================
+      - name: Restaurer le code store Agent Q
+        uses: actions/cache@v4
+
+        with:
+          path: agent-q/code_store
+
+          key: agent-q-code-store-${{ matrix.site.id }}-${{ hashFiles('agent-q/src/**/*.py', 'agent-q/Pipfile') }}
+
+          restore-keys: |
+            agent-q-code-store-${{ matrix.site.id }}-
+            agent-q-code-store-
+
+
+      # ========================================================
+      # DÉPENDANCES AGENT Q
+      #
+      # Versions provenant du Pipfile du repository Agent Q.
+      # ========================================================
+      - name: Installer les dépendances Agent Q
+        working-directory: agent-q
         run: |
-          set -e
+          set -euo pipefail
 
-          echo "=== ffmpeg ==="
-          if ! command -v ffmpeg >/dev/null 2>&1; then
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq ffmpeg
-          fi
-          ffmpeg -version 2>/dev/null | head -1
+          python -m pip install --upgrade pip setuptools wheel
 
-          echo "=== symlink chromium ==="
-          if ! command -v chromium >/dev/null 2>&1 && command -v google-chrome >/dev/null 2>&1; then
-            sudo ln -sf "$(command -v google-chrome)" /usr/local/bin/chromium
-          fi
-          command -v chromium && chromium --version
+          pip install \
+            "pytest==6.2.5" \
+            "python-dotenv==1.0.1" \
+            "smolagents==1.2.2" \
+            "litellm==1.57.8" \
+            "playwright==1.49.1" \
+            "html-sanitizer==2.5.0" \
+            "beautifulsoup4==4.12.3" \
+            "requests==2.32.3" \
+            "torch==2.5.1" \
+            "ollama==0.4.7"
 
-          echo "=== agent-browser global ==="
-          npm install -g agent-browser || echo "⚠️ npm install failed"
-          which agent-browser && agent-browser --version || true
+          echo
+          echo "✅ Dépendances Agent Q installées"
 
-          echo "=== Playwright deps ==="
-          sudo npx playwright install-deps chromium || echo "⚠️ playwright install-deps failed"
-          npx playwright install chromium || echo "⚠️ playwright install chromium failed"
 
-          echo "=== Xvfb + gestionnaire de fenêtres ==="
-          sudo apt-get install -y -qq matchbox-window-manager || echo "⚠️ matchbox non installé"
-          which Xvfb && echo "✅ Xvfb présent" || echo "❌ Xvfb absent"
-
-      - name: Démarrer Xvfb + WM + Configurer Hermes
-        env:
-          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
-          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-          HF_API_KEY: ${{ secrets.HF_API_KEY }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-          DISPLAY: ":99"
-          AGENT_BROWSER_HEADED: "1"
-          AGENT_BROWSER_ARGS: |
-            --no-sandbox
-            --disable-dev-shm-usage
-            --disable-blink-features=AutomationControlled
-            --start-maximized
-            --no-first-run
-            --no-default-browser-check
+      # ========================================================
+      # PLAYWRIGHT + CHROMIUM
+      # ========================================================
+      - name: Installer Chromium Playwright
+        working-directory: agent-q
         run: |
-          mkdir -p ~/.hermes
-          mkdir -p ~/.hermes/browser_recordings
+          set -euo pipefail
 
-          unset BROWSERBASE_API_KEY || true
-          unset BROWSER_USE_API_KEY || true
+          python -m playwright install --with-deps chromium
 
-          echo "=== Démarrage de Xvfb ==="
-          Xvfb :99 -screen 0 1280x800x24 -ac +extension GLX +render -noreset > /tmp/xvfb.log 2>&1 &
-          XVFB_PID=$!
-          sleep 2
-          if kill -0 $XVFB_PID 2>/dev/null; then
-            echo "✅ Xvfb actif sur DISPLAY=:99"
-            echo "XVFB_PID=$XVFB_PID" >> $GITHUB_ENV
-          else
-            echo "❌ Xvfb n'a pas démarré"
-            cat /tmp/xvfb.log
-            exit 1
-          fi
+          echo "======================================"
+          echo "🌐 PLAYWRIGHT"
+          echo "======================================"
 
-          echo "=== Démarrage du gestionnaire de fenêtres ==="
-          DISPLAY=:99 matchbox-window-manager > /tmp/wm.log 2>&1 &
-          sleep 1
-          echo "✅ matchbox-window-manager lancé"
+          python -m playwright --version
 
-          cat > ~/.hermes/.env << EOF
-          MISTRAL_API_KEY=${MISTRAL_API_KEY}
-          GOOGLE_API_KEY=${GOOGLE_API_KEY}
-          HF_TOKEN=${HF_API_KEY}
-          OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
-          NVIDIA_API_KEY=${NVIDIA_API_KEY}
-          DISPLAY=:99
-          AGENT_BROWSER_HEADED=1
-          EOF
 
-          cat > ~/.hermes/config.yaml << 'EOF'
-          browser:
-            enabled: true
-            cloud_provider: local
-            record_sessions: true
-            engine: chrome
-            headed: true
-            inactivity_timeout: 300
-            command_timeout: 30
+      # ========================================================
+      # RÉPERTOIRES
+      # ========================================================
+      - name: Préparer les répertoires
+        run: |
+          set -euo pipefail
 
-          toolsets:
-            - browser
-            - terminal
-            - web_search
-            - web_extract
+          mkdir -p \
+            recordings \
+            traces \
+            screenshots \
+            agent-output
 
-          display:
-            tool_progress: "off"
+          echo "✅ Répertoires prêts"
 
-          sessions:
-            auto_prune: false
 
-          model:
-            provider: openrouter
-            default: openrouter/free
-
-          custom_providers:
-            - name: mistral
-              base_url: https://api.mistral.ai/v1
-              key_env: MISTRAL_API_KEY
-          EOF
-
-          echo "=== hermes doctor --fix ==="
-          hermes doctor --fix || true
-
-      - name: Générer la tâche
+      # ========================================================
+      # GÉNÉRER LE RUNNER AGENT Q
+      # ========================================================
+      - name: Générer le runner Agent Q
         env:
           PAGES_JSON: ${{ toJson(matrix.site.pages) }}
-          SITE_URL: ${{ matrix.site.url }}
+
         run: |
-          PAGES_LIST=$(echo "$PAGES_JSON" | jq -c . | jq -r '[.[]? | .url] | join("\n")')
 
-          cat > task.md << EOF
-          Va sur $SITE_URL avec l'outil de navigateur. Explore comme un
-          humain (scroll, structure) et détecte le type de site.
+          cat > run_agent_q.py <<'PYTHON'
+          import json
+          import os
+          import sys
+          from pathlib import Path
 
-          GESTION DES ONGLETS (IMPORTANT POUR LA VIDÉO) :
-          - Reste dans UN SEUL onglet autant que possible : utilise la
-            navigation dans l'onglet courant plutôt que d'ouvrir de nouveaux
-            onglets.
-          - Si un clic ouvre un nouvel onglet, ferme l'onglet précédent.
-          - Ignore et ferme tout onglet "Loading..." ou affichant une URL
-            du type "0.0.3.32" qui ne charge jamais.
+          from playwright.sync_api import sync_playwright
+          from smolagents import LiteLLMModel
 
-          VÉRIFICATION CRITIQUE avant tout le reste : le contenu affiché
-          correspond-il vraiment au site attendu, ou est-ce une page par
-          défaut d'hébergeur/registrar (ex: "o2switch", "It works!", page de
-          parking de domaine, message DNS/SSL non configuré) ? Si le frontend
-          affiche des sections censées recevoir des données du backend
-          (liste de produits, résultats, profil, prix, etc.) mais qu'elles
-          restent vides, bloquées en chargement, ou affichent une erreur/
-          "undefined"/"null" à la place des vraies données, c'est un backend
-          en panne : DOWN, même si la page HTTP répond 200.
+          # =====================================================
+          # IMPORT AGENT Q
+          # =====================================================
 
-          PAGES À VÉRIFIER OBLIGATOIREMENT :
-          $PAGES_LIST
+          AGENT_Q_ROOT = Path("agent-q").resolve()
 
-          Choisis 2-3 actions à tester selon le type détecté :
-          - E-commerce : ajoute un produit au panier, VÉRIFIE qu'il apparaît
-            bien dans le panier (nom/qté/prix) — ces données viennent du
-            backend, vérifie qu'elles sont réelles et pas un état vide/figé.
-          - Compte utilisateur : inscris-toi avec des données fictives
-            (test+ci-<horodatage>@example.com), puis connecte-toi avec ces
-            identifiants. Si compte existant seulement, teste juste qu'un
-            login invalide donne une erreur propre (pas de vraie connexion).
-          - Formulaire de contact : soumets-le en indiquant "TEST AUTOMATISÉ"
-            dans le message.
-          - Recherche : vérifie que des résultats s'affichent réellement.
-          - Sinon : les 2-3 actions les plus représentatives du site.
+          if str(AGENT_Q_ROOT) not in sys.path:
+              sys.path.insert(0, str(AGENT_Q_ROOT))
 
-          IMPORTANT — CHAQUE page listée doit être RÉELLEMENT VISITÉE
-          INDIVIDUELLEMENT, et chaque action choisie RÉELLEMENT EXÉCUTÉE
-          (cliquée/soumise), pas seulement observée depuis une autre page.
-          "Le panier a une structure" n'est PAS un test — le test est "j'ai
-          cliqué ajouter, PUIS j'ai vérifié que le produit apparaît". Si deux
-          pages différentes ont exactement la même note, c'est suspect : tu
-          ne les as probablement pas visitées séparément. Si tu ne peux pas
-          exécuter une action ou visiter une page, dis-le explicitement dans
-          "note" ET mets actions_completed à false — ne mets JAMAIS
-          actions_completed à true juste parce qu'une page a chargé.
+          from src.agent.web_agent.web_agent import WebAgent
 
-          RAPPEL STRICT : tu DOIS effectuer au moins une action interactive
-          réelle (clic + vérification du résultat) avant de conclure quoi
-          que ce soit sur le statut du site. Si tu termines sans avoir cliqué
-          "ajouter au panier" (ou l'équivalent pour le type de site détecté :
-          inscription/connexion, soumission de formulaire, recherche) ET
-          vérifié le résultat obtenu, mets actions_completed: false et
-          explique précisément pourquoi dans "note". Ne conclus JAMAIS "UP"
-          sur la seule base d'un chargement de page sans action exécutée.
 
-          Pour chaque page listée, vérifie au minimum qu'elle répond correctement
-          (HTTP 200, contenu attendu). Explore aussi les liens internes pour
-          détecter d'éventuelles pages non listées et signale-les dans le JSON
-          final. Toute nouvelle URL atteinte = une page distincte à noter.
+          # =====================================================
+          # CONFIGURATION
+          # =====================================================
 
-          Termine par ton verdict en langage naturel (type de site + parcours
-          testés, en précisant si le contenu venait bien du backend ou si
-          c'était un placeholder/backend en panne), puis ce bloc JSON exact
-          en toute fin (rien d'autre dedans) :
+          SITE_URL = os.environ["SITE_URL"]
+          SITE_ID = os.environ["SITE_ID"]
 
-          \`\`\`json
-          {
+          MODEL_ID = os.environ.get(
+              "AGENT_Q_MODEL",
+              "openrouter/thinkingmachines/inkling:free"
+          )
+
+          OPENROUTER_API_KEY = os.environ.get(
+              "OPENROUTER_API_KEY"
+          )
+
+          if not OPENROUTER_API_KEY:
+              raise RuntimeError(
+                  "OPENROUTER_API_KEY absent des secrets GitHub."
+              )
+
+
+          # =====================================================
+          # PAGES CONNUES
+          # =====================================================
+
+          try:
+              pages = json.loads(
+                  os.environ.get("PAGES_JSON", "[]")
+              )
+          except Exception:
+              pages = []
+
+          pages_list = "\n".join(
+              f"- {page.get('url')}"
+              for page in pages
+              if page.get("url")
+          )
+
+
+          # =====================================================
+          # TÂCHE AGENT Q
+          # =====================================================
+
+          task = f"""
+          TU ES L'AGENT D'EXÉCUTION E2E DE SENTINELSITE.
+
+          SITE :
+          {SITE_URL}
+
+          SITE_ID :
+          {SITE_ID}
+
+          PAGES CONNUES :
+          {pages_list}
+
+          ======================================================
+          OBJECTIF
+          ======================================================
+
+          Tester réellement le fonctionnement du site comme un
+          utilisateur humain.
+
+          Tu dois utiliser le navigateur.
+
+          Tu ne dois pas seulement analyser le HTML ou expliquer
+          ce qu'il faudrait faire.
+
+          Tu dois réellement effectuer les actions.
+
+          ======================================================
+          ÉTAPE 1 — SITE
+          ======================================================
+
+          Ouvre d'abord :
+
+          {SITE_URL}
+
+          Vérifie que la page correspond réellement au site attendu.
+
+          Attention aux :
+          - pages de parking ;
+          - pages d'hébergement ;
+          - "It works!" ;
+          - erreurs DNS ;
+          - erreurs SSL ;
+          - placeholders ;
+          - pages totalement vides.
+
+          ======================================================
+          ÉTAPE 2 — TYPE DE SITE
+          ======================================================
+
+          Détermine :
+
+          ecommerce
+          auth
+          vitrine
+          blog
+          autre
+
+          ======================================================
+          ÉTAPE 3 — PAGES
+          ======================================================
+
+          Les pages suivantes sont connues :
+
+          {pages_list}
+
+          Visite réellement les pages pertinentes.
+
+          Ne prétends jamais avoir visité une page simplement parce
+          que son URL était fournie.
+
+          ======================================================
+          ÉTAPE 4 — ACTION INTERACTIVE
+          ======================================================
+
+          Tu dois effectuer AU MOINS UNE vraie action interactive.
+
+          E-COMMERCE :
+
+          - trouver un vrai produit ;
+          - ouvrir sa fiche ;
+          - cliquer réellement sur Ajouter au panier / Add to cart
+            ou équivalent ;
+          - ouvrir le panier ;
+          - vérifier le résultat réel ;
+          - vérifier nom, quantité et prix.
+
+          AUTH :
+
+          - ouvrir réellement la page d'authentification ;
+          - effectuer une action pertinente ;
+          - ne jamais utiliser de vrai compte ;
+          - utiliser des données fictives ;
+          - observer réellement la réponse.
+
+          RECHERCHE :
+
+          - effectuer réellement une recherche ;
+          - observer réellement les résultats.
+
+          FORMULAIRE :
+
+          - remplir réellement le formulaire ;
+          - utiliser "TEST AUTOMATISÉ" lorsqu'un message est approprié ;
+          - soumettre réellement ;
+          - observer le résultat.
+
+          ======================================================
+          IMPORTANT
+          ======================================================
+
+          Un bouton présent n'est PAS la preuve que la fonction marche.
+
+          Exemple :
+
+          FAUX :
+          "Le bouton Ajouter au panier existe donc le panier marche."
+
+          CORRECT :
+          "J'ai cliqué sur Ajouter au panier, puis ouvert le panier
+          et constaté que le produit X apparaît avec quantité Y
+          et prix Z."
+
+          ======================================================
+          DONNÉES BACKEND
+          ======================================================
+
+          Si la page possède des données dynamiques attendues
+          et qu'elles sont :
+          - vides ;
+          - undefined ;
+          - null ;
+          - bloquées ;
+          - absentes ;
+
+          considère cela comme une anomalie fonctionnelle,
+          même si HTTP = 200.
+
+          ======================================================
+          RÉSULTAT
+          ======================================================
+
+          À la fin, produis un résultat JSON suivant exactement
+          cette structure :
+
+          {{
             "overall_status": "UP",
             "site_type": "ecommerce",
             "actions_completed": true,
             "pages": [
-              {
+              {{
                 "url": "URL exacte",
                 "status": "UP",
                 "http_code": 200,
-                "action_tested": "action testée ou null",
-                "note": "explication en une sentence"
-              }
+                "action_tested": "description de l'action",
+                "note": "résultat réel observé"
+              }}
             ]
-          }
-          \`\`\`
-          Règles : status/overall_status = "UP" ou "DOWN" uniquement.
-          site_type = ecommerce|auth|vitrine|blog|autre. actions_completed =
-          true UNIQUEMENT si tu as réellement exécuté chaque action choisie ET
-          observé son résultat ; false si tu as seulement navigué sans
-          compléter les étapes interactives. Une entrée par page visitée
-          (départ + chaque URL distincte, y compris erreurs/404). Un parcours
-          métier qui échoue (panier vide après ajout, recherche sans résultat,
-          form qui ne soumet rien) = DOWN même si HTTP 200. Une page par
-          défaut d'hébergeur ou des données backend manquantes/vides alors
-          qu'elles sont attendues = DOWN même si HTTP 200.
-          EOF
+          }}
 
-      - name: Lancer Hermes Agent avec capture vidéo
-        id: agent_run
+          Règles :
+
+          overall_status :
+            uniquement UP ou DOWN
+
+          status :
+            uniquement UP ou DOWN
+
+          actions_completed :
+            true uniquement si les actions exécutées ont réellement
+            été effectuées et vérifiées.
+
+          Une action métier qui échoue signifie DOWN.
+
+          Une page HTTP 200 avec un backend inutilisable peut également
+          être DOWN.
+
+          Ne jamais inventer une action qui n'a pas été exécutée.
+          """
+
+
+          # =====================================================
+          # INITIALISER MODÈLE
+          # =====================================================
+
+          print("======================================")
+          print("🤖 AGENT Q")
+          print("======================================")
+          print(f"Site   : {SITE_URL}")
+          print(f"Model  : {MODEL_ID}")
+          print()
+
+
+          model = LiteLLMModel(
+              model_id=MODEL_ID,
+              api_key=OPENROUTER_API_KEY,
+          )
+
+
+          # =====================================================
+          # PLAYWRIGHT
+          # =====================================================
+
+          with sync_playwright() as playwright:
+
+              browser = playwright.chromium.launch(
+                  headless=True,
+                  args=[
+                      "--no-sandbox",
+                      "--disable-dev-shm-usage",
+                      "--disable-blink-features=AutomationControlled",
+                      "--no-first-run",
+                      "--no-default-browser-check",
+                  ],
+              )
+
+              context = browser.new_context(
+                  viewport={
+                      "width": 1280,
+                      "height": 800,
+                  },
+
+                  locale="fr-FR",
+
+                  timezone_id="Africa/Porto-Novo",
+
+                  user_agent=(
+                      "Mozilla/5.0 "
+                      "(X11; Linux x86_64) "
+                      "AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) "
+                      "Chrome/131.0.0.0 "
+                      "Safari/537.36"
+                  ),
+
+                  # ============================================
+                  # VIDÉO PLAYWRIGHT
+                  # ============================================
+
+                  record_video={
+                      "dir": str(
+                          Path("recordings").resolve()
+                      ),
+                      "size": {
+                          "width": 1280,
+                          "height": 800,
+                      },
+                  },
+              )
+
+
+              # ================================================
+              # TRACE PLAYWRIGHT
+              # ================================================
+
+              context.tracing.start(
+                  screenshots=True,
+                  snapshots=True,
+                  sources=True,
+                )
+
+
+              page = context.new_page()
+
+
+              try:
+
+                  # ==========================================
+                  # PAGE INITIALE
+                  # ==========================================
+
+                  print("🌐 Ouverture du site...")
+
+                  page.goto(
+                      SITE_URL,
+                      wait_until="domcontentloaded",
+                      timeout=30000,
+                  )
+
+                  print(
+                      "✅ Page initiale chargée :",
+                      page.url
+                  )
+
+
+                  # ==========================================
+                  # AGENT Q
+                  # ==========================================
+
+                  agent = WebAgent(
+                      page,
+                      model
+                  )
+
+                  agent.init_agent()
+
+
+                  # ==========================================
+                  # PREMIÈRE EXÉCUTION
+                  # ==========================================
+
+                  print()
+                  print(
+                      "🤖 Exécution Agent Q..."
+                  )
+
+                  result = agent.do(task)
+
+
+                  # ==========================================
+                  # RÉSULTAT
+                  # ==========================================
+
+                  print()
+                  print(
+                      "✅ Agent Q a terminé."
+                  )
+
+                  print(
+                      "Résultat :"
+                  )
+
+                  print(result)
+
+
+                  # ==========================================
+                  # SAUVEGARDE
+                  # ==========================================
+
+                  output = {
+                      "site_id": SITE_ID,
+                      "site_url": SITE_URL,
+                      "model": MODEL_ID,
+                      "result": result,
+                  }
+
+                  Path(
+                      "agent-output/raw-result.json"
+                  ).write_text(
+                      json.dumps(
+                          output,
+                          ensure_ascii=False,
+                          indent=2,
+                          default=str,
+                      ),
+                      encoding="utf-8",
+                  )
+
+
+              except Exception as error:
+
+                  print()
+                  print(
+                      "❌ Agent Q a échoué :"
+                  )
+
+                  print(
+                      repr(error)
+                  )
+
+                  # ==========================================
+                  # DEUXIÈME ESSAI :
+                  # uniquement une régénération du même modèle.
+                  #
+                  # Ce n'est PAS un fallback de modèle.
+                  # ==========================================
+
+                  print()
+                  print(
+                      "🔄 Tentative de régénération Agent Q "
+                      "avec le même modèle..."
+                  )
+
+                  try:
+
+                      result = agent.do(
+                          task,
+                          force_regenerate=True,
+                      )
+
+                      print(
+                          "✅ Régénération réussie."
+                      )
+
+                      output = {
+                          "site_id": SITE_ID,
+                          "site_url": SITE_URL,
+                          "model": MODEL_ID,
+                          "result": result,
+                          "regenerated": True,
+                      }
+
+                      Path(
+                          "agent-output/raw-result.json"
+                      ).write_text(
+                          json.dumps(
+                              output,
+                              ensure_ascii=False,
+                              indent=2,
+                              default=str,
+                          ),
+                          encoding="utf-8",
+                      )
+
+                  except Exception as regeneration_error:
+
+                      print(
+                          "❌ Échec de la régénération."
+                      )
+
+                      print(
+                          repr(regeneration_error)
+                      )
+
+                      output = {
+                          "site_id": SITE_ID,
+                          "site_url": SITE_URL,
+                          "model": MODEL_ID,
+                          "error": str(regeneration_error),
+                      }
+
+                      Path(
+                          "agent-output/raw-result.json"
+                      ).write_text(
+                          json.dumps(
+                              output,
+                              ensure_ascii=False,
+                              indent=2,
+                          ),
+                          encoding="utf-8",
+                      )
+
+                      raise
+
+
+              finally:
+
+                  # ==========================================
+                  # ARRÊTER TRACE
+                  # ==========================================
+
+                  try:
+
+                      context.tracing.stop(
+                          path=str(
+                              Path("traces")
+                              / f"trace-{SITE_ID}.zip"
+                          )
+                      )
+
+                  except Exception as error:
+
+                      print(
+                          "⚠️ Impossible de sauvegarder la trace :",
+                          error
+                      )
+
+                  # ==========================================
+                  # FERMER CONTEXT
+                  #
+                  # IMPORTANT :
+                  # Playwright finalise la vidéo à la fermeture
+                  # du BrowserContext.
+                  # ==========================================
+
+                  context.close()
+
+                  browser.close()
+
+
+          print()
+          print(
+              "🎥 Le contexte Playwright a été fermé."
+          )
+
+          print(
+              "La vidéo devrait maintenant être finalisée."
+          )
+          PYTHON
+
+
+      # ========================================================
+      # EXÉCUTER AGENT Q
+      # ========================================================
+      - name: Exécuter Agent Q
         env:
-          DISPLAY: ":99"
-          AGENT_BROWSER_HEADED: "1"
-          AGENT_BROWSER_ARGS: |
-            --no-sandbox
-            --disable-dev-shm-usage
-            --disable-blink-features=AutomationControlled
-            --start-maximized
-            --no-first-run
-            --no-default-browser-check
+          SITE_ID: ${{ matrix.site.id }}
+          SITE_URL: ${{ matrix.site.url }}
+          PAGES_JSON: ${{ toJson(matrix.site.pages) }}
+
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+
+          AGENT_Q_MODEL: "openrouter/thinkingmachines/inkling:free"
+
         run: |
-          set +e
+          set -euo pipefail
 
-          if ! pgrep -f "Xvfb :99" > /dev/null; then
-            echo "⚠️ Xvfb arrêté, redémarrage..."
-            Xvfb :99 -screen 0 1280x800x24 -ac +extension GLX +render -noreset > /tmp/xvfb.log 2>&1 &
-            sleep 2
-          fi
-          if ! pgrep -f matchbox-window-manager > /dev/null; then
-            DISPLAY=:99 matchbox-window-manager > /tmp/wm.log 2>&1 &
-            sleep 1
-          fi
+          python run_agent_q.py
 
-          TASK_CONTENT=$(cat task.md)
-          mkdir -p recordings
-          rm -f /tmp/best_partial.json
-          BEST_PARTIAL_LABEL=""
 
-          run_agent() {
-            local provider=$1
-            local model=$2
-            local label=$3
-            echo "======================================"
-            echo "Test avec $provider/$model pour ${{ matrix.site.url }}"
-            echo "======================================"
-
-            export DISPLAY=:99
-            RECORDING_PATH="recordings/${label}.mp4"
-
-            echo "🎥 Démarrage capture ffmpeg optimisée (léger) sur DISPLAY=:99..."
-            ffmpeg -y -f x11grab -video_size 1280x800 -framerate 10 \
-              -i :99.0 \
-              -c:v libx264 -crf 28 -preset fast -tune stillimage -pix_fmt yuv420p -an \
-              "$RECORDING_PATH" > /tmp/ffmpeg-${label}.log 2>&1 &
-            FFMPEG_PID=$!
-            sleep 1
-            if kill -0 $FFMPEG_PID 2>/dev/null; then
-              echo "✅ ffmpeg actif (PID $FFMPEG_PID)"
-            else
-              echo "❌ ffmpeg n'a pas démarré"
-              cat /tmp/ffmpeg-${label}.log | tail -10
-            fi
-
-            hermes -z "$TASK_CONTENT" --provider "$provider" -m "$model" -t "browser,terminal" --yolo > "output-${label}.json" 2>&1
-            HERMES_EXIT=$?
-
-            echo "🎥 Arrêt de ffmpeg..."
-            if kill -0 $FFMPEG_PID 2>/dev/null; then
-              kill -INT $FFMPEG_PID
-              wait $FFMPEG_PID 2>/dev/null || true
-              echo "✅ ffmpeg arrêté"
-            fi
-
-            agent-browser close --all 2>/dev/null || true
-
-            echo "exit_code=$HERMES_EXIT"
-
-            if ! grep -qiE '"overall_status"\s*:\s*"(up|down)"' "output-${label}.json" && grep -qiE 'bloc json|json (ci-dessus|généré|generated above)' "output-${label}.json"; then
-              echo "⚠️ ${label} : vérification terminée mais bloc JSON final tronqué — voir output-${label}.json"
-            fi
-
-            if [ -f "$RECORDING_PATH" ] && [ -s "$RECORDING_PATH" ]; then
-              FILE_SIZE=$(ls -lh "$RECORDING_PATH" | awk '{print $5}')
-              echo "✅ Vidéo enregistrée : $RECORDING_PATH ($FILE_SIZE)"
-            else
-              echo "❌ Fichier vidéo absent ou vide"
-              echo "=== Log ffmpeg ==="
-              cat /tmp/ffmpeg-${label}.log | tail -30
-              echo "=== Dernières lignes des logs Hermes ==="
-              tail -50 "output-${label}.json" || true
-            fi
-          }
-
-          is_json_valid() {
-            grep -qiE '"overall_status"\s*:\s*"(up|down)"' "$1"
-          }
-
-          is_fully_verified() {
-            is_json_valid "$1" && ! grep -qiE '"actions_completed"\s*:\s*false' "$1"
-          }
-
-          try_result() {
-            cp "$1" output.json
-            if is_fully_verified output.json; then
-              echo "✅ Succès complet avec ${2}"
-              echo "agent_failed=false" >> $GITHUB_OUTPUT
-              echo "winning_label=${2}" >> $GITHUB_OUTPUT
-              echo "verification_partial=false" >> $GITHUB_OUTPUT
-              exit 0
-            elif is_json_valid output.json; then
-              echo "⚠️ ${2} : JSON valide mais actions_completed=false — mis en réserve, on continue la chaîne"
-              cp output.json /tmp/best_partial.json
-              BEST_PARTIAL_LABEL="${2}"
-            fi
-          }
-
-          # ======================================
-          # 🥇 PRIORITÉ 1 : Mistral
-          # ======================================
-          echo "======================================"
-          echo "🥇 PRIORITÉ 1 : Mistral"
-          echo "======================================"
-          run_agent "custom:mistral" "mistral-small-latest" "mistral"
-          try_result "output-mistral.json" "mistral"
-
-          # ======================================
-          # 🥈 PRIORITÉ 2 : Chaîne OpenRouter (modèles gratuits)
-          # ======================================
-          echo "======================================"
-          echo "🥈 PRIORITÉ 2 : Chaîne OpenRouter"
-          echo "======================================"
-          for OR_MODEL in "poolside/laguna-s-2.1:free" "inclusionai/ling-3.0-flash-fin:free" "thinkingmachines/inkling:free" "openrouter/free"; do
-            label="openrouter-$(echo "$OR_MODEL" | tr '/:' '--')"
-            run_agent "openrouter" "$OR_MODEL" "$label"
-            try_result "output-${label}.json" "$label"
-          done
-
-          # ======================================
-          # 🥉 PRIORITÉ 3 : Fallback sur Gemini / HuggingFace
-          # ======================================
-          echo "======================================"
-          echo "🔁 PRIORITÉ 3 : Fallback sur Gemini / HuggingFace"
-          echo "======================================"
-          for PAIR in "gemini|gemini-3.1-pro-preview" "huggingface|openai/gpt-oss-120b:cerebras"; do
-            provider="${PAIR%%|*}"
-            model="${PAIR#*|}"
-            label="$(echo "${provider}-${model}" | tr '/:' '--')"
-            run_agent "$provider" "$model" "$label"
-            try_result "output-${label}.json" "$label"
-          done
-
-          # Aucun modèle n'a complété toutes les actions demandées : on utilise le meilleur essai partiel
-          if [ -f /tmp/best_partial.json ]; then
-            echo "⚠️ Aucun modèle n'a complété toutes les actions — utilisation du meilleur essai partiel (${BEST_PARTIAL_LABEL})"
-            cp /tmp/best_partial.json output.json
-            echo "agent_failed=false" >> $GITHUB_OUTPUT
-            echo "winning_label=${BEST_PARTIAL_LABEL}" >> $GITHUB_OUTPUT
-            echo "verification_partial=true" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          echo "❌ Échec final après tous les providers"
-          echo "agent_failed=true" >> $GITHUB_OUTPUT
-
-      - name: Extraire et envoyer le résultat
+      # ========================================================
+      # TRANSFORMER LE RÉSULTAT AGENT Q
+      # ========================================================
+      - name: Construire output.json
         if: always()
+        run: |
+
+          python - <<'PYTHON'
+
+          import json
+          import re
+          from pathlib import Path
+
+
+          raw_file = Path(
+              "agent-output/raw-result.json"
+          )
+
+          output_file = Path(
+              "output.json"
+          )
+
+
+          # ==================================================
+          # AUCUN RÉSULTAT
+          # ==================================================
+
+          if not raw_file.exists():
+
+              result = {
+                  "overall_status": "ERROR",
+                  "site_type": "autre",
+                  "actions_completed": False,
+                  "pages": [],
+                  "error": "Agent Q n'a produit aucun résultat."
+              }
+
+              output_file.write_text(
+                  json.dumps(
+                      result,
+                      ensure_ascii=False,
+                      indent=2,
+                  ),
+                  encoding="utf-8",
+              )
+
+              raise SystemExit(0)
+
+
+          data = json.loads(
+              raw_file.read_text(
+                  encoding="utf-8"
+              )
+          )
+
+
+          raw_result = data.get("result")
+
+
+          candidate = None
+
+
+          # ==================================================
+          # SI DICT DIRECT
+          # ==================================================
+
+          if isinstance(
+              raw_result,
+              dict
+          ):
+
+              if (
+                  "overall_status"
+                  in raw_result
+                  and
+                  "pages"
+                  in raw_result
+              ):
+
+                  candidate = raw_result
+
+
+          # ==================================================
+          # SI STRING
+          # ==================================================
+
+          elif isinstance(
+              raw_result,
+              str
+          ):
+
+              # JSON direct
+
+              try:
+
+                  parsed = json.loads(
+                      raw_result
+                  )
+
+                  if (
+                      isinstance(parsed, dict)
+                      and
+                      "overall_status"
+                      in parsed
+                      and
+                      "pages"
+                      in parsed
+                  ):
+
+                      candidate = parsed
+
+              except Exception:
+                  pass
+
+
+              # JSON dans un bloc Markdown
+
+              if candidate is None:
+
+                  match = re.search(
+                      r"```json\s*(\{.*?\})\s*```",
+                      raw_result,
+                      re.DOTALL | re.IGNORECASE,
+                  )
+
+                  if match:
+
+                      try:
+
+                          parsed = json.loads(
+                              match.group(1)
+                          )
+
+                          if isinstance(
+                              parsed,
+                              dict
+                          ):
+
+                              candidate = parsed
+
+                      except Exception:
+                          pass
+
+
+          # ==================================================
+          # SI JSON NON EXPLOITABLE
+          # ==================================================
+
+          if candidate is None:
+
+              candidate = {
+                  "overall_status": "ERROR",
+                  "site_type": "autre",
+                  "actions_completed": False,
+                  "pages": [],
+                  "error": (
+                      "Agent Q n'a pas produit le JSON "
+                      "attendu."
+                  ),
+              }
+
+
+          # ==================================================
+          # NORMALISATION
+          # ==================================================
+
+          candidate["overall_status"] = (
+              str(
+                  candidate.get(
+                      "overall_status",
+                      "ERROR"
+                  )
+              )
+              .upper()
+          )
+
+
+          if candidate["overall_status"] not in {
+              "UP",
+              "DOWN",
+              "ERROR",
+          }:
+
+              candidate["overall_status"] = "ERROR"
+
+
+          if not isinstance(
+              candidate.get("pages"),
+              list
+          ):
+
+              candidate["pages"] = []
+
+
+          candidate["actions_completed"] = bool(
+              candidate.get(
+                  "actions_completed",
+                  False
+              )
+          )
+
+
+          # ==================================================
+          # ÉCRIRE
+          # ==================================================
+
+          output_file.write_text(
+              json.dumps(
+                  candidate,
+                  ensure_ascii=False,
+                  indent=2,
+              ),
+              encoding="utf-8",
+          )
+
+
+          print(
+              "======================================"
+          )
+
+          print(
+              "📄 output.json"
+          )
+
+          print(
+              "======================================"
+          )
+
+          print(
+              json.dumps(
+                  candidate,
+                  ensure_ascii=False,
+                  indent=2,
+              )
+          )
+
+          PYTHON
+
+
+      # ========================================================
+      # AFFICHER LE RÉSULTAT
+      # ========================================================
+      - name: Afficher le résultat
+        if: always()
+        run: |
+
+          echo "======================================"
+          echo "📊 RÉSULTAT FINAL"
+          echo "======================================"
+
+          if [ -f output.json ]; then
+            jq . output.json
+          else
+            echo "❌ output.json absent"
+          fi
+
+
+      # ========================================================
+      # ENVOYER LES PAGES AU RELAY
+      # ========================================================
+      - name: Envoyer le rapport des pages
+        if: always()
+
         env:
           SITE_ID: ${{ matrix.site.id }}
           RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
           RELAY_URL: ${{ secrets.RELAY_URL }}
-          WINNING_LABEL: ${{ steps.agent_run.outputs.winning_label }}
-          VERIFICATION_PARTIAL: ${{ steps.agent_run.outputs.verification_partial }}
+
         run: |
-          if [ ! -f output.json ] || [ ! -s output.json ]; then
-            STATUS="ERROR"
-            REASON="Agent output missing or empty"
-            PAGES_JSON=""
-          elif [ "${{ steps.agent_run.outputs.agent_failed }}" == "true" ]; then
-            STATUS="ERROR"
-            REASON="Agent execution failed after all attempts"
-            PAGES_JSON=""
+
+          set +e
+
+          if [ ! -f output.json ]; then
+            echo "⚠️ output.json absent"
+            exit 0
+          fi
+
+
+          if jq -e '.pages' output.json >/dev/null 2>&1; then
+
+            jq -c \
+              '{pages: .pages}' \
+              output.json \
+              > pages_payload.json
+
+
+            echo "📤 Envoi du rapport pages..."
+
+            curl -sS \
+              --retry 3 \
+              --retry-delay 2 \
+              -X POST \
+              "$RELAY_URL/sites/$SITE_ID/pages-report" \
+              -H "x-relay-secret: $RELAY_SECRET" \
+              -H "Content-Type: application/json" \
+              -d @pages_payload.json
+
+            echo
+
           else
-            AGENT_TEXT=$(cat output.json)
-            PAGES_JSON=$(printf '%s' "$AGENT_TEXT" | awk '
-              /```json/ { capture=1; buf=""; next }
-              /```/ { if (capture) { last=buf; capture=0 } ; next }
-              capture { buf = buf $0 "\n" }
-              END { printf "%s", last }
-            ')
 
-            if echo "$PAGES_JSON" | jq -e '.overall_status and .pages' > /dev/null 2>&1; then
-              STATUS=$(echo "$PAGES_JSON" | jq -r '.overall_status // "UNKNOWN"' | tr '[:lower:]' '[:upper:]')
-              SITE_TYPE=$(echo "$PAGES_JSON" | jq -r '.site_type // "non détecté"')
-              PAGES_JSON=$(echo "$PAGES_JSON" | jq -c '.pages |= map(.status |= (if . then ascii_upcase else "UNKNOWN" end))')
-              REASON=$(echo "$PAGES_JSON" | jq -c '.pages')
-              echo "$PAGES_JSON" > pages.json
-              echo "🏷️ Type de site détecté : $SITE_TYPE"
-              echo "📄 $(echo "$PAGES_JSON" | jq '.pages | length') page(s) rapportée(s) :"
-              echo "$PAGES_JSON" | jq -r '.pages[] | "  - \(.url) → \(.status) (http=\(.http_code // "n/a")) : \(.action_tested // "navigation simple") — \(.note // "")"'
+            echo "⚠️ Aucun tableau pages."
 
-              MAX_DUP=$(echo "$PAGES_JSON" | jq '[.pages[].note] | group_by(.) | map(length) | max')
-              TOTAL_PAGES=$(echo "$PAGES_JSON" | jq '.pages | length')
-              if [ -n "$MAX_DUP" ] && [ -n "$TOTAL_PAGES" ] && [ "$TOTAL_PAGES" -gt 0 ] && [ "$MAX_DUP" -ge $(( (TOTAL_PAGES + 1) / 2 )) ]; then
-                echo "⚠️ ${MAX_DUP}/${TOTAL_PAGES} pages partagent une note identique — vérification probablement bâclée"
-                REASON="⚠️ VÉRIFICATION SUSPECTE (notes dupliquées, ${MAX_DUP}/${TOTAL_PAGES} pages identiques) — $REASON"
-              fi
-            else
-              echo "⚠️ Bloc JSON structuré introuvable, repli sur extraction texte"
-              if echo "$AGENT_TEXT" | grep -qi "up"; then
-                STATUS="UP"
-                REASON="Site appears operational (extracted from text)"
-              elif echo "$AGENT_TEXT" | grep -qi "down"; then
-                STATUS="DOWN"
-                REASON="Site appears down (extracted from text)"
-              else
-                STATUS="UNKNOWN"
-                REASON="No status indicator found in output"
-              fi
-              PAGES_JSON=""
-            fi
           fi
 
-          if [ "$VERIFICATION_PARTIAL" == "true" ]; then
-            REASON="⚠️ VÉRIFICATION PARTIELLE (aucun modèle n'a complété toutes les actions demandées) — $REASON"
+
+      # ========================================================
+      # ENVOYER LE STATUT GLOBAL
+      # ========================================================
+      - name: Envoyer le statut global
+        if: always()
+
+        env:
+          SITE_ID: ${{ matrix.site.id }}
+          RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
+          RELAY_URL: ${{ secrets.RELAY_URL }}
+
+        run: |
+
+          set +e
+
+          STATUS="ERROR"
+          MESSAGE="Agent Q execution error"
+
+
+          if [ -f output.json ]; then
+
+            STATUS=$(jq -r \
+              '.overall_status // "ERROR"' \
+              output.json \
+              | tr '[:lower:]' '[:upper:]'
+            )
+
+
+            MESSAGE=$(jq -c '
+              {
+                site_type: .site_type,
+                actions_completed: .actions_completed,
+                pages: .pages
+              }
+            ' output.json)
+
           fi
 
-          echo "Statut final: $STATUS"
-          echo "Message: $REASON"
 
-          if [ -n "$PAGES_JSON" ] && echo "$PAGES_JSON" | jq -e '.pages' > /dev/null 2>&1; then
-            echo "📤 Envoi du rapport pages à $RELAY_URL/sites/$SITE_ID/pages-report"
-            echo "$PAGES_JSON" | jq -c '{pages: .pages}' > pages_payload.json
-            curl -X POST "$RELAY_URL/sites/$SITE_ID/pages-report" -H "x-relay-secret: $RELAY_SECRET" -H "Content-Type: application/json" -d @pages_payload.json || echo "⚠️ Échec envoi pages-report"
-          fi
+          echo "======================================"
+          echo "📡 STATUT : $STATUS"
+          echo "======================================"
 
-          echo "📤 Envoi du statut global à $RELAY_URL/sites/$SITE_ID/mark-crawled"
-          jq -nc --arg status "$STATUS" --arg message "$REASON" '{status: $status, message: $message}' > status_payload.json
-          curl -X POST "$RELAY_URL/sites/$SITE_ID/mark-crawled" -H "x-relay-secret: $RELAY_SECRET" -H "Content-Type: application/json" -d @status_payload.json || echo "⚠️ Échec envoi mark-crawled"
+          echo "$MESSAGE"
 
-      - name: Lister toutes les vidéos enregistrées (Aucun filtrage)
+
+          jq -nc \
+            --arg status "$STATUS" \
+            --arg message "$MESSAGE" \
+            '{
+              status: $status,
+              message: $message
+            }' \
+            > status_payload.json
+
+
+          curl -sS \
+            --retry 3 \
+            --retry-delay 2 \
+            -X POST \
+            "$RELAY_URL/sites/$SITE_ID/mark-crawled" \
+            -H "x-relay-secret: $RELAY_SECRET" \
+            -H "Content-Type: application/json" \
+            -d @status_payload.json
+
+          echo
+
+
+      # ========================================================
+      # LISTER LES VIDÉOS
+      # ========================================================
+      - name: Lister les vidéos
         if: always()
         run: |
-          echo "=== Vidéos enregistrées (TOUTES conservées pour l'artefact) ==="
-          ls -lah recordings/ 2>/dev/null || echo "(aucune vidéo trouvée)"
 
-      - name: Uploader la vidéo (artifact)
+          echo "======================================"
+          echo "🎥 VIDÉOS PLAYWRIGHT"
+          echo "======================================"
+
+          find recordings \
+            -maxdepth 2 \
+            -type f \
+            -printf "%p - %s bytes\n" \
+            2>/dev/null \
+            || echo "Aucune vidéo."
+
+
+      # ========================================================
+      # LISTER LES TRACES
+      # ========================================================
+      - name: Lister les traces
         if: always()
+        run: |
+
+          echo "======================================"
+          echo "🧪 TRACES PLAYWRIGHT"
+          echo "======================================"
+
+          find traces \
+            -maxdepth 2 \
+            -type f \
+            -printf "%p - %s bytes\n" \
+            2>/dev/null \
+            || echo "Aucune trace."
+
+
+      # ========================================================
+      # UPLOAD ARTIFACTS
+      # ========================================================
+      - name: Uploader les artifacts Agent Q
+        if: always()
+
         uses: actions/upload-artifact@v4
+
         with:
-          name: hermes-recordings-${{ matrix.site.id }}
-          path: recordings/*
+          name: agent-q-recordings-${{ matrix.site.id }}
+
+          path: |
+            recordings/
+            traces/
+            screenshots/
+            agent-output/
+            output.json
+            run_agent_q.py
+
           if-no-files-found: ignore
+
           retention-days: 7
