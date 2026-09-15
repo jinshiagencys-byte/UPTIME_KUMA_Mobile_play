@@ -230,7 +230,7 @@ jobs:
     env:
 
       # ========================================================
-      # MODÈLE UNIQUE
+      # MODÈLE UNIQUE — PAS DE FALLBACK
       # ========================================================
       AGENT_Q_MODEL: "openrouter/thinkingmachines/inkling:free"
 
@@ -250,10 +250,6 @@ jobs:
 
       # ========================================================
       # PYTHON
-      #
-      # Pas de cache pip :
-      # le repo SentinelSite n'a pas de requirements.txt /
-      # pyproject.toml à la racine.
       # ========================================================
       - name: Installer Python 3.10
         uses: actions/setup-python@v5
@@ -282,12 +278,12 @@ jobs:
           git rev-parse HEAD
 
           echo
-          echo "Python :"
+          echo "Python système :"
           python --version
 
 
       # ========================================================
-      # CACHE CODE STORE AGENT Q
+      # CACHE CODE STORE
       # ========================================================
       - name: Restaurer le code store Agent Q
         uses: actions/cache@v4
@@ -303,21 +299,20 @@ jobs:
 
 
       # ========================================================
-      # INSTALLER PIPENV
+      # PIPENV
       # ========================================================
       - name: Installer Pipenv
         run: |
           set -euo pipefail
 
           python -m pip install --upgrade pip
-
           python -m pip install pipenv
 
           pipenv --version
 
 
       # ========================================================
-      # INSTALLER L'ENVIRONNEMENT EXACT D'AGENT Q
+      # ENVIRONNEMENT AGENT Q
       # ========================================================
       - name: Installer les dépendances Agent Q
         working-directory: agent-q
@@ -330,21 +325,11 @@ jobs:
 
           pipenv sync
 
-          echo
           echo "✅ Dépendances Agent Q installées"
 
 
       # ========================================================
-      # IMPORTANT :
-      # AGENT Q DEMANDE TORCH 2.5.1.
-      #
-      # Sur le runner GitHub sans GPU NVIDIA, la version PyPI
-      # peut charger les dépendances CUDA et provoquer :
-      #
-      # libcudart.so.12 not found
-      # libcublas.so.* not found
-      #
-      # On remplace donc uniquement torch par la build CPU.
+      # TORCH CPU
       # ========================================================
       - name: Remplacer Torch CUDA par Torch CPU
         working-directory: agent-q
@@ -355,42 +340,48 @@ jobs:
           echo "🧠 TORCH CPU"
           echo "======================================"
 
-          echo "Suppression de Torch installé par Pipenv..."
+          echo "Suppression du Torch existant..."
 
           pipenv run pip uninstall -y torch || true
 
-          echo
           echo "Installation de Torch CPU..."
 
           pipenv run pip install \
             --index-url https://download.pytorch.org/whl/cpu \
             "torch==2.5.1"
 
-          echo
           echo "✅ Torch CPU installé"
 
 
       # ========================================================
-      # VÉRIFICATION TORCH
+      # VÉRIFIER TORCH
       # ========================================================
-      - name: Vérifier Torch et smolagents
+      - name: Vérifier Torch
         working-directory: agent-q
         run: |
           set -euo pipefail
 
           echo "======================================"
-          echo "🔎 VÉRIFICATION TORCH"
+          echo "🔎 TORCH"
           echo "======================================"
 
           pipenv run python -c "
           import torch
-          print('✅ torch :', torch.__version__)
-          print('✅ CUDA disponible :', torch.cuda.is_available())
+          print('torch =', torch.__version__)
+          print('CUDA disponible =', torch.cuda.is_available())
           "
 
-          echo
+
+      # ========================================================
+      # VÉRIFIER SMOLAGENTS
+      # ========================================================
+      - name: Vérifier smolagents et LiteLLM
+        working-directory: agent-q
+        run: |
+          set -euo pipefail
+
           echo "======================================"
-          echo "🔎 VÉRIFICATION SMOLAGENTS"
+          echo "🔎 SMOLAGENTS"
           echo "======================================"
 
           pipenv run python -c "
@@ -400,7 +391,7 @@ jobs:
 
           echo
           echo "======================================"
-          echo "🔎 VÉRIFICATION LITELLM"
+          echo "🔎 LITELLM"
           echo "======================================"
 
           pipenv run python -c "
@@ -410,18 +401,16 @@ jobs:
 
 
       # ========================================================
-      # PLAYWRIGHT
+      # VÉRIFIER PLAYWRIGHT
       # ========================================================
-      - name: Vérifier Playwright Agent Q
+      - name: Vérifier Playwright
         working-directory: agent-q
         run: |
           set -euo pipefail
 
           echo "======================================"
-          echo "🌐 VÉRIFICATION PLAYWRIGHT"
+          echo "🌐 PLAYWRIGHT"
           echo "======================================"
-
-          pipenv run python --version
 
           pipenv run python -c "
           import playwright
@@ -443,7 +432,7 @@ jobs:
           set -euo pipefail
 
           echo "======================================"
-          echo "🌐 INSTALLATION CHROMIUM"
+          echo "🌐 CHROMIUM"
           echo "======================================"
 
           pipenv run playwright install --with-deps chromium
@@ -468,10 +457,9 @@ jobs:
 
 
       # ========================================================
-      # GÉNÉRER LE RUNNER AGENT Q
+      # GÉNÉRER RUNNER AGENT Q
       # ========================================================
       - name: Générer le runner Agent Q
-
         env:
           PAGES_JSON: ${{ toJson(matrix.site.pages) }}
 
@@ -554,10 +542,11 @@ jobs:
 
 
           # =====================================================
-          # PAGES CONNUES
+          # PAGES
           # =====================================================
 
           try:
+
               pages = json.loads(
                   os.environ.get(
                       "PAGES_JSON",
@@ -566,6 +555,7 @@ jobs:
               )
 
           except Exception:
+
               pages = []
 
 
@@ -577,7 +567,7 @@ jobs:
 
 
           # =====================================================
-          # TÂCHE
+          # TÂCHE AGENT Q
           # =====================================================
 
           task = f"""
@@ -599,12 +589,15 @@ jobs:
           Tester réellement le fonctionnement du site comme un
           utilisateur humain.
 
-          Utilise le navigateur et effectue réellement les actions.
+          Utilise le navigateur.
 
-          Ne te contente pas d'analyser le HTML.
+          Ne te contente pas d'analyser le HTML ou d'expliquer
+          ce qu'il faudrait faire.
+
+          Tu dois réellement effectuer les actions.
 
           ======================================================
-          PAGE PRINCIPALE
+          ÉTAPE 1 — SITE
           ======================================================
 
           Ouvre :
@@ -613,18 +606,18 @@ jobs:
 
           Vérifie que le contenu correspond réellement au site attendu.
 
-          Attention aux :
+          Attention notamment aux :
 
           - pages de parking ;
           - pages d'hébergement ;
-          - "It works!" ;
+          - pages "It works!" ;
           - erreurs DNS ;
           - erreurs SSL ;
           - placeholders ;
-          - pages vides.
+          - pages totalement vides.
 
           ======================================================
-          TYPE DE SITE
+          ÉTAPE 2 — TYPE DE SITE
           ======================================================
 
           Détermine :
@@ -636,7 +629,7 @@ jobs:
           autre
 
           ======================================================
-          PAGES
+          ÉTAPE 3 — PAGES
           ======================================================
 
           Les pages connues sont :
@@ -645,48 +638,67 @@ jobs:
 
           Visite réellement les pages pertinentes.
 
-          Ne prétends jamais avoir visité une page que tu n'as
+          Ne prétends jamais avoir visité une page si tu ne l'as
           pas réellement ouverte.
 
           ======================================================
-          ACTION INTERACTIVE
+          ÉTAPE 4 — ACTION INTERACTIVE
           ======================================================
 
-          Tu dois effectuer au moins une vraie action interactive.
+          Tu dois effectuer au moins UNE vraie action interactive.
 
           E-COMMERCE :
 
           - trouver un produit réel ;
-          - ouvrir la fiche ;
-          - cliquer réellement sur Ajouter au panier ;
-          - ouvrir le panier ;
-          - vérifier le produit ;
-          - vérifier quantité et prix.
+          - ouvrir sa fiche ;
+          - cliquer réellement sur Ajouter au panier / Add to cart
+            ou équivalent ;
+          - ouvrir réellement le panier ;
+          - vérifier le résultat ;
+          - vérifier nom, quantité et prix.
 
           AUTH :
 
-          - ouvrir réellement la page d'authentification ;
+          - ouvrir réellement l'authentification ;
           - effectuer une action pertinente ;
-          - utiliser uniquement des données fictives ;
+          - ne jamais utiliser un vrai compte ;
+          - utiliser des données fictives ;
           - observer réellement le résultat.
 
           RECHERCHE :
 
           - effectuer réellement une recherche ;
-          - vérifier les résultats.
+          - vérifier réellement les résultats.
 
           FORMULAIRE :
 
           - remplir réellement le formulaire ;
-          - utiliser "TEST AUTOMATISÉ" si pertinent ;
-          - soumettre ;
-          - vérifier le résultat.
+          - utiliser "TEST AUTOMATISÉ" lorsque pertinent ;
+          - soumettre réellement ;
+          - observer le résultat.
 
           ======================================================
-          DONNÉES DYNAMIQUES
+          RÈGLE CRITIQUE
           ======================================================
 
-          Si des données attendues sont :
+          La présence d'un bouton n'est PAS la preuve que
+          la fonctionnalité fonctionne.
+
+          Exemple incorrect :
+
+          "Le bouton Ajouter au panier existe donc le panier marche."
+
+          Exemple correct :
+
+          "J'ai cliqué sur Ajouter au panier, ouvert le panier,
+          et constaté que le produit apparaît avec son nom,
+          sa quantité et son prix."
+
+          ======================================================
+          DONNÉES BACKEND
+          ======================================================
+
+          Si des données dynamiques attendues sont :
 
           - vides ;
           - undefined ;
@@ -695,22 +707,7 @@ jobs:
           - absentes ;
 
           considère cela comme une anomalie fonctionnelle,
-          même avec HTTP 200.
-
-          ======================================================
-          RÈGLE CRITIQUE
-          ======================================================
-
-          Un bouton présent ne signifie PAS que la fonctionnalité
-          fonctionne.
-
-          Il faut :
-
-          action réelle
-          +
-          résultat réel
-          +
-          vérification.
+          même si HTTP = 200.
 
           ======================================================
           JSON FINAL
@@ -727,25 +724,28 @@ jobs:
                 "url": "URL exacte",
                 "status": "UP",
                 "http_code": 200,
-                "action_tested": "description",
+                "action_tested": "description de l'action",
                 "note": "résultat réellement observé"
               }}
             ]
           }}
 
           overall_status :
-          UP ou DOWN uniquement.
+            uniquement UP ou DOWN.
 
           status :
-          UP ou DOWN uniquement.
+            uniquement UP ou DOWN.
 
           actions_completed :
-          true uniquement si les actions ont été réellement exécutées
-          et vérifiées.
+            true uniquement si les actions ont réellement
+            été exécutées ET vérifiées.
 
-          Un échec métier réel = DOWN.
+          Une action métier qui échoue signifie DOWN.
 
-          Ne jamais inventer une action.
+          Une page HTTP 200 avec un backend inutilisable peut
+          également être DOWN.
+
+          Ne jamais inventer une action qui n'a pas été exécutée.
           """
 
 
@@ -757,8 +757,17 @@ jobs:
           print("🤖 AGENT Q")
           print("======================================")
 
-          print("Site :", SITE_URL)
-          print("Model :", MODEL_ID)
+          print(
+              "Site :",
+              SITE_URL
+          )
+
+          print(
+              "Model :",
+              MODEL_ID
+          )
+
+          print()
 
 
           model = LiteLLMModel(
@@ -774,9 +783,7 @@ jobs:
           with sync_playwright() as playwright:
 
               browser = playwright.chromium.launch(
-
                   headless=True,
-
                   args=[
                       "--no-sandbox",
                       "--disable-dev-shm-usage",
@@ -786,6 +793,17 @@ jobs:
                   ],
               )
 
+
+              # ==================================================
+              # CORRECTION IMPORTANTE
+              #
+              # Playwright Python utilise :
+              # record_video_dir
+              # record_video_size
+              #
+              # et NON :
+              # record_video={...}
+              # ==================================================
 
               context = browser.new_context(
 
@@ -807,20 +825,20 @@ jobs:
                       "Safari/537.36"
                   ),
 
-                  record_video={
-                      "dir": str(RECORDINGS_DIR),
+                  record_video_dir=str(
+                      RECORDINGS_DIR
+                  ),
 
-                      "size": {
-                          "width": 1280,
-                          "height": 800,
-                      },
+                  record_video_size={
+                      "width": 1280,
+                      "height": 800,
                   },
               )
 
 
-              # =================================================
-              # TRACE PLAYWRIGHT
-              # =================================================
+              # ==================================================
+              # TRACE
+              # ==================================================
 
               context.tracing.start(
                   screenshots=True,
@@ -835,7 +853,9 @@ jobs:
               try:
 
                   print()
-                  print("🌐 Ouverture du site...")
+                  print(
+                      "🌐 Ouverture du site..."
+                  )
 
 
                   page.goto(
@@ -864,17 +884,29 @@ jobs:
 
 
                   print()
-                  print("🤖 Exécution Agent Q...")
+                  print(
+                      "🤖 Exécution Agent Q..."
+                  )
 
 
-                  result = agent.do(task)
+                  result = agent.do(
+                      task
+                  )
 
 
                   print()
-                  print("✅ Agent Q terminé")
+                  print(
+                      "✅ Agent Q terminé"
+                  )
 
                   print()
-                  print(result)
+                  print(
+                      "Résultat :"
+                  )
+
+                  print(
+                      result
+                  )
 
 
                   output = {
@@ -965,7 +997,9 @@ jobs:
                       )
 
                       print(
-                          repr(regeneration_error)
+                          repr(
+                              regeneration_error
+                          )
                       )
 
 
@@ -1000,7 +1034,7 @@ jobs:
               finally:
 
                   # =================================================
-                  # ARRÊTER TRACE
+                  # ARRÊT TRACE
                   # =================================================
 
                   try:
@@ -1022,7 +1056,10 @@ jobs:
 
 
                   # =================================================
-                  # FERMER CONTEXTE
+                  # FERMETURE CONTEXT
+                  #
+                  # La fermeture du BrowserContext permet à
+                  # Playwright de finaliser la vidéo.
                   # =================================================
 
                   context.close()
@@ -1113,9 +1150,18 @@ jobs:
 
 
           echo
-          echo "Lancement du runner..."
-          echo
+          echo "Playwright sync API :"
 
+          pipenv run python -c "
+          from playwright.sync_api import sync_playwright
+          print('playwright.sync_api OK')
+          "
+
+
+          echo
+          echo "======================================"
+          echo "🚀 LANCEMENT DU RUNNER"
+          echo "======================================"
 
           pipenv run python ../run_agent_q.py
 
@@ -1154,6 +1200,7 @@ jobs:
                       "Agent Q n'a produit aucun résultat."
                   ),
               }
+
 
               output_file.write_text(
                   json.dumps(
@@ -1215,6 +1262,7 @@ jobs:
                       raw_result
                   )
 
+
                   if (
                       isinstance(
                           parsed,
@@ -1229,6 +1277,7 @@ jobs:
                   ):
 
                       candidate = parsed
+
 
               except Exception:
                   pass
@@ -1262,12 +1311,13 @@ jobs:
 
                               candidate = parsed
 
+
                       except Exception:
                           pass
 
 
           # ==================================================
-          # AUCUN JSON
+          # PAS DE JSON
           # ==================================================
 
           if candidate is None:
@@ -1338,7 +1388,6 @@ jobs:
 
 
           print()
-
           print(
               "======================================"
           )
@@ -1381,7 +1430,7 @@ jobs:
 
 
       # ========================================================
-      # ENVOYER PAGES REPORT
+      # ENVOYER PAGES-REPORT
       # ========================================================
       - name: Envoyer le rapport des pages
         if: always()
@@ -1454,18 +1503,14 @@ jobs:
           if [ -f output.json ]; then
 
             STATUS=$(
-
               jq -r \
                 '.overall_status // "ERROR"' \
                 output.json |
-
               tr '[:lower:]' '[:upper:]'
-
             )
 
 
             MESSAGE=$(
-
               jq -c '
                 {
                   site_type: .site_type,
@@ -1473,7 +1518,6 @@ jobs:
                   pages: .pages
                 }
               ' output.json
-
             )
 
           fi
@@ -1548,7 +1592,7 @@ jobs:
 
 
       # ========================================================
-      # ARTIFACTS
+      # UPLOAD ARTIFACTS
       # ========================================================
       - name: Uploader les artifacts Agent Q
         if: always()
@@ -1556,7 +1600,6 @@ jobs:
         uses: actions/upload-artifact@v4
 
         with:
-
           name: agent-q-monitoring-${{ matrix.site.id }}
 
           path: |
