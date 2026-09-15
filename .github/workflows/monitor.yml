@@ -1,16 +1,22 @@
-name: Hermes Agent - Monitoring Autonome Multi-Sites
+name: AutoSpec Agent - Monitoring Autonome Multi-Sites
 
 on:
   workflow_dispatch:
     inputs:
       site_id:
-        description: 'ID du site à tester spécifiquement (optionnel)'
+        description: "ID du site à tester spécifiquement (optionnel)"
         required: false
         type: string
   schedule:
     - cron: "0 */6 * * *"
 
+permissions:
+  contents: read
+
 jobs:
+  # ============================================================
+  # 1. RÉCUPÉRER LES SITES (identique aux workflows précédents)
+  # ============================================================
   fetch-sites:
     runs-on: ubuntu-latest
     outputs:
@@ -22,60 +28,58 @@ jobs:
           SITE_ID_INPUT: ${{ github.event.inputs.site_id }}
           RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
           RELAY_URL: ${{ secrets.RELAY_URL }}
+        shell: bash
         run: |
-          SITE_ID="$SITE_ID_INPUT"
+          set -euo pipefail
+          SITE_ID="${SITE_ID_INPUT:-}"
 
           if [ -n "$SITE_ID" ]; then
             echo "🔍 Test ciblé sur le site $SITE_ID"
-            DETAIL=$(curl -s -H "x-relay-secret: $RELAY_SECRET" "$RELAY_URL/monitors/$SITE_ID")
-
+            DETAIL=$(curl -fsS --retry 3 --retry-delay 2 -H "x-relay-secret: $RELAY_SECRET" "$RELAY_URL/monitors/$SITE_ID")
             MONITOR=$(echo "$DETAIL" | jq -c '.monitor | if .type == "http" then {id: .parent, url: .url, name: .parentName} else {id: .id, url: .url, name: .name} end')
 
-            if [ -z "$MONITOR" ] || [ "$MONITOR" == "null" ]; then
+            if [ -z "$MONITOR" ] || [ "$MONITOR" = "null" ]; then
               echo "❌ Site $SITE_ID introuvable ou erreur relay"
               echo "sites=[]" >> "$GITHUB_OUTPUT"
               exit 0
             fi
 
-            ALL_MONITORS=$(curl -s -H "x-relay-secret: $RELAY_SECRET" "$RELAY_URL/monitors")
-            PAGES=$(echo "$ALL_MONITORS" | jq -c --arg sid "$(echo "$MONITOR" | jq -r '.id')" '[.monitors[]? | select(.type == "http" and (.parent|tostring) == $sid) | {url: .url, name: .name}]')
-
+            ALL_MONITORS=$(curl -fsS --retry 3 --retry-delay 2 -H "x-relay-secret: $RELAY_SECRET" "$RELAY_URL/monitors")
+            PAGES=$(echo "$ALL_MONITORS" | jq -c --arg sid "$(echo "$MONITOR" | jq -r '.id')" '[.monitors[]? | select(.type == "http" and (.parent | tostring) == $sid) | {url: .url, name: .name}]')
             SITES=$(jq -cn --argjson mon "$MONITOR" --argjson pages "$PAGES" '[{id: $mon.id, url: $mon.url, name: $mon.name, pages: $pages}]')
           else
-            RAW=$(curl -s "$RELAY_URL/active-sites")
-            SITES_RAW=$(echo "$RAW" | jq -c '[.sites[]? | {id: .id, url: .site_url}]' 2>/dev/null || echo "")
-
-            if [ -z "$SITES_RAW" ] || [ "$SITES_RAW" == "null" ]; then
-              echo "⚠️ Réponse Supabase/relay illisible ou vide — aucun test ne sera lancé"
-              SITES_RAW="[]"
-            fi
-
-            if [ "$SITES_RAW" == "[]" ]; then
-              echo "ℹ️ Aucun site actif trouvé sur Supabase — aucun run de vérification ce cycle"
-            fi
+            echo "📡 Récupération de tous les sites actifs..."
+            RAW=$(curl -fsS --retry 3 --retry-delay 2 -H "x-relay-secret: $RELAY_SECRET" "$RELAY_URL/active-sites")
+            SITES_RAW=$(echo "$RAW" | jq -c '[.sites[]? | {id: .id, url: .site_url}]' 2>/dev/null || echo "[]")
+            [ -z "$SITES_RAW" ] || [ "$SITES_RAW" = "null" ] && SITES_RAW="[]"
 
             SITES_ARRAY="[]"
             while IFS= read -r site; do
               [ -z "$site" ] && continue
-              sid=$(echo "$site" | jq -r '.id')
-              all=$(curl -s -H "x-relay-secret: $RELAY_SECRET" "$RELAY_URL/monitors")
-              pages=$(echo "$all" | jq -c --arg sid "$sid" '[.monitors[]? | select(.type == "http" and (.parent|tostring) == $sid) | {url: .url, name: .name}]')
-              site_with_pages=$(echo "$site" | jq -c --argjson pages "$pages" '. + {pages: $pages}')
-              SITES_ARRAY=$(echo "$SITES_ARRAY" | jq -c --argjson site "$site_with_pages" '. + [$site]')
+              SID=$(echo "$site" | jq -r '.id')
+              ALL_MONITORS=$(curl -fsS --retry 3 --retry-delay 2 -H "x-relay-secret: $RELAY_SECRET" "$RELAY_URL/monitors")
+              PAGES=$(echo "$ALL_MONITORS" | jq -c --arg sid "$SID" '[.monitors[]? | select(.type == "http" and (.parent | tostring) == $sid) | {url: .url, name: .name}]')
+              SITE_WITH_PAGES=$(echo "$site" | jq -c --argjson pages "$PAGES" '. + {pages: $pages}')
+              SITES_ARRAY=$(echo "$SITES_ARRAY" | jq -c --argjson site "$SITE_WITH_PAGES" '. + [$site]')
             done <<< "$(echo "$SITES_RAW" | jq -c '.[]?')"
             SITES="$SITES_ARRAY"
           fi
 
           SITES=$(echo "$SITES" | jq -c .)
           echo "sites=$SITES" >> "$GITHUB_OUTPUT"
-          echo "📡 Sites à monitorer: $SITES"
+          echo "📡 Sites à monitorer :"
+          echo "$SITES" | jq .
 
-  hermes-test:
+  # ============================================================
+  # 2. AGENT AUTOSPEC
+  # ============================================================
+  autospec-test:
     needs: fetch-sites
     if: needs.fetch-sites.outputs.sites != '[]'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     concurrency:
-      group: hermes-check-${{ matrix.site.id }}
+      group: autospec-check-${{ matrix.site.id }}
       cancel-in-progress: false
     strategy:
       fail-fast: false
@@ -84,526 +88,257 @@ jobs:
         site: ${{ fromJson(needs.fetch-sites.outputs.sites) }}
 
     steps:
-      - name: Checkout du code
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Installer Hermes Agent
+      # autospecai requires Node >= 22
+      - name: Installer Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Installer autospecai + Playwright Chromium
         run: |
-          curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          source ~/.bashrc || true
-          hermes --version
+          set -euo pipefail
+          mkdir -p autospec-runner && cd autospec-runner
+          npm init -y --silent > /dev/null
+          npm install autospecai --silent
+          npx playwright install --with-deps chromium
 
-      - name: Dépendances système (ffmpeg + chromium + agent-browser + Playwright + Xvfb + WM)
+      # Le wrapper gère : specs par page connue, chaîne de fallback modèle
+      # (coût croissant), récupération HTTP code, et traduction vers le
+      # schéma JSON attendu par le relay SentinelSite.
+      - name: Générer le wrapper run-autospec.mjs
+        working-directory: autospec-runner
         run: |
-          set -e
+          cat > run-autospec.mjs <<'NODEJS'
+          // (voir /home/claude/run-autospec.mjs pour la version commentée en détail)
+          import { main as runAutospec } from "autospecai";
+          import fs from "fs";
 
-          echo "=== ffmpeg ==="
-          if ! command -v ffmpeg >/dev/null 2>&1; then
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq ffmpeg
-          fi
-          ffmpeg -version 2>/dev/null | head -1
+          const SITE_URL = process.env.SITE_URL;
+          const SITE_ID = process.env.SITE_ID;
 
-          echo "=== symlink chromium ==="
-          if ! command -v chromium >/dev/null 2>&1 && command -v google-chrome >/dev/null 2>&1; then
-            sudo ln -sf "$(command -v google-chrome)" /usr/local/bin/chromium
-          fi
-          command -v chromium && chromium --version
+          if (!SITE_URL || !SITE_ID) {
+            console.error("SITE_URL and SITE_ID are required.");
+            process.exit(1);
+          }
 
-          echo "=== agent-browser global ==="
-          npm install -g agent-browser || echo "⚠️ npm install failed"
-          which agent-browser && agent-browser --version || true
+          let pages = [];
+          try { pages = JSON.parse(process.env.PAGES_JSON || "[]"); } catch { pages = []; }
 
-          echo "=== Playwright deps ==="
-          sudo npx playwright install-deps chromium || echo "⚠️ playwright install-deps failed"
-          npx playwright install chromium || echo "⚠️ playwright install chromium failed"
+          const knownUrls = pages.map((p) => p.url).filter(Boolean);
+          if (!knownUrls.includes(SITE_URL)) {
+            pages = [{ url: SITE_URL, name: "Accueil" }, ...pages];
+          }
 
-          echo "=== Xvfb + gestionnaire de fenêtres ==="
-          sudo apt-get install -y -qq matchbox-window-manager || echo "⚠️ matchbox non installé"
-          which Xvfb && echo "✅ Xvfb présent" || echo "❌ Xvfb absent"
+          const MODEL_CHAIN = [
+            { model: "gemini-2.5-flash", apiKey: process.env.GOOGLE_API_KEY },
+            { model: "claude-opus-4-6", apiKey: process.env.ANTHROPIC_API_KEY },
+            { model: "gpt-5.4", apiKey: process.env.OPENAI_API_KEY },
+          ];
 
-      - name: Démarrer Xvfb + WM + Configurer Hermes
-        env:
-          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
-          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-          HF_API_KEY: ${{ secrets.HF_API_KEY }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-          DISPLAY: ":99"
-          AGENT_BROWSER_HEADED: "1"
-          AGENT_BROWSER_ARGS: |
-            --no-sandbox
-            --disable-dev-shm-usage
-            --disable-blink-features=AutomationControlled
-            --start-maximized
-            --no-first-run
-            --no-default-browser-check
-        run: |
-          mkdir -p ~/.hermes
-          mkdir -p ~/.hermes/browser_recordings
+          function isTemporaryError(err) {
+            const s = String(err).toLowerCase();
+            return /503|rate limit|429|too many requests|timeout|overloaded|internal server error|500|502|504/.test(s);
+          }
 
-          unset BROWSERBASE_API_KEY || true
-          unset BROWSER_USE_API_KEY || true
+          function buildSpec(pageUrl) {
+            return `Navigate to ${pageUrl}. ` +
+              `Check that the content genuinely matches the expected site, and is NOT ` +
+              `a hosting/registrar placeholder page, a domain parking page, a default ` +
+              `"It works!" page, or a DNS/SSL error page. ` +
+              `If the page has sections that should be filled with backend data ` +
+              `(product listings, search results, a user profile, prices, a cart, ` +
+              `etc.), verify that data actually appears — if those sections stay ` +
+              `empty, stuck loading, or show "undefined"/"null" placeholders, treat ` +
+              `this as a functional failure even if the page itself loaded. ` +
+              `If there is an obviously testable interactive element on this specific ` +
+              `page (add to cart, submit a contact form using "TEST AUTOMATISÉ" as the ` +
+              `message, run a search, or a signup/login using fake data such as ` +
+              `test+ci-${Date.now()}@example.com — never a real account), perform that ` +
+              `one action and verify its real result before concluding. ` +
+              `A button merely existing is not proof a feature works — you must click ` +
+              `it and observe the outcome. ` +
+              `Call mark_complete with your verdict once you've actually checked.`;
+          }
 
-          echo "=== Démarrage de Xvfb ==="
-          Xvfb :99 -screen 0 1280x800x24 -ac +extension GLX +render -noreset > /tmp/xvfb.log 2>&1 &
-          XVFB_PID=$!
-          sleep 2
-          if kill -0 $XVFB_PID 2>/dev/null; then
-            echo "✅ Xvfb actif sur DISPLAY=:99"
-            echo "XVFB_PID=$XVFB_PID" >> $GITHUB_ENV
-          else
-            echo "❌ Xvfb n'a pas démarré"
-            cat /tmp/xvfb.log
-            exit 1
-          fi
+          async function getHttpCode(url) {
+            try {
+              const res = await fetch(url, { method: "GET", redirect: "follow", signal: AbortSignal.timeout(15000) });
+              return res.status;
+            } catch { return null; }
+          }
 
-          echo "=== Démarrage du gestionnaire de fenêtres ==="
-          DISPLAY=:99 matchbox-window-manager > /tmp/wm.log 2>&1 &
-          sleep 1
-          echo "✅ matchbox-window-manager lancé"
-
-          cat > ~/.hermes/.env << EOF
-          MISTRAL_API_KEY=${MISTRAL_API_KEY}
-          GOOGLE_API_KEY=${GOOGLE_API_KEY}
-          HF_TOKEN=${HF_API_KEY}
-          OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
-          NVIDIA_API_KEY=${NVIDIA_API_KEY}
-          DISPLAY=:99
-          AGENT_BROWSER_HEADED=1
-          EOF
-
-          cat > ~/.hermes/config.yaml << 'EOF'
-          browser:
-            enabled: true
-            cloud_provider: local
-            record_sessions: true
-            engine: chrome
-            headed: true
-            inactivity_timeout: 300
-            command_timeout: 30
-
-          toolsets:
-            - browser
-            - terminal
-            - web_search
-            - web_extract
-
-          display:
-            tool_progress: "off"
-
-          sessions:
-            auto_prune: false
-
-          model:
-            provider: gemini
-            default: gemini-3.5-flash
-
-          custom_providers:
-            - name: gemini
-              base_url: https://generativelanguage.googleapis.com/v1beta/models
-              key_env: GOOGLE_API_KEY
-            - name: mistral
-              base_url: https://api.mistral.ai/v1
-              key_env: MISTRAL_API_KEY
-          EOF
-
-          echo "=== hermes doctor --fix ==="
-          hermes doctor --fix || true
-
-      - name: Générer la tâche
-        env:
-          PAGES_JSON: ${{ toJson(matrix.site.pages) }}
-          SITE_URL: ${{ matrix.site.url }}
-        run: |
-          PAGES_LIST=$(echo "$PAGES_JSON" | jq -c . | jq -r '[.[]? | .url] | join("\n")')
-
-          cat > task.md << EOF
-          Va sur $SITE_URL avec l'outil de navigateur. Explore comme un
-          humain (scroll, structure) et détecte le type de site.
-
-          GESTION DES ONGLETS (IMPORTANT POUR LA VIDÉO) :
-          - Reste dans UN SEUL onglet autant que possible : utilise la
-            navigation dans l'onglet courant plutôt que d'ouvrir de nouveaux
-            onglets.
-          - Si un clic ouvre un nouvel onglet, ferme l'onglet précédent.
-          - Ignore et ferme tout onglet "Loading..." ou affichant une URL
-            du type "0.0.3.32" qui ne charge jamais.
-
-          VÉRIFICATION CRITIQUE avant tout le reste : le contenu affiché
-          correspond-il vraiment au site attendu, ou est-ce une page par
-          défaut d'hébergeur/registrar (ex: "o2switch", "It works!", page de
-          parking de domaine, message DNS/SSL non configuré) ? Si le frontend
-          affiche des sections censées recevoir des données du backend
-          (liste de produits, résultats, profil, prix, etc.) mais qu'elles
-          restent vides, bloquées en chargement, ou affichent une erreur/
-          "undefined"/"null" à la place des vraies données, c'est un backend
-          en panne : DOWN, même si la page HTTP répond 200.
-
-          PAGES À VÉRIFIER OBLIGATOIREMENT :
-          $PAGES_LIST
-
-          Choisis 2-3 actions à tester selon le type détecté :
-          - E-commerce : ajoute un produit au panier, VÉRIFIE qu'il apparaît
-            bien dans le panier (nom/qté/prix) — ces données viennent du
-            backend, vérifie qu'elles sont réelles et pas un état vide/figé.
-          - Compte utilisateur : inscris-toi avec des données fictives
-            (test+ci-<horodatage>@example.com), puis connecte-toi avec ces
-            identifiants. Si compte existant seulement, teste juste qu'un
-            login invalide donne une erreur propre (pas de vraie connexion).
-          - Formulaire de contact : soumets-le en indiquant "TEST AUTOMATISÉ"
-            dans le message.
-          - Recherche : vérifie que des résultats s'affichent réellement.
-          - Sinon : les 2-3 actions les plus représentatives du site.
-
-          IMPORTANT — CHAQUE page listée doit être RÉELLEMENT VISITÉE
-          INDIVIDUELLEMENT, et chaque action choisie RÉELLEMENT EXÉCUTÉE
-          (cliquée/soumise), pas seulement observée depuis une autre page.
-          "Le panier a une structure" n'est PAS un test — le test est "j'ai
-          cliqué ajouter, PUIS j'ai vérifié que le produit apparaît". Si deux
-          pages différentes ont exactement la même note, c'est suspect : tu
-          ne les as probablement pas visitées séparément. Si tu ne peux pas
-          exécuter une action ou visiter une page, dis-le explicitement dans
-          "note" ET mets actions_completed à false — ne mets JAMAIS
-          actions_completed à true juste parce qu'une page a chargé.
-
-          RAPPEL STRICT : tu DOIS effectuer au moins une action interactive
-          réelle (clic + vérification du résultat) avant de conclure quoi
-          que ce soit sur le statut du site. Si tu termines sans avoir cliqué
-          "ajouter au panier" (ou l'équivalent pour le type de site détecté :
-          inscription/connexion, soumission de formulaire, recherche) ET
-          vérifié le résultat obtenu, mets actions_completed: false et
-          explique précisément pourquoi dans "note". Ne conclus JAMAIS "UP"
-          sur la seule base d'un chargement de page sans action exécutée.
-
-          Pour chaque page listée, vérifie au minimum qu'elle répond correctement
-          (HTTP 200, contenu attendu). Explore aussi les liens internes pour
-          détecter d'éventuelles pages non listées et signale-les dans le JSON
-          final. Toute nouvelle URL atteinte = une page distincte à noter.
-
-          Termine par ton verdict en langage naturel (type de site + parcours
-          testés, en précisant si le contenu venait bien du backend ou si
-          c'était un placeholder/backend en panne), puis ce bloc JSON exact
-          en toute fin (rien d'autre dedans) :
-
-          \`\`\`json
-          {
-            "overall_status": "UP",
-            "site_type": "ecommerce",
-            "actions_completed": true,
-            "pages": [
-              {
-                "url": "URL exacte",
-                "status": "UP",
-                "http_code": 200,
-                "action_tested": "action testée ou null",
-                "note": "explication en une sentence"
+          async function runAttempt({ model, apiKey }, specFilePath) {
+            console.log("======================================");
+            console.log(`🤖 TENTATIVE — MODÈLE : ${model}`);
+            console.log("======================================");
+            if (!apiKey) {
+              console.log(`⚠️ Pas de clé API pour ${model}, modèle sauté.`);
+              return { ok: false, temporary: false };
+            }
+            try {
+              const { testResults } = await runAutospec({
+                testUrl: SITE_URL,
+                modelName: model,
+                apiKey,
+                specFile: specFilePath,
+                trajectoriesPath: "./trajectories",
+                recordVideo: true,
+              });
+              if (!testResults || testResults.length === 0) {
+                console.log(`⚠️ ${model} n'a produit aucun résultat exploitable.`);
+                return { ok: false, temporary: false };
               }
-            ]
+              return { ok: true, testResults };
+            } catch (err) {
+              console.log(`❌ Échec avec ${model} : ${err}`);
+              return { ok: false, temporary: isTemporaryError(err) };
+            }
           }
-          \`\`\`
-          Règles : status/overall_status = "UP" ou "DOWN" uniquement.
-          site_type = ecommerce|auth|vitrine|blog|autre. actions_completed =
-          true UNIQUEMENT si tu as réellement exécuté chaque action choisie ET
-          observé son résultat ; false si tu as seulement navigué sans
-          compléter les étapes interactives. Une entrée par page visitée
-          (départ + chaque URL distincte, y compris erreurs/404). Un parcours
-          métier qui échoue (panier vide après ajout, recherche sans résultat,
-          form qui ne soumet rien) = DOWN même si HTTP 200. Une page par
-          défaut d'hébergeur ou des données backend manquantes/vides alors
-          qu'elles sont attendues = DOWN même si HTTP 200.
-          EOF
 
-      - name: Lancer Hermes Agent avec capture vidéo
-        id: agent_run
+          async function main() {
+            const specs = pages.map((p) => buildSpec(p.url));
+            const specFilePath = "./specs.json";
+            fs.writeFileSync(specFilePath, JSON.stringify(specs, null, 2), "utf-8");
+
+            console.log("Site :", SITE_URL);
+            console.log("Pages à vérifier :", pages.map((p) => p.url).join(", "));
+
+            let finalResults = null;
+            let winningModel = null;
+
+            for (const candidate of MODEL_CHAIN) {
+              const MAX_RETRIES = 2;
+              let attempt = { ok: false, temporary: false };
+              for (let i = 0; i <= MAX_RETRIES; i++) {
+                attempt = await runAttempt(candidate, specFilePath);
+                if (attempt.ok) break;
+                if (!attempt.temporary) break;
+                const delay = Math.min(30, 2 ** i * 2);
+                console.log(`⏳ Erreur temporaire, nouvel essai dans ${delay}s...`);
+                await new Promise((r) => setTimeout(r, delay * 1000));
+              }
+              if (attempt.ok) {
+                finalResults = attempt.testResults;
+                winningModel = candidate.model;
+                break;
+              }
+            }
+
+            const httpCodes = await Promise.all(pages.map((p) => getHttpCode(p.url)));
+
+            let pagesReport, overallStatus, actionsCompleted;
+
+            if (finalResults) {
+              pagesReport = pages.map((p, i) => {
+                const r = finalResults[i];
+                const status = r?.status === "passed" ? "UP" : "DOWN";
+                return {
+                  url: p.url,
+                  status,
+                  http_code: httpCodes[i],
+                  action_tested: r ? (r.actions?.map((a) => a.tool).join(" → ") || "navigation") : "non testé (résultat manquant)",
+                  note: r?.reason || (status === "UP" ? "OK" : "Voir vidéo/trace pour détail"),
+                };
+              });
+              overallStatus = pagesReport.some((p) => p.status === "DOWN") ? "DOWN" : "UP";
+              actionsCompleted = true;
+            } else {
+              pagesReport = pages.map((p, i) => ({
+                url: p.url,
+                status: httpCodes[i] && httpCodes[i] < 400 ? "UP" : "DOWN",
+                http_code: httpCodes[i],
+                action_tested: null,
+                note: "⚠️ Tous les modèles IA ont échoué — statut basé sur un simple code HTTP, aucune vérification fonctionnelle réelle.",
+              }));
+              overallStatus = pagesReport.some((p) => p.status === "DOWN") ? "DOWN" : "UP";
+              actionsCompleted = false;
+            }
+
+            const output = {
+              overall_status: overallStatus,
+              site_type: "non_detecte",
+              actions_completed: actionsCompleted,
+              model_used: winningModel,
+              pages: pagesReport,
+            };
+
+            fs.writeFileSync("../output.json", JSON.stringify(output, null, 2), "utf-8");
+            console.log("\n=== output.json ===");
+            console.log(JSON.stringify(output, null, 2));
+          }
+
+          main().catch((err) => {
+            console.error("Erreur fatale :", err);
+            fs.writeFileSync("../output.json", JSON.stringify({
+              overall_status: "ERROR",
+              site_type: "non_detecte",
+              actions_completed: false,
+              pages: [],
+              error: String(err),
+            }, null, 2), "utf-8");
+            process.exit(0);
+          });
+          NODEJS
+
+      - name: Exécuter AutoSpec
+        working-directory: autospec-runner
         env:
-          DISPLAY: ":99"
-          AGENT_BROWSER_HEADED: "1"
-          AGENT_BROWSER_ARGS: |
-            --no-sandbox
-            --disable-dev-shm-usage
-            --disable-blink-features=AutomationControlled
-            --start-maximized
-            --no-first-run
-            --no-default-browser-check
+          SITE_ID: ${{ matrix.site.id }}
+          SITE_URL: ${{ matrix.site.url }}
+          PAGES_JSON: ${{ toJson(matrix.site.pages) }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: node run-autospec.mjs
+
+      - name: Afficher le résultat
+        if: always()
         run: |
-          set +e
+          if [ -f output.json ]; then jq . output.json; else echo "❌ output.json absent"; fi
 
-          if ! pgrep -f "Xvfb :99" > /dev/null; then
-            echo "⚠️ Xvfb arrêté, redémarrage..."
-            Xvfb :99 -screen 0 1280x800x24 -ac +extension GLX +render -noreset > /tmp/xvfb.log 2>&1 &
-            sleep 2
-          fi
-          if ! pgrep -f matchbox-window-manager > /dev/null; then
-            DISPLAY=:99 matchbox-window-manager > /tmp/wm.log 2>&1 &
-            sleep 1
-          fi
-
-          TASK_CONTENT=$(cat task.md)
-          mkdir -p recordings
-          rm -f /tmp/best_partial.json
-          BEST_PARTIAL_LABEL=""
-          MAX_RETRIES=3
-          RETRY_DELAY_BASE=2
-          MIN_RETRY_DELAY=1
-          MAX_RETRY_DELAY=30
-
-          is_temporary_error() {
-            local error_msg="$1"
-            echo "$error_msg" | tr '[:upper:]' '[:lower:]' | grep -qE '503|serviceunavailableerror|high demand|spikes in demand|rate limit|429|too many requests|524|gateway timeout|connection reset|connection aborted|network error|service temporarily unavailable|internal server error|500'
-          }
-
-          is_quota_error() {
-            local error_msg="$1"
-            echo "$error_msg" | tr '[:upper:]' '[:lower:]' | grep -qE 'quota|limit exceeded|402|billing|payment required|403|permission denied|api key disabled'
-          }
-
-          run_with_retry() {
-            local provider=$1
-            local model=$2
-            local label=$3
-            local max_retries=${4:-$MAX_RETRIES}
-            local delay_base=${5:-$RETRY_DELAY_BASE}
-
-            for attempt in $(seq 0 $max_retries); do
-              echo "======================================"
-              echo "Test avec $provider/$model pour ${{ matrix.site.url }} (tentative $((attempt+1))/$((max_retries+1)))"
-              echo "======================================"
-
-              export DISPLAY=:99
-              RECORDING_PATH="recordings/${label}.mp4"
-
-              echo "🎥 Démarrage capture ffmpeg optimisée (léger) sur DISPLAY=:99..."
-              ffmpeg -y -f x11grab -video_size 1280x800 -framerate 10 \
-                -i :99.0 \
-                -c:v libx264 -crf 28 -preset fast -tune stillimage -pix_fmt yuv420p -an \
-                "$RECORDING_PATH" > /tmp/ffmpeg-${label}.log 2>&1 &
-              FFMPEG_PID=$!
-              sleep 1
-              if kill -0 $FFMPEG_PID 2>/dev/null; then
-                echo "✅ ffmpeg actif (PID $FFMPEG_PID)"
-              else
-                echo "❌ ffmpeg n'a pas démarré"
-                cat /tmp/ffmpeg-${label}.log | tail -10
-              fi
-
-              hermes -z "$TASK_CONTENT" --provider "$provider" -m "$model" -t "browser,terminal" --yolo > "output-${label}.json" 2>&1
-              HERMES_EXIT=$?
-
-              echo "🎥 Arrêt de ffmpeg..."
-              if kill -0 $FFMPEG_PID 2>/dev/null; then
-                kill -INT $FFMPEG_PID
-                wait $FFMPEG_PID 2>/dev/null || true
-                echo "✅ ffmpeg arrêté"
-              fi
-
-              agent-browser close --all 2>/dev/null || true
-
-              echo "exit_code=$HERMES_EXIT"
-
-              # Vérifier si le résultat est valide
-              if grep -qiE '"overall_status"\s*:\s*"(up|down)"' "output-${label}.json"; then
-                echo "✅ Résultat valide détecté"
-                return 0
-              fi
-
-              # Vérifier les erreurs temporaires
-              if [ $attempt -lt $max_retries ]; then
-                ERROR_MSG=$(cat "output-${label}.json" 2>/dev/null || echo "")
-                if is_temporary_error "$ERROR_MSG"; then
-                  delay=$(echo "scale=2; min($MAX_RETRY_DELAY, $delay_base * (2 ^ $attempt) + $RANDOM / 32767) * 1" | bc -l)
-                  delay=$(echo "scale=2; if ($delay < $MIN_RETRY_DELAY) $MIN_RETRY_DELAY else if ($delay > $MAX_RETRY_DELAY) $MAX_RETRY_DELAY else $delay" | bc -l)
-                  echo "⚠️ Erreur temporaire détectée - Attente de ${delay}s avant de réessayer..."
-                  sleep $delay
-                  continue
-                elif is_quota_error "$ERROR_MSG"; then
-                  echo "❌ Erreur de quota définitive détectée - Passage au modèle suivant"
-                  return 1
-                fi
-              fi
-
-              return 1
-            done
-            return 1
-          }
-
-          is_json_valid() {
-            grep -qiE '"overall_status"\s*:\s*"(up|down)"' "$1"
-          }
-
-          is_fully_verified() {
-            is_json_valid "$1" && ! grep -qiE '"actions_completed"\s*:\s*false' "$1"
-          }
-
-          try_result() {
-            cp "$1" output.json
-            if is_fully_verified output.json; then
-              echo "✅ Succès complet avec ${2}"
-              echo "agent_failed=false" >> $GITHUB_OUTPUT
-              echo "winning_label=${2}" >> $GITHUB_OUTPUT
-              echo "verification_partial=false" >> $GITHUB_OUTPUT
-              exit 0
-            elif is_json_valid output.json; then
-              echo "⚠️ ${2} : JSON valide mais actions_completed=false — mis en réserve, on continue la chaîne"
-              cp output.json /tmp/best_partial.json
-              BEST_PARTIAL_LABEL="${2}"
-            fi
-          }
-
-          # ======================================
-          # 🥇 PRIORITÉ 1 : Gemini (Google AI Studio) - MODÈLES GRATUITS
-          # ======================================
-          echo "======================================"
-          echo "🥇 PRIORITÉ 1 : Gemini (Google AI Studio) - MODÈLES GRATUITS"
-          echo "======================================"
-          for GEMINI_MODEL in "gemini-3.5-flash" "gemini-3.6-flash" "gemini-2.5-pro"; do
-            label="gemini-$(echo "$GEMINI_MODEL" | tr '/:' '--')"
-            if run_with_retry "gemini" "$GEMINI_MODEL" "$label"; then
-              try_result "output-${label}.json" "$label"
-            else
-              echo "❌ Échec avec $GEMINI_MODEL après $((MAX_RETRIES+1)) tentatives"
-            fi
-          done
-
-          # ======================================
-          # 🥈 PRIORITÉ 2 : Mistral
-          # ======================================
-          echo "======================================"
-          echo "🥈 PRIORITÉ 2 : Mistral"
-          echo "======================================"
-          if run_with_retry "custom:mistral" "mistral-small-latest" "mistral"; then
-            try_result "output-mistral.json" "mistral"
-          else
-            echo "❌ Échec avec Mistral après $((MAX_RETRIES+1)) tentatives"
-          fi
-
-          # ======================================
-          # 🥉 PRIORITÉ 3 : Chaîne OpenRouter (modèles gratuits)
-          # ======================================
-          echo "======================================"
-          echo "🥉 PRIORITÉ 3 : Chaîne OpenRouter (modèles gratuits)"
-          echo "======================================"
-          for OR_MODEL in "poolside/laguna-s-2.1:free" "inclusionai/ling-3.0-flash-fin:free" "thinkingmachines/inkling:free" "openrouter/free"; do
-            label="openrouter-$(echo "$OR_MODEL" | tr '/:' '--')"
-            if run_with_retry "openrouter" "$OR_MODEL" "$label"; then
-              try_result "output-${label}.json" "$label"
-            else
-              echo "❌ Échec avec $OR_MODEL après $((MAX_RETRIES+1)) tentatives"
-            fi
-          done
-
-          # ======================================
-          # 🌐 PRIORITÉ 4 : Fallback sur HuggingFace
-          # ======================================
-          echo "======================================"
-          echo "🌐 PRIORITÉ 4 : Fallback sur HuggingFace"
-          echo "======================================"
-          if run_with_retry "huggingface" "openai/gpt-oss-120b:cerebras" "huggingface"; then
-            try_result "output-huggingface.json" "huggingface"
-          else
-            echo "❌ Échec avec HuggingFace après $((MAX_RETRIES+1)) tentatives"
-          fi
-
-          # Aucun modèle n'a complété toutes les actions demandées : on utilise le meilleur essai partiel
-          if [ -f /tmp/best_partial.json ]; then
-            echo "⚠️ Aucun modèle n'a complété toutes les actions — utilisation du meilleur essai partiel (${BEST_PARTIAL_LABEL})"
-            cp /tmp/best_partial.json output.json
-            echo "agent_failed=false" >> $GITHUB_OUTPUT
-            echo "winning_label=${BEST_PARTIAL_LABEL}" >> $GITHUB_OUTPUT
-            echo "verification_partial=true" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          echo "❌ Échec final après tous les providers"
-          echo "agent_failed=true" >> $GITHUB_OUTPUT
-
-      - name: Extraire et envoyer le résultat
+      - name: Envoyer le rapport des pages
         if: always()
         env:
           SITE_ID: ${{ matrix.site.id }}
           RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
           RELAY_URL: ${{ secrets.RELAY_URL }}
-          WINNING_LABEL: ${{ steps.agent_run.outputs.winning_label }}
-          VERIFICATION_PARTIAL: ${{ steps.agent_run.outputs.verification_partial }}
         run: |
-          if [ ! -f output.json ] || [ ! -s output.json ]; then
-            STATUS="ERROR"
-            REASON="Agent output missing or empty"
-            PAGES_JSON=""
-          elif [ "${{ steps.agent_run.outputs.agent_failed }}" == "true" ]; then
-            STATUS="ERROR"
-            REASON="Agent execution failed after all attempts"
-            PAGES_JSON=""
-          else
-            AGENT_TEXT=$(cat output.json)
-            PAGES_JSON=$(printf '%s' "$AGENT_TEXT" | awk '
-              /```json/ { capture=1; buf=""; next }
-              /```/ { if (capture) { last=buf; capture=0 } ; next }
-              capture { buf = buf $0 "\n" }
-              END { printf "%s", last }
-            ')
-
-            if echo "$PAGES_JSON" | jq -e '.overall_status and .pages' > /dev/null 2>&1; then
-              STATUS=$(echo "$PAGES_JSON" | jq -r '.overall_status // "UNKNOWN"' | tr '[:lower:]' '[:upper:]')
-              SITE_TYPE=$(echo "$PAGES_JSON" | jq -r '.site_type // "non détecté"')
-              PAGES_JSON=$(echo "$PAGES_JSON" | jq -c '.pages |= map(.status |= (if . then ascii_upcase else "UNKNOWN" end))')
-              REASON=$(echo "$PAGES_JSON" | jq -c '.pages')
-              echo "$PAGES_JSON" > pages.json
-              echo "🏷️ Type de site détecté : $SITE_TYPE"
-              echo "📄 $(echo "$PAGES_JSON" | jq '.pages | length') page(s) rapportée(s) :"
-              echo "$PAGES_JSON" | jq -r '.pages[] | "  - \(.url) → \(.status) (http=\(.http_code // "n/a")) : \(.action_tested // "navigation simple") — \(.note // "")"'
-
-              MAX_DUP=$(echo "$PAGES_JSON" | jq '[.pages[].note] | group_by(.) | map(length) | max')
-              TOTAL_PAGES=$(echo "$PAGES_JSON" | jq '.pages | length')
-              if [ -n "$MAX_DUP" ] && [ -n "$TOTAL_PAGES" ] && [ "$TOTAL_PAGES" -gt 0 ] && [ "$MAX_DUP" -ge $(( (TOTAL_PAGES + 1) / 2 )) ]; then
-                echo "⚠️ ${MAX_DUP}/${TOTAL_PAGES} pages partagent une note identique — vérification probablement bâclée"
-                REASON="⚠️ VÉRIFICATION SUSPECTE (notes dupliquées, ${MAX_DUP}/${TOTAL_PAGES} pages identiques) — $REASON"
-              fi
-            else
-              echo "⚠️ Bloc JSON structuré introuvable, repli sur extraction texte"
-              if echo "$AGENT_TEXT" | grep -qi "up"; then
-                STATUS="UP"
-                REASON="Site appears operational (extracted from text)"
-              elif echo "$AGENT_TEXT" | grep -qi "down"; then
-                STATUS="DOWN"
-                REASON="Site appears down (extracted from text)"
-              else
-                STATUS="UNKNOWN"
-                REASON="No status indicator found in output"
-              fi
-              PAGES_JSON=""
-            fi
+          set +e
+          [ ! -f output.json ] && exit 0
+          if jq -e '.pages' output.json >/dev/null 2>&1; then
+            jq -c '{pages: .pages}' output.json > pages_payload.json
+            curl -sS --retry 3 --retry-delay 2 -X POST "$RELAY_URL/sites/$SITE_ID/pages-report" \
+              -H "x-relay-secret: $RELAY_SECRET" -H "Content-Type: application/json" -d @pages_payload.json
           fi
 
-          if [ "$VERIFICATION_PARTIAL" == "true" ]; then
-            REASON="⚠️ VÉRIFICATION PARTIELLE (aucun modèle n'a complété toutes les actions demandées) — $REASON"
-          fi
-
-          echo "Statut final: $STATUS"
-          echo "Message: $REASON"
-
-          if [ -n "$PAGES_JSON" ] && echo "$PAGES_JSON" | jq -e '.pages' > /dev/null 2>&1; then
-            echo "📤 Envoi du rapport pages à $RELAY_URL/sites/$SITE_ID/pages-report"
-            echo "$PAGES_JSON" | jq -c '{pages: .pages}' > pages_payload.json
-            curl -X POST "$RELAY_URL/sites/$SITE_ID/pages-report" -H "x-relay-secret: $RELAY_SECRET" -H "Content-Type: application/json" -d @pages_payload.json || echo "⚠️ Échec envoi pages-report"
-          fi
-
-          echo "📤 Envoi du statut global à $RELAY_URL/sites/$SITE_ID/mark-crawled"
-          jq -nc --arg status "$STATUS" --arg message "$REASON" '{status: $status, message: $message}' > status_payload.json
-          curl -X POST "$RELAY_URL/sites/$SITE_ID/mark-crawled" -H "x-relay-secret: $RELAY_SECRET" -H "Content-Type: application/json" -d @status_payload.json || echo "⚠️ Échec envoi mark-crawled"
-
-      - name: Lister toutes les vidéos enregistrées (Aucun filtrage)
+      - name: Envoyer le statut global
         if: always()
+        env:
+          SITE_ID: ${{ matrix.site.id }}
+          RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
+          RELAY_URL: ${{ secrets.RELAY_URL }}
         run: |
-          echo "=== Vidéos enregistrées (TOUTES conservées pour l'artefact) ==="
-          ls -lah recordings/ 2>/dev/null || echo "(aucune vidéo trouvée)"
+          set +e
+          STATUS="ERROR"; MESSAGE="AutoSpec execution error"
+          if [ -f output.json ]; then
+            STATUS=$(jq -r '.overall_status // "ERROR"' output.json | tr '[:lower:]' '[:upper:]')
+            MESSAGE=$(jq -c '{actions_completed, model_used, pages}' output.json)
+          fi
+          jq -nc --arg status "$STATUS" --arg message "$MESSAGE" '{status: $status, message: $message}' > status_payload.json
+          curl -sS --retry 3 --retry-delay 2 -X POST "$RELAY_URL/sites/$SITE_ID/mark-crawled" \
+            -H "x-relay-secret: $RELAY_SECRET" -H "Content-Type: application/json" -d @status_payload.json
 
-      - name: Uploader la vidéo (artifact)
+      - name: Uploader les artifacts (vidéos, traces, specs générées)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: hermes-recordings-${{ matrix.site.id }}
-          path: recordings/*
+          name: autospec-monitoring-${{ matrix.site.id }}
+          path: |
+            autospec-runner/trajectories/
+            autospec-runner/output.json
+            autospec-runner/specs.json
           if-no-files-found: ignore
           retention-days: 7
