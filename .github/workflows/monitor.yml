@@ -1,1466 +1,609 @@
-name: Agent Q - Monitoring Autonome Multi-Sites
+name: Hermes Agent - Monitoring Autonome Multi-Sites
 
 on:
   workflow_dispatch:
     inputs:
       site_id:
-        description: "ID du site à tester spécifiquement (optionnel)"
+        description: 'ID du site à tester spécifiquement (optionnel)'
         required: false
         type: string
-
   schedule:
     - cron: "0 */6 * * *"
 
-permissions:
-  contents: read
-
 jobs:
-
-  # ============================================================
-  # 1. RÉCUPÉRER LES SITES
-  # ============================================================
   fetch-sites:
     runs-on: ubuntu-latest
-
     outputs:
       sites: ${{ steps.get-sites.outputs.sites }}
-
     steps:
-
       - name: Récupérer les sites actifs et leurs pages
         id: get-sites
-
         env:
           SITE_ID_INPUT: ${{ github.event.inputs.site_id }}
           RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
           RELAY_URL: ${{ secrets.RELAY_URL }}
-
-        shell: bash
-
         run: |
-          set -euo pipefail
-
-          SITE_ID="${SITE_ID_INPUT:-}"
-
-          echo "======================================"
-          echo "🔎 RÉCUPÉRATION DES SITES"
-          echo "======================================"
+          SITE_ID="$SITE_ID_INPUT"
 
           if [ -n "$SITE_ID" ]; then
-
             echo "🔍 Test ciblé sur le site $SITE_ID"
+            DETAIL=$(curl -s -H "x-relay-secret: $RELAY_SECRET" "$RELAY_URL/monitors/$SITE_ID")
 
-            DETAIL=$(curl -fsS \
-              --retry 3 \
-              --retry-delay 2 \
-              -H "x-relay-secret: $RELAY_SECRET" \
-              "$RELAY_URL/monitors/$SITE_ID")
+            MONITOR=$(echo "$DETAIL" | jq -c '.monitor | if .type == "http" then {id: .parent, url: .url, name: .parentName} else {id: .id, url: .url, name: .name} end')
 
-            MONITOR=$(echo "$DETAIL" | jq -c '
-              .monitor
-              | if .type == "http"
-                then {
-                    id: .parent,
-                    url: .url,
-                    name: .parentName
-                  }
-                else {
-                    id: .id,
-                    url: .url,
-                    name: .name
-                  }
-                end
-            ')
-
-            if [ -z "$MONITOR" ] || [ "$MONITOR" = "null" ]; then
+            if [ -z "$MONITOR" ] || [ "$MONITOR" == "null" ]; then
               echo "❌ Site $SITE_ID introuvable ou erreur relay"
               echo "sites=[]" >> "$GITHUB_OUTPUT"
               exit 0
             fi
 
-            ALL_MONITORS=$(curl -fsS \
-              --retry 3 \
-              --retry-delay 2 \
-              -H "x-relay-secret: $RELAY_SECRET" \
-              "$RELAY_URL/monitors")
+            ALL_MONITORS=$(curl -s -H "x-relay-secret: $RELAY_SECRET" "$RELAY_URL/monitors")
+            PAGES=$(echo "$ALL_MONITORS" | jq -c --arg sid "$(echo "$MONITOR" | jq -r '.id')" '[.monitors[]? | select(.type == "http" and (.parent|tostring) == $sid) | {url: .url, name: .name}]')
 
-            PAGES=$(echo "$ALL_MONITORS" | jq -c \
-              --arg sid "$(echo "$MONITOR" | jq -r '.id')" '
-              [
-                .monitors[]?
-                | select(
-                    .type == "http"
-                    and (.parent | tostring) == $sid
-                  )
-                | {
-                    url: .url,
-                    name: .name
-                  }
-              ]
-            ')
-
-            SITES=$(jq -cn \
-              --argjson mon "$MONITOR" \
-              --argjson pages "$PAGES" '
-              [
-                {
-                  id: $mon.id,
-                  url: $mon.url,
-                  name: $mon.name,
-                  pages: $pages
-                }
-              ]
-            ')
-
+            SITES=$(jq -cn --argjson mon "$MONITOR" --argjson pages "$PAGES" '[{id: $mon.id, url: $mon.url, name: $mon.name, pages: $pages}]')
           else
+            RAW=$(curl -s "$RELAY_URL/active-sites")
+            SITES_RAW=$(echo "$RAW" | jq -c '[.sites[]? | {id: .id, url: .site_url}]' 2>/dev/null || echo "")
 
-            echo "📡 Récupération de tous les sites actifs..."
-
-            RAW=$(curl -fsS \
-              --retry 3 \
-              --retry-delay 2 \
-              -H "x-relay-secret: $RELAY_SECRET" \
-              "$RELAY_URL/active-sites")
-
-            SITES_RAW=$(echo "$RAW" \
-              | jq -c '
-                  [
-                    .sites[]?
-                    | {
-                        id: .id,
-                        url: .site_url
-                      }
-                  ]
-                ' \
-              2>/dev/null || echo "[]")
-
-            if [ -z "$SITES_RAW" ] || [ "$SITES_RAW" = "null" ]; then
-              echo "⚠️ Réponse active-sites illisible ou vide"
+            if [ -z "$SITES_RAW" ] || [ "$SITES_RAW" == "null" ]; then
+              echo "⚠️ Réponse Supabase/relay illisible ou vide — aucun test ne sera lancé"
               SITES_RAW="[]"
             fi
 
-            if [ "$SITES_RAW" = "[]" ]; then
-              echo "ℹ️ Aucun site actif trouvé"
+            if [ "$SITES_RAW" == "[]" ]; then
+              echo "ℹ️ Aucun site actif trouvé sur Supabase — aucun run de vérification ce cycle"
             fi
 
             SITES_ARRAY="[]"
-
             while IFS= read -r site; do
-
               [ -z "$site" ] && continue
-
-              SID=$(echo "$site" | jq -r '.id')
-
-              echo "--------------------------------------"
-              echo "🌐 Site : $SID"
-              echo "--------------------------------------"
-
-              ALL_MONITORS=$(curl -fsS \
-                --retry 3 \
-                --retry-delay 2 \
-                -H "x-relay-secret: $RELAY_SECRET" \
-                "$RELAY_URL/monitors")
-
-              PAGES=$(echo "$ALL_MONITORS" | jq -c \
-                --arg sid "$SID" '
-                [
-                  .monitors[]?
-                  | select(
-                      .type == "http"
-                      and (.parent | tostring) == $sid
-                    )
-                  | {
-                      url: .url,
-                      name: .name
-                    }
-                ]
-              ')
-
-              SITE_WITH_PAGES=$(echo "$site" \
-                | jq -c \
-                  --argjson pages "$PAGES" \
-                  '. + {pages: $pages}')
-
-              SITES_ARRAY=$(echo "$SITES_ARRAY" \
-                | jq -c \
-                  --argjson site "$SITE_WITH_PAGES" \
-                  '. + [$site]')
-
+              sid=$(echo "$site" | jq -r '.id')
+              all=$(curl -s -H "x-relay-secret: $RELAY_SECRET" "$RELAY_URL/monitors")
+              pages=$(echo "$all" | jq -c --arg sid "$sid" '[.monitors[]? | select(.type == "http" and (.parent|tostring) == $sid) | {url: .url, name: .name}]')
+              site_with_pages=$(echo "$site" | jq -c --argjson pages "$pages" '. + {pages: $pages}')
+              SITES_ARRAY=$(echo "$SITES_ARRAY" | jq -c --argjson site "$site_with_pages" '. + [$site]')
             done <<< "$(echo "$SITES_RAW" | jq -c '.[]?')"
-
             SITES="$SITES_ARRAY"
-
           fi
 
           SITES=$(echo "$SITES" | jq -c .)
-
           echo "sites=$SITES" >> "$GITHUB_OUTPUT"
+          echo "📡 Sites à monitorer: $SITES"
 
-          echo "======================================"
-          echo "📡 SITES À MONITORER"
-          echo "======================================"
-
-          echo "$SITES" | jq .
-
-
-  # ============================================================
-  # 2. AGENT Q
-  # ============================================================
-  agent-q-test:
-
+  hermes-test:
     needs: fetch-sites
-
     if: needs.fetch-sites.outputs.sites != '[]'
-
     runs-on: ubuntu-latest
-
-    timeout-minutes: 45
-
     concurrency:
-      group: agent-q-check-${{ matrix.site.id }}
+      group: hermes-check-${{ matrix.site.id }}
       cancel-in-progress: false
-
     strategy:
       fail-fast: false
       max-parallel: 1
-
       matrix:
         site: ${{ fromJson(needs.fetch-sites.outputs.sites) }}
 
-    env:
-      # PRIORITÉ ABSOLUE À GOOGLE AI STUDIO
-      GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-      
-      # Configuration optimisée avec gestion des erreurs
-      AGENT_Q_MODELS: "gemini/gemini-3.5-flash,gemini/gemini-3.6-flash,gemini/gemini-2.5-pro,nvidia_nim/moonshotai/kimi-k2.6,openrouter/cohere/north-mini-code:free,openrouter/poolside/laguna-xs-2.1:free,openrouter/poolside/laguna-s-2.1:free"
-      
-      # Paramètres critiques pour gérer les surcharges
-      MAX_RETRIES: "3"
-      RETRY_DELAY_BASE: "2"
-      MIN_RETRY_DELAY: "1"
-      MAX_RETRY_DELAY: "30"
-
-      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-      NVIDIA_NIM_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-
-      SITE_ID: ${{ matrix.site.id }}
-      SITE_URL: ${{ matrix.site.url }}
-
     steps:
-
-      # ========================================================
-      # CHECKOUT
-      # ========================================================
-      - name: Checkout du repository
+      - name: Checkout du code
         uses: actions/checkout@v4
 
-
-      # ========================================================
-      # PYTHON
-      # ========================================================
-      - name: Installer Python 3.10
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
-
-
-      # ========================================================
-      # CLONER AGENT Q
-      # ========================================================
-      - name: Cloner Agent Q
+      - name: Installer Hermes Agent
         run: |
-          set -euo pipefail
+          curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          source ~/.bashrc || true
+          hermes --version
 
-          git clone --depth 1 \
-            https://github.com/Top-Q/agent-q.git \
-            agent-q
-
-          echo "======================================"
-          echo "🤖 AGENT Q"
-          echo "======================================"
-
-          cd agent-q
-
-          echo "Commit :"
-          git rev-parse HEAD
-
-          echo
-          echo "Python système :"
-          python --version
-
-
-      # ========================================================
-      # CACHE CODE STORE
-      # ========================================================
-      - name: Restaurer le code store Agent Q
-        uses: actions/cache@v4
-
-        with:
-          path: agent-q/code_store
-
-          key: agent-q-code-store-${{ matrix.site.id }}-${{ hashFiles('agent-q/src/**/*.py', 'agent-q/Pipfile', 'agent-q/Pipfile.lock') }}
-
-          restore-keys: |
-            agent-q-code-store-${{ matrix.site.id }}-
-            agent-q-code-store-
-
-
-      # ========================================================
-      # PIPENV
-      # ========================================================
-      - name: Installer Pipenv
+      - name: Dépendances système (ffmpeg + chromium + agent-browser + Playwright + Xvfb + WM)
         run: |
-          set -euo pipefail
+          set -e
 
-          python -m pip install --upgrade pip
-          python -m pip install pipenv
+          echo "=== ffmpeg ==="
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq ffmpeg
+          fi
+          ffmpeg -version 2>/dev/null | head -1
 
-          pipenv --version
+          echo "=== symlink chromium ==="
+          if ! command -v chromium >/dev/null 2>&1 && command -v google-chrome >/dev/null 2>&1; then
+            sudo ln -sf "$(command -v google-chrome)" /usr/local/bin/chromium
+          fi
+          command -v chromium && chromium --version
 
+          echo "=== agent-browser global ==="
+          npm install -g agent-browser || echo "⚠️ npm install failed"
+          which agent-browser && agent-browser --version || true
 
-      # ========================================================
-      # ENVIRONNEMENT AGENT Q
-      # ========================================================
-      - name: Installer les dépendances Agent Q
-        working-directory: agent-q
+          echo "=== Playwright deps ==="
+          sudo npx playwright install-deps chromium || echo "⚠️ playwright install-deps failed"
+          npx playwright install chromium || echo "⚠️ playwright install chromium failed"
+
+          echo "=== Xvfb + gestionnaire de fenêtres ==="
+          sudo apt-get install -y -qq matchbox-window-manager || echo "⚠️ matchbox non installé"
+          which Xvfb && echo "✅ Xvfb présent" || echo "❌ Xvfb absent"
+
+      - name: Démarrer Xvfb + WM + Configurer Hermes
+        env:
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          HF_API_KEY: ${{ secrets.HF_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          DISPLAY: ":99"
+          AGENT_BROWSER_HEADED: "1"
+          AGENT_BROWSER_ARGS: |
+            --no-sandbox
+            --disable-dev-shm-usage
+            --disable-blink-features=AutomationControlled
+            --start-maximized
+            --no-first-run
+            --no-default-browser-check
         run: |
-          set -euo pipefail
+          mkdir -p ~/.hermes
+          mkdir -p ~/.hermes/browser_recordings
 
-          echo "======================================"
-          echo "📦 INSTALLATION AGENT Q"
-          echo "======================================"
+          unset BROWSERBASE_API_KEY || true
+          unset BROWSER_USE_API_KEY || true
 
-          pipenv sync
+          echo "=== Démarrage de Xvfb ==="
+          Xvfb :99 -screen 0 1280x800x24 -ac +extension GLX +render -noreset > /tmp/xvfb.log 2>&1 &
+          XVFB_PID=$!
+          sleep 2
+          if kill -0 $XVFB_PID 2>/dev/null; then
+            echo "✅ Xvfb actif sur DISPLAY=:99"
+            echo "XVFB_PID=$XVFB_PID" >> $GITHUB_ENV
+          else
+            echo "❌ Xvfb n'a pas démarré"
+            cat /tmp/xvfb.log
+            exit 1
+          fi
 
-          echo "✅ Dépendances Agent Q installées"
+          echo "=== Démarrage du gestionnaire de fenêtres ==="
+          DISPLAY=:99 matchbox-window-manager > /tmp/wm.log 2>&1 &
+          sleep 1
+          echo "✅ matchbox-window-manager lancé"
 
+          cat > ~/.hermes/.env << EOF
+          MISTRAL_API_KEY=${MISTRAL_API_KEY}
+          GOOGLE_API_KEY=${GOOGLE_API_KEY}
+          HF_TOKEN=${HF_API_KEY}
+          OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+          NVIDIA_API_KEY=${NVIDIA_API_KEY}
+          DISPLAY=:99
+          AGENT_BROWSER_HEADED=1
+          EOF
 
-      # ========================================================
-      # TORCH CPU
-      # ========================================================
-      - name: Remplacer Torch CUDA par Torch CPU
-        working-directory: agent-q
-        run: |
-          set -euo pipefail
+          cat > ~/.hermes/config.yaml << 'EOF'
+          browser:
+            enabled: true
+            cloud_provider: local
+            record_sessions: true
+            engine: chrome
+            headed: true
+            inactivity_timeout: 300
+            command_timeout: 30
 
-          echo "======================================"
-          echo "🧠 TORCH CPU"
-          echo "======================================"
+          toolsets:
+            - browser
+            - terminal
+            - web_search
+            - web_extract
 
-          echo "Suppression du Torch existant..."
+          display:
+            tool_progress: "off"
 
-          pipenv run pip uninstall -y torch || true
+          sessions:
+            auto_prune: false
 
-          echo "Installation de Torch CPU..."
+          model:
+            provider: gemini
+            default: gemini-3.5-flash
 
-          pipenv run pip install \
-            --index-url https://download.pytorch.org/whl/cpu \
-            "torch==2.5.1"
+          custom_providers:
+            - name: gemini
+              base_url: https://generativelanguage.googleapis.com/v1beta/models
+              key_env: GOOGLE_API_KEY
+            - name: mistral
+              base_url: https://api.mistral.ai/v1
+              key_env: MISTRAL_API_KEY
+          EOF
 
-          echo "✅ Torch CPU installé"
+          echo "=== hermes doctor --fix ==="
+          hermes doctor --fix || true
 
-
-      # ========================================================
-      # VÉRIFIER TORCH
-      # ========================================================
-      - name: Vérifier Torch
-        working-directory: agent-q
-        run: |
-          set -euo pipefail
-
-          echo "======================================"
-          echo "🔎 TORCH"
-          echo "======================================"
-
-          pipenv run python -c "
-          import torch
-          print('torch =', torch.__version__)
-          print('CUDA disponible =', torch.cuda.is_available())
-          "
-
-
-      # ========================================================
-      # VÉRIFIER SMOLAGENTS
-      # ========================================================
-      - name: Vérifier smolagents et LiteLLM
-        working-directory: agent-q
-        run: |
-          set -euo pipefail
-
-          echo "======================================"
-          echo "🔎 SMOLAGENTS"
-          echo "======================================"
-
-          pipenv run python -c "
-          import smolagents
-          print('✅ smolagents import OK')
-          "
-
-          echo
-          echo "======================================"
-          echo "🔎 LITELLM"
-          echo "======================================"
-
-          pipenv run python -c "
-          from smolagents import LiteLLMModel
-          print('✅ LiteLLMModel import OK')
-          "
-
-
-      # ========================================================
-      # VÉRIFIER PLAYWRIGHT
-      # ========================================================
-      - name: Vérifier Playwright
-        working-directory: agent-q
-        run: |
-          set -euo pipefail
-
-          echo "======================================"
-          echo "🌐 PLAYWRIGHT"
-          echo "======================================"
-
-          pipenv run python -c "
-          import playwright
-          print('✅ Playwright :', playwright.__file__)
-          "
-
-          pipenv run python -c "
-          from playwright.sync_api import sync_playwright
-          print('✅ playwright.sync_api OK')
-          "
-
-
-      # ========================================================
-      # INSTALLER CHROMIUM
-      # ========================================================
-      - name: Installer Chromium Playwright
-        working-directory: agent-q
-        run: |
-          set -euo pipefail
-
-          echo "======================================"
-          echo "🌐 CHROMIUM"
-          echo "======================================"
-
-          pipenv run playwright install --with-deps chromium
-
-          echo
-          pipenv run playwright --version
-
-
-      # ========================================================
-      # RÉPERTOIRES
-      # ========================================================
-      - name: Préparer les répertoires
-        run: |
-          set -euo pipefail
-
-          mkdir -p recordings
-          mkdir -p traces
-          mkdir -p screenshots
-          mkdir -p agent-output
-
-          echo "✅ Répertoires prêts"
-
-
-      # ========================================================
-      # GÉNÉRER RUNNER AGENT Q
-      # ========================================================
-      - name: Générer le runner Agent Q
+      - name: Générer la tâche
         env:
           PAGES_JSON: ${{ toJson(matrix.site.pages) }}
-
+          SITE_URL: ${{ matrix.site.url }}
         run: |
-
-          cat > run_agent_q.py <<'PYTHON'
-
-          import json
-          import os
-          import sys
-          import re
-          import time
-          import random
-          from pathlib import Path
-          from playwright.sync_api import sync_playwright
-          from smolagents import LiteLLMModel
-
-
-          # =====================================================
-          # CONFIGURATION DES RETRIES
-          # =====================================================
-          MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "3"))
-          RETRY_DELAY_BASE = float(os.environ.get("RETRY_DELAY_BASE", "2"))
-          MIN_RETRY_DELAY = float(os.environ.get("MIN_RETRY_DELAY", "1"))
-          MAX_RETRY_DELAY = float(os.environ.get("MAX_RETRY_DELAY", "30"))
-
-
-          # =====================================================
-          # CHEMINS ABSOLUS
-          # =====================================================
-          ROOT = Path(__file__).resolve().parent
-
-          AGENT_Q_ROOT = ROOT / "agent-q"
-
-          RECORDINGS_DIR = ROOT / "recordings"
-          TRACES_DIR = ROOT / "traces"
-          OUTPUT_DIR = ROOT / "agent-output"
-
-
-          RECORDINGS_DIR.mkdir(
-              parents=True,
-              exist_ok=True
-          )
-
-          TRACES_DIR.mkdir(
-              parents=True,
-              exist_ok=True
-          )
-
-          OUTPUT_DIR.mkdir(
-              parents=True,
-              exist_ok=True
-          )
-
-
-          # =====================================================
-          # IMPORT AGENT Q
-          # =====================================================
-          sys.path.insert(
-              0,
-              str(AGENT_Q_ROOT)
-          )
-
-          from src.agent.web_agent.web_agent import WebAgent
-
-
-          # =====================================================
-          # CONFIGURATION
-          # =====================================================
-          SITE_URL = os.environ["SITE_URL"]
-          SITE_ID = os.environ["SITE_ID"]
-          
-          # Clés API
-          GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
-          OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
-          NVIDIA_NIM_API_KEY = os.environ.get("NVIDIA_NIM_API_KEY")
-
-          # Liste de modèles séparés par des virgules, essayés
-          # dans l'ordre jusqu'à ce qu'un résultat exploitable
-          # soit obtenu.
-          MODEL_IDS = [
-              m.strip()
-              for m in os.environ.get(
-                  "AGENT_Q_MODELS",
-                  "gemini/gemini-3.5-flash,gemini/gemini-3.6-flash,gemini/gemini-2.5-pro"
-              ).split(",")
-              if m.strip()
-          ]
-
-
-          # =====================================================
-          # DÉTECTION DES ERREURS
-          # =====================================================
-          def is_temporary_error(error):
-              """Détecte les erreurs temporaires qui justifient un retry"""
-              error_str = str(error).lower()
-              return any(
-                  phrase in error_str
-                  for phrase in [
-                      "503",
-                      "serviceunavailableerror",
-                      "high demand",
-                      "spikes in demand",
-                      "rate limit",
-                      "429",
-                      "too many requests",
-                      "524",
-                      "gateway timeout",
-                      "connection reset",
-                      "connection aborted",
-                      "network error",
-                      "service temporarily unavailable",
-                      "internal server error",
-                      "500"
-                  ]
-              )
-
-
-          def is_quota_error(error):
-              """Détecte les erreurs de quota définitives"""
-              error_str = str(error).lower()
-              return any(
-                  phrase in error_str
-                  for phrase in [
-                      "quota",
-                      "limit exceeded",
-                      "402",
-                      "billing",
-                      "payment required",
-                      "403",
-                      "permission denied",
-                      "api key disabled"
-                  ]
-              )
-
-
-          def is_model_not_available(error):
-              """Détecte si le modèle spécifique n'est pas disponible"""
-              error_str = str(error).lower()
-              return any(
-                  phrase in error_str
-                  for phrase in [
-                      "model not found",
-                      "invalid model",
-                      "model not available",
-                      "404"
-                  ]
-              )
-
-
-          def resolve_api_key(model_id):
-              """
-              Choisit la bonne clé API selon le préfixe du modèle :
-              - gemini/gemini-... → GOOGLE_API_KEY
-              - nvidia_nim/... → NVIDIA_NIM_API_KEY
-              - openrouter/... → OPENROUTER_API_KEY
-              """
-              if model_id.startswith("gemini/gemini-"):
-                  return GOOGLE_API_KEY
-
-              if model_id.startswith("nvidia_nim/"):
-                  return NVIDIA_NIM_API_KEY
-
-              if model_id.startswith("openrouter/"):
-                  return OPENROUTER_API_KEY
-
-              # Préfixe inconnu : on retente avec la clé OpenRouter
-              return OPENROUTER_API_KEY
-
-
-          if not GOOGLE_API_KEY and not OPENROUTER_API_KEY and not NVIDIA_NIM_API_KEY:
-              raise RuntimeError(
-                  "Aucune clé API disponible : ni GOOGLE_API_KEY, "
-                  "ni OPENROUTER_API_KEY ni NVIDIA_NIM_API_KEY "
-                  "ne sont configurées dans les secrets GitHub."
-              )
-
-          if not MODEL_IDS:
-              raise RuntimeError(
-                  "AGENT_Q_MODELS est vide : aucun modèle à essayer."
-              )
-
-
-          # =====================================================
-          # PAGES
-          # =====================================================
-          try:
-              pages = json.loads(
-                  os.environ.get(
-                      "PAGES_JSON",
-                      "[]"
-                  )
-              )
-          except Exception:
-              pages = []
-
-
-          pages_list = "\n".join(
-              f"- {page.get('url')}"
-              for page in pages
-              if page.get("url")
-          )
-
-
-          # =====================================================
-          # TÂCHE AGENT Q
-          # =====================================================
-          task = f"""
-          TU ES L'AGENT D'EXÉCUTION E2E DE SENTINELSITE.
-
-          SITE :
-          {SITE_URL}
-
-          SITE_ID :
-          {SITE_ID}
-
-          PAGES CONNUES :
-          {pages_list}
-
-          ======================================================
-          OBJECTIF
-          ======================================================
-
-          Tester réellement le fonctionnement du site comme un
-          utilisateur humain.
-
-          Utilise le navigateur.
-
-          Ne te contente pas d'analyser le HTML ou d'expliquer
-          ce qu'il faudrait faire.
-
-          Tu dois réellement effectuer les actions.
-
-          ======================================================
-          ÉTAPE 1 — SITE
-          ======================================================
-
-          Ouvre :
-
-          {SITE_URL}
-
-          Vérifie que le contenu correspond réellement au site attendu.
-
-          Attention notamment aux :
-
-          - pages de parking ;
-          - pages d'hébergement ;
-          - pages "It works!" ;
-          - erreurs DNS ;
-          - erreurs SSL ;
-          - placeholders ;
-          - pages totalement vides.
-
-          ======================================================
-          ÉTAPE 2 — TYPE DE SITE
-          ======================================================
-
-          Détermine :
-
-          ecommerce
-          auth
-          vitrine
-          blog
-          autre
-
-          ======================================================
-          ÉTAPE 3 — PAGES
-          ======================================================
-
-          Les pages connues sont :
-
-          {pages_list}
-
-          Visite réellement les pages pertinentes.
-
-          Ne prétends jamais avoir visité une page si tu ne l'as
-          pas réellement ouverte.
-
-          ======================================================
-          ÉTAPE 4 — ACTION INTERACTIVE
-          ======================================================
-
-          Tu dois effectuer au moins UNE vraie action interactive.
-
-          E-COMMERCE :
-
-          - trouver un produit réel ;
-          - ouvrir sa fiche ;
-          - cliquer réellement sur Ajouter au panier / Add to cart
-            ou équivalent ;
-          - ouvrir réellement le panier ;
-          - vérifier le résultat ;
-          - vérifier nom, quantité et prix.
-
-          AUTH :
-
-          - ouvrir réellement l'authentification ;
-          - effectuer une action pertinente ;
-          - ne jamais utiliser un vrai compte ;
-          - utiliser des données fictives ;
-          - observer réellement le résultat.
-
-          RECHERCHE :
-
-          - effectuer réellement une recherche ;
-          - vérifier réellement les résultats.
-
-          FORMULAIRE :
-
-          - remplir réellement le formulaire ;
-          - utiliser "TEST AUTOMATISÉ" lorsque pertinent ;
-          - soumettre réellement ;
-          - observer le résultat.
-
-          ======================================================
-          RÈGLE CRITIQUE
-          ======================================================
-
-          La présence d'un bouton n'est PAS la preuve que
-          la fonctionnalité fonctionne.
-
-          Exemple incorrect :
-
-          "Le bouton Ajouter au panier existe donc le panier marche."
-
-          Exemple correct :
-
-          "J'ai cliqué sur Ajouter au panier, ouvert le panier,
-          et constaté que le produit apparaît avec son nom,
-          sa quantité et son prix."
-
-          ======================================================
-          DONNÉES BACKEND
-          ======================================================
-
-          Si des données dynamiques attendues sont :
-
-          - vides ;
-          - undefined ;
-          - null ;
-          - bloquées ;
-          - absentes ;
-
-          considère cela comme une anomalie fonctionnelle,
-          même si HTTP = 200.
-
-          ======================================================
-          JSON FINAL
-          ======================================================
-
-          Produis à la fin exactement :
-
-          {{
+          PAGES_LIST=$(echo "$PAGES_JSON" | jq -c . | jq -r '[.[]? | .url] | join("\n")')
+
+          cat > task.md << EOF
+          Va sur $SITE_URL avec l'outil de navigateur. Explore comme un
+          humain (scroll, structure) et détecte le type de site.
+
+          GESTION DES ONGLETS (IMPORTANT POUR LA VIDÉO) :
+          - Reste dans UN SEUL onglet autant que possible : utilise la
+            navigation dans l'onglet courant plutôt que d'ouvrir de nouveaux
+            onglets.
+          - Si un clic ouvre un nouvel onglet, ferme l'onglet précédent.
+          - Ignore et ferme tout onglet "Loading..." ou affichant une URL
+            du type "0.0.3.32" qui ne charge jamais.
+
+          VÉRIFICATION CRITIQUE avant tout le reste : le contenu affiché
+          correspond-il vraiment au site attendu, ou est-ce une page par
+          défaut d'hébergeur/registrar (ex: "o2switch", "It works!", page de
+          parking de domaine, message DNS/SSL non configuré) ? Si le frontend
+          affiche des sections censées recevoir des données du backend
+          (liste de produits, résultats, profil, prix, etc.) mais qu'elles
+          restent vides, bloquées en chargement, ou affichent une erreur/
+          "undefined"/"null" à la place des vraies données, c'est un backend
+          en panne : DOWN, même si la page HTTP répond 200.
+
+          PAGES À VÉRIFIER OBLIGATOIREMENT :
+          $PAGES_LIST
+
+          Choisis 2-3 actions à tester selon le type détecté :
+          - E-commerce : ajoute un produit au panier, VÉRIFIE qu'il apparaît
+            bien dans le panier (nom/qté/prix) — ces données viennent du
+            backend, vérifie qu'elles sont réelles et pas un état vide/figé.
+          - Compte utilisateur : inscris-toi avec des données fictives
+            (test+ci-<horodatage>@example.com), puis connecte-toi avec ces
+            identifiants. Si compte existant seulement, teste juste qu'un
+            login invalide donne une erreur propre (pas de vraie connexion).
+          - Formulaire de contact : soumets-le en indiquant "TEST AUTOMATISÉ"
+            dans le message.
+          - Recherche : vérifie que des résultats s'affichent réellement.
+          - Sinon : les 2-3 actions les plus représentatives du site.
+
+          IMPORTANT — CHAQUE page listée doit être RÉELLEMENT VISITÉE
+          INDIVIDUELLEMENT, et chaque action choisie RÉELLEMENT EXÉCUTÉE
+          (cliquée/soumise), pas seulement observée depuis une autre page.
+          "Le panier a une structure" n'est PAS un test — le test est "j'ai
+          cliqué ajouter, PUIS j'ai vérifié que le produit apparaît". Si deux
+          pages différentes ont exactement la même note, c'est suspect : tu
+          ne les as probablement pas visitées séparément. Si tu ne peux pas
+          exécuter une action ou visiter une page, dis-le explicitement dans
+          "note" ET mets actions_completed à false — ne mets JAMAIS
+          actions_completed à true juste parce qu'une page a chargé.
+
+          RAPPEL STRICT : tu DOIS effectuer au moins une action interactive
+          réelle (clic + vérification du résultat) avant de conclure quoi
+          que ce soit sur le statut du site. Si tu termines sans avoir cliqué
+          "ajouter au panier" (ou l'équivalent pour le type de site détecté :
+          inscription/connexion, soumission de formulaire, recherche) ET
+          vérifié le résultat obtenu, mets actions_completed: false et
+          explique précisément pourquoi dans "note". Ne conclus JAMAIS "UP"
+          sur la seule base d'un chargement de page sans action exécutée.
+
+          Pour chaque page listée, vérifie au minimum qu'elle répond correctement
+          (HTTP 200, contenu attendu). Explore aussi les liens internes pour
+          détecter d'éventuelles pages non listées et signale-les dans le JSON
+          final. Toute nouvelle URL atteinte = une page distincte à noter.
+
+          Termine par ton verdict en langage naturel (type de site + parcours
+          testés, en précisant si le contenu venait bien du backend ou si
+          c'était un placeholder/backend en panne), puis ce bloc JSON exact
+          en toute fin (rien d'autre dedans) :
+
+          \`\`\`json
+          {
             "overall_status": "UP",
             "site_type": "ecommerce",
             "actions_completed": true,
             "pages": [
-              {{
+              {
                 "url": "URL exacte",
                 "status": "UP",
                 "http_code": 200,
-                "action_tested": "description de l'action",
-                "note": "résultat réellement observé"
-              }}
+                "action_tested": "action testée ou null",
+                "note": "explication en une sentence"
+              }
             ]
-          }}
+          }
+          \`\`\`
+          Règles : status/overall_status = "UP" ou "DOWN" uniquement.
+          site_type = ecommerce|auth|vitrine|blog|autre. actions_completed =
+          true UNIQUEMENT si tu as réellement exécuté chaque action choisie ET
+          observé son résultat ; false si tu as seulement navigué sans
+          compléter les étapes interactives. Une entrée par page visitée
+          (départ + chaque URL distincte, y compris erreurs/404). Un parcours
+          métier qui échoue (panier vide après ajout, recherche sans résultat,
+          form qui ne soumet rien) = DOWN même si HTTP 200. Une page par
+          défaut d'hébergeur ou des données backend manquantes/vides alors
+          qu'elles sont attendues = DOWN même si HTTP 200.
+          EOF
 
-          overall_status :
-            uniquement UP ou DOWN.
-
-          status :
-            uniquement UP ou DOWN.
-
-          actions_completed :
-            true uniquement si les actions ont réellement
-            été exécutées ET vérifiées.
-
-          Une action métier qui échoue signifie DOWN.
-
-          Une page HTTP 200 avec un backend inutilisable peut
-          également être DOWN.
-
-          Ne jamais inventer une action qui n'a pas été exécutée.
-          """
-
-
-          # =====================================================
-          # VALIDATION D'UN RÉSULTAT
-          # =====================================================
-          def extract_candidate(raw_result):
-              candidate = None
-
-              if isinstance(raw_result, dict):
-                  if "overall_status" in raw_result and "pages" in raw_result:
-                      candidate = raw_result
-
-              elif isinstance(raw_result, str):
-                  try:
-                      parsed = json.loads(raw_result)
-                      if isinstance(parsed, dict) and "overall_status" in parsed and "pages" in parsed:
-                          candidate = parsed
-                  except Exception:
-                      pass
-
-                  if candidate is None:
-                      match = re.search(
-                          r"```json\s*(\{.*?\})\s*```",
-                          raw_result,
-                          re.DOTALL | re.IGNORECASE,
-                      )
-                      if match:
-                          try:
-                              parsed = json.loads(match.group(1))
-                              if isinstance(parsed, dict):
-                                  candidate = parsed
-                          except Exception:
-                              pass
-
-              return candidate
-
-
-          # =====================================================
-          # FONCTION DE RETRY AVEC BACKOFF EXPONENTIEL
-          # =====================================================
-          def retry_with_backoff(func, max_retries=MAX_RETRIES, delay_base=RETRY_DELAY_BASE):
-              """
-              Exécute une fonction avec retry et backoff exponentiel.
-              Gère spécifiquement les erreurs temporaires de Google AI Studio.
-              """
-              for attempt in range(max_retries + 1):
-                  try:
-                      return func(), None
-                  except Exception as e:
-                      if attempt == max_retries:
-                          return None, e
-                      
-                      if is_temporary_error(e):
-                          # Calcul du délai avec backoff exponentiel et randomisation
-                          delay = min(
-                              MAX_RETRY_DELAY,
-                              delay_base * (2 ** attempt) + random.uniform(0, 1)
-                          )
-                          delay = max(MIN_RETRY_DELAY, delay)
-                          
-                          print(f"⚠️ Erreur temporaire détectée (tentative {attempt+1}/{max_retries}) - Attente de {delay:.2f}s")
-                          time.sleep(delay)
-                      else:
-                          return None, e
-              return None, Exception("Échec après tous les retries")
-
-
-          # =====================================================
-          # EXÉCUTION D'UNE TENTATIVE POUR UN MODÈLE DONNÉ
-          # =====================================================
-          def run_attempt(model_id):
-              """
-              Lance une tentative complète (navigateur + agent)
-              pour un modèle donné avec gestion avancée des erreurs.
-              """
-              print()
-              print("======================================")
-              print(f"🤖 TENTATIVE — MODÈLE : {model_id}")
-              print("======================================")
-
-              api_key = resolve_api_key(model_id)
-
-              if not api_key:
-                  print(f"⚠️ Aucune clé API disponible pour {model_id}, modèle sauté.")
-                  return (
-                      {
-                          "site_id": SITE_ID,
-                          "site_url": SITE_URL,
-                          "model": model_id,
-                          "error": "Clé API manquante pour ce modèle.",
-                      },
-                      False,
-                  )
-
-              model = LiteLLMModel(
-                  model_id=model_id,
-                  api_key=api_key,
-              )
-
-              with sync_playwright() as playwright:
-                  browser = playwright.chromium.launch(
-                      headless=True,
-                      args=[
-                          "--no-sandbox",
-                          "--disable-dev-shm-usage",
-                          "--disable-blink-features=AutomationControlled",
-                          "--no-first-run",
-                          "--no-default-browser-check",
-                      ],
-                  )
-
-                  context = browser.new_context(
-                      viewport={
-                          "width": 1280,
-                          "height": 800,
-                      },
-                      locale="fr-FR",
-                      timezone_id="Africa/Porto-Novo",
-                      user_agent=(
-                          "Mozilla/5.0 "
-                          "(X11; Linux x86_64) "
-                          "AppleWebKit/537.36 "
-                          "(KHTML, like Gecko) "
-                          "Chrome/131.0.0.0 "
-                          "Safari/537.36"
-                      ),
-                      record_video_dir=str(RECORDINGS_DIR),
-                      record_video_size={
-                          "width": 1280,
-                          "height": 800,
-                      },
-                  )
-
-                  context.tracing.start(
-                      screenshots=True,
-                      snapshots=True,
-                      sources=True,
-                  )
-
-                  page = context.new_page()
-
-                  raw_result = None
-                  error_text = None
-
-                  try:
-                      print()
-                      print("🌐 Ouverture du site...")
-
-                      page.goto(
-                          SITE_URL,
-                          wait_until="domcontentloaded",
-                          timeout=30000,
-                      )
-
-                      print("✅ Page chargée :", page.url)
-
-                      agent = WebAgent(page, model)
-                      agent.init_agent()
-
-                      print()
-                      print(f"🤖 Exécution Agent Q avec {model_id}...")
-
-                      # Fonction d'exécution pour le retry
-                      def execute_agent():
-                          return agent.do(task)
-
-                      # Exécution avec retry intelligent
-                      raw_result, error = retry_with_backoff(
-                          execute_agent,
-                          max_retries=MAX_RETRIES,
-                          delay_base=RETRY_DELAY_BASE
-                      )
-
-                      if error:
-                          error_text = str(error)
-                          print()
-                          print(f"❌ Échec définitif après {MAX_RETRIES+1} tentatives : {error_text}")
-                          
-                          # Si c'est une erreur de quota, on ne réessaie pas avec le même modèle
-                          if is_quota_error(error):
-                              print("⚠️ Erreur de quota détectée - passage au modèle suivant")
-                              raise error
-                      else:
-                          print()
-                          print("✅ Agent Q terminé")
-                          print()
-                          print("Résultat brut :")
-                          print(raw_result)
-
-                  except Exception as error:
-                      error_text = repr(error)
-                      print()
-                      print(f"❌ Modèle {model_id} indisponible ou en échec : {error_text}")
-
-                  finally:
-                      try:
-                          context.tracing.stop(
-                              path=str(TRACES_DIR / f"trace-{SITE_ID}.zip")
-                          )
-                      except Exception as trace_error:
-                          print("⚠️ Trace non sauvegardée :", trace_error)
-
-                      context.close()
-                      browser.close()
-
-              candidate = extract_candidate(raw_result)
-
-              output = {
-                  "site_id": SITE_ID,
-                  "site_url": SITE_URL,
-                  "model": model_id,
-                  "raw_result": raw_result,
-              }
-
-              if error_text:
-                  output["error"] = error_text
-
-              if candidate is not None:
-                  output["result"] = candidate
-                  return output, True
-
-              return output, False
-
-
-          # =====================================================
-          # BOUCLE DE FALLBACK SUR LES MODÈLES
-          # =====================================================
-          print("======================================")
-          print("🤖 AGENT Q — MODÈLES DISPONIBLES")
-          print("======================================")
-
-          print("Site :", SITE_URL)
-          print("Modèles (dans l'ordre) :", ", ".join(MODEL_IDS))
-
-          final_output = None
-          success = False
-
-          for index, model_id in enumerate(MODEL_IDS, start=1):
-              try:
-                  print(f"\n🔄 Essai avec {model_id} (tentative {index}/{len(MODEL_IDS)})")
-                  attempt_output, attempt_success = run_attempt(model_id)
-              except Exception as fatal_error:
-                  print()
-                  print(f"❌ Erreur fatale avec {model_id} : {repr(fatal_error)}")
-                  attempt_output = {
-                      "site_id": SITE_ID,
-                      "site_url": SITE_URL,
-                      "model": model_id,
-                      "error": repr(fatal_error),
-                  }
-                  attempt_success = False
-
-              final_output = attempt_output
-
-              if attempt_success:
-                  print()
-                  print(f"✅ Modèle retenu : {model_id} (tentative {index}/{len(MODEL_IDS)})")
-                  success = True
-                  break
-
-              print()
-
-              # Pause entre les modèles pour éviter de saturer les APIs
-              if index < len(MODEL_IDS):
-                  delay = random.uniform(0.5, 1.5)
-                  print(f"➡️ Passage au modèle suivant dans {delay:.1f} seconde(s)...")
-                  time.sleep(delay)
-              else:
-                  print("❌ Tous les modèles de la liste ont échoué.")
-
-          if final_output is None:
-              final_output = {
-                  "site_id": SITE_ID,
-                  "site_url": SITE_URL,
-                  "model": None,
-                  "error": "Aucun modèle n'a pu être exécuté.",
-              }
-
-          final_output["fallback_used"] = not success or (
-              MODEL_IDS.index(final_output.get("model", MODEL_IDS[0])) > 0
-              if final_output.get("model") in MODEL_IDS
-              else False
-          )
-
-          (OUTPUT_DIR / "raw-result.json").write_text(
-              json.dumps(
-                  final_output,
-                  ensure_ascii=False,
-                  indent=2,
-                  default=str,
-              ),
-              encoding="utf-8",
-          )
-
-          print()
-          print("✅ BrowserContext(s) fermé(s)")
-          print("🎥 Vidéo(s) Playwright finalisée(s)")
-
-          if not success:
-              raise RuntimeError(
-                  "Aucun des modèles configurés n'a produit de résultat exploitable."
-              )
-
-          PYTHON
-
-
-      # ========================================================
-      # EXÉCUTER AGENT Q
-      # ========================================================
-      - name: Exécuter Agent Q
+      - name: Lancer Hermes Agent avec capture vidéo
+        id: agent_run
         env:
-          SITE_ID: ${{ matrix.site.id }}
-          SITE_URL: ${{ matrix.site.url }}
-          PAGES_JSON: ${{ toJson(matrix.site.pages) }}
-          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          NVIDIA_NIM_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-          MAX_RETRIES: ${{ env.MAX_RETRIES }}
-          RETRY_DELAY_BASE: ${{ env.RETRY_DELAY_BASE }}
-          MIN_RETRY_DELAY: ${{ env.MIN_RETRY_DELAY }}
-          MAX_RETRY_DELAY: ${{ env.MAX_RETRY_DELAY }}
-          AGENT_Q_MODELS: "gemini/gemini-3.5-flash,gemini/gemini-3.6-flash,gemini/gemini-2.5-pro,nvidia_nim/moonshotai/kimi-k2.6,openrouter/cohere/north-mini-code:free,openrouter/poolside/laguna-xs-2.1:free,openrouter/poolside/laguna-s-2.1:free"
-
-        run: |
-          set -euo pipefail
-
-          echo "======================================"
-          echo "🤖 LANCEMENT AGENT Q"
-          echo "======================================"
-
-          echo
-          echo "Python système :"
-          python --version
-
-          cd agent-q
-
-          echo
-          echo "Python Agent Q :"
-          pipenv run python --version
-
-          echo
-          echo "Torch :"
-          pipenv run python -c "
-          import torch
-          print('torch =', torch.__version__)
-          print('cuda =', torch.cuda.is_available())
-          "
-
-          echo
-          echo "smolagents :"
-          pipenv run python -c "
-          import smolagents
-          print('smolagents import OK')
-          "
-
-          echo
-          echo "Playwright sync API :"
-          pipenv run python -c "
-          from playwright.sync_api import sync_playwright
-          print('playwright.sync_api OK')
-          "
-
-          echo
-          echo "======================================"
-          echo "🚀 LANCEMENT DU RUNNER (avec fallback modèles)"
-          echo "======================================"
-
-          # Le runner gère le fallback multi-modèles
-          pipenv run python ../run_agent_q.py || true
-
-
-      # ========================================================
-      # CONSTRUIRE output.json
-      # ========================================================
-      - name: Construire output.json
-        if: always()
-        run: |
-          python - <<'PYTHON'
-          import json
-          import re
-          from pathlib import Path
-
-          raw_file = Path("agent-output/raw-result.json")
-          output_file = Path("output.json")
-
-          if not raw_file.exists():
-              result = {
-                  "overall_status": "ERROR",
-                  "site_type": "autre",
-                  "actions_completed": False,
-                  "pages": [],
-                  "error": "Agent Q n'a produit aucun résultat.",
-              }
-              output_file.write_text(
-                  json.dumps(result, ensure_ascii=False, indent=2),
-                  encoding="utf-8",
-              )
-              raise SystemExit(0)
-
-          data = json.loads(raw_file.read_text(encoding="utf-8"))
-          candidate = data.get("result")
-
-          if candidate is None:
-              raw_result = data.get("raw_result")
-              # DICT
-              if isinstance(raw_result, dict):
-                  if "overall_status" in raw_result and "pages" in raw_result:
-                      candidate = raw_result
-              # STRING
-              elif isinstance(raw_result, str):
-                  try:
-                      parsed = json.loads(raw_result)
-                      if isinstance(parsed, dict) and "overall_status" in parsed and "pages" in parsed:
-                          candidate = parsed
-                  except Exception:
-                      pass
-                  if candidate is None:
-                      match = re.search(
-                          r"```json\s*(\{.*?\})\s*```",
-                          raw_result,
-                          re.DOTALL | re.IGNORECASE,
-                      )
-                      if match:
-                          try:
-                              parsed = json.loads(match.group(1))
-                              if isinstance(parsed, dict):
-                                  candidate = parsed
-                          except Exception:
-                              pass
-
-          if candidate is None:
-              candidate = {
-                  "overall_status": "ERROR",
-                  "site_type": "autre",
-                  "actions_completed": False,
-                  "pages": [],
-                  "error": (
-                      data.get("error") or 
-                      "Agent Q n'a pas produit le JSON attendu (tous les modèles ont échoué)."
-                  ),
-              }
-
-          # NORMALISATION
-          candidate["overall_status"] = str(candidate.get("overall_status", "ERROR")).upper()
-          if candidate["overall_status"] not in {"UP", "DOWN", "ERROR"}:
-              candidate["overall_status"] = "ERROR"
-
-          if not isinstance(candidate.get("pages"), list):
-              candidate["pages"] = []
-
-          candidate["actions_completed"] = bool(candidate.get("actions_completed", False))
-
-          # Traçabilité
-          if data.get("model"):
-              candidate["model_used"] = data["model"]
-          if data.get("fallback_used"):
-              candidate["fallback_used"] = True
-
-          output_file.write_text(
-              json.dumps(candidate, ensure_ascii=False, indent=2),
-              encoding="utf-8",
-          )
-
-          print()
-          print("======================================")
-          print("📄 output.json")
-          print("======================================")
-          print(json.dumps(candidate, ensure_ascii=False, indent=2))
-          PYTHON
-
-
-      # ========================================================
-      # AFFICHER LE RÉSULTAT
-      # ========================================================
-      - name: Afficher le résultat final
-        if: always()
-        run: |
-          echo "======================================"
-          echo "📊 RÉSULTAT AGENT Q"
-          echo "======================================"
-          if [ -f output.json ]; then
-            jq . output.json
-          else
-            echo "❌ output.json absent"
-          fi
-
-
-      # ========================================================
-      # ENVOYER PAGES-REPORT
-      # ========================================================
-      - name: Envoyer le rapport des pages
-        if: always()
-        env:
-          SITE_ID: ${{ matrix.site.id }}
-          RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
-          RELAY_URL: ${{ secrets.RELAY_URL }}
+          DISPLAY: ":99"
+          AGENT_BROWSER_HEADED: "1"
+          AGENT_BROWSER_ARGS: |
+            --no-sandbox
+            --disable-dev-shm-usage
+            --disable-blink-features=AutomationControlled
+            --start-maximized
+            --no-first-run
+            --no-default-browser-check
         run: |
           set +e
-          if [ ! -f output.json ]; then
-            echo "⚠️ output.json absent"
+
+          if ! pgrep -f "Xvfb :99" > /dev/null; then
+            echo "⚠️ Xvfb arrêté, redémarrage..."
+            Xvfb :99 -screen 0 1280x800x24 -ac +extension GLX +render -noreset > /tmp/xvfb.log 2>&1 &
+            sleep 2
+          fi
+          if ! pgrep -f matchbox-window-manager > /dev/null; then
+            DISPLAY=:99 matchbox-window-manager > /tmp/wm.log 2>&1 &
+            sleep 1
+          fi
+
+          TASK_CONTENT=$(cat task.md)
+          mkdir -p recordings
+          rm -f /tmp/best_partial.json
+          BEST_PARTIAL_LABEL=""
+          MAX_RETRIES=3
+          RETRY_DELAY_BASE=2
+          MIN_RETRY_DELAY=1
+          MAX_RETRY_DELAY=30
+
+          is_temporary_error() {
+            local error_msg="$1"
+            echo "$error_msg" | tr '[:upper:]' '[:lower:]' | grep -qE '503|serviceunavailableerror|high demand|spikes in demand|rate limit|429|too many requests|524|gateway timeout|connection reset|connection aborted|network error|service temporarily unavailable|internal server error|500'
+          }
+
+          is_quota_error() {
+            local error_msg="$1"
+            echo "$error_msg" | tr '[:upper:]' '[:lower:]' | grep -qE 'quota|limit exceeded|402|billing|payment required|403|permission denied|api key disabled'
+          }
+
+          run_with_retry() {
+            local provider=$1
+            local model=$2
+            local label=$3
+            local max_retries=${4:-$MAX_RETRIES}
+            local delay_base=${5:-$RETRY_DELAY_BASE}
+
+            for attempt in $(seq 0 $max_retries); do
+              echo "======================================"
+              echo "Test avec $provider/$model pour ${{ matrix.site.url }} (tentative $((attempt+1))/$((max_retries+1)))"
+              echo "======================================"
+
+              export DISPLAY=:99
+              RECORDING_PATH="recordings/${label}.mp4"
+
+              echo "🎥 Démarrage capture ffmpeg optimisée (léger) sur DISPLAY=:99..."
+              ffmpeg -y -f x11grab -video_size 1280x800 -framerate 10 \
+                -i :99.0 \
+                -c:v libx264 -crf 28 -preset fast -tune stillimage -pix_fmt yuv420p -an \
+                "$RECORDING_PATH" > /tmp/ffmpeg-${label}.log 2>&1 &
+              FFMPEG_PID=$!
+              sleep 1
+              if kill -0 $FFMPEG_PID 2>/dev/null; then
+                echo "✅ ffmpeg actif (PID $FFMPEG_PID)"
+              else
+                echo "❌ ffmpeg n'a pas démarré"
+                cat /tmp/ffmpeg-${label}.log | tail -10
+              fi
+
+              hermes -z "$TASK_CONTENT" --provider "$provider" -m "$model" -t "browser,terminal" --yolo > "output-${label}.json" 2>&1
+              HERMES_EXIT=$?
+
+              echo "🎥 Arrêt de ffmpeg..."
+              if kill -0 $FFMPEG_PID 2>/dev/null; then
+                kill -INT $FFMPEG_PID
+                wait $FFMPEG_PID 2>/dev/null || true
+                echo "✅ ffmpeg arrêté"
+              fi
+
+              agent-browser close --all 2>/dev/null || true
+
+              echo "exit_code=$HERMES_EXIT"
+
+              # Vérifier si le résultat est valide
+              if grep -qiE '"overall_status"\s*:\s*"(up|down)"' "output-${label}.json"; then
+                echo "✅ Résultat valide détecté"
+                return 0
+              fi
+
+              # Vérifier les erreurs temporaires
+              if [ $attempt -lt $max_retries ]; then
+                ERROR_MSG=$(cat "output-${label}.json" 2>/dev/null || echo "")
+                if is_temporary_error "$ERROR_MSG"; then
+                  delay=$(echo "scale=2; min($MAX_RETRY_DELAY, $delay_base * (2 ^ $attempt) + $RANDOM / 32767) * 1" | bc -l)
+                  delay=$(echo "scale=2; if ($delay < $MIN_RETRY_DELAY) $MIN_RETRY_DELAY else if ($delay > $MAX_RETRY_DELAY) $MAX_RETRY_DELAY else $delay" | bc -l)
+                  echo "⚠️ Erreur temporaire détectée - Attente de ${delay}s avant de réessayer..."
+                  sleep $delay
+                  continue
+                elif is_quota_error "$ERROR_MSG"; then
+                  echo "❌ Erreur de quota définitive détectée - Passage au modèle suivant"
+                  return 1
+                fi
+              fi
+
+              return 1
+            done
+            return 1
+          }
+
+          is_json_valid() {
+            grep -qiE '"overall_status"\s*:\s*"(up|down)"' "$1"
+          }
+
+          is_fully_verified() {
+            is_json_valid "$1" && ! grep -qiE '"actions_completed"\s*:\s*false' "$1"
+          }
+
+          try_result() {
+            cp "$1" output.json
+            if is_fully_verified output.json; then
+              echo "✅ Succès complet avec ${2}"
+              echo "agent_failed=false" >> $GITHUB_OUTPUT
+              echo "winning_label=${2}" >> $GITHUB_OUTPUT
+              echo "verification_partial=false" >> $GITHUB_OUTPUT
+              exit 0
+            elif is_json_valid output.json; then
+              echo "⚠️ ${2} : JSON valide mais actions_completed=false — mis en réserve, on continue la chaîne"
+              cp output.json /tmp/best_partial.json
+              BEST_PARTIAL_LABEL="${2}"
+            fi
+          }
+
+          # ======================================
+          # 🥇 PRIORITÉ 1 : Gemini (Google AI Studio) - MODÈLES GRATUITS
+          # ======================================
+          echo "======================================"
+          echo "🥇 PRIORITÉ 1 : Gemini (Google AI Studio) - MODÈLES GRATUITS"
+          echo "======================================"
+          for GEMINI_MODEL in "gemini-3.5-flash" "gemini-3.6-flash" "gemini-2.5-pro"; do
+            label="gemini-$(echo "$GEMINI_MODEL" | tr '/:' '--')"
+            if run_with_retry "gemini" "$GEMINI_MODEL" "$label"; then
+              try_result "output-${label}.json" "$label"
+            else
+              echo "❌ Échec avec $GEMINI_MODEL après $((MAX_RETRIES+1)) tentatives"
+            fi
+          done
+
+          # ======================================
+          # 🥈 PRIORITÉ 2 : Mistral
+          # ======================================
+          echo "======================================"
+          echo "🥈 PRIORITÉ 2 : Mistral"
+          echo "======================================"
+          if run_with_retry "custom:mistral" "mistral-small-latest" "mistral"; then
+            try_result "output-mistral.json" "mistral"
+          else
+            echo "❌ Échec avec Mistral après $((MAX_RETRIES+1)) tentatives"
+          fi
+
+          # ======================================
+          # 🥉 PRIORITÉ 3 : Chaîne OpenRouter (modèles gratuits)
+          # ======================================
+          echo "======================================"
+          echo "🥉 PRIORITÉ 3 : Chaîne OpenRouter (modèles gratuits)"
+          echo "======================================"
+          for OR_MODEL in "poolside/laguna-s-2.1:free" "inclusionai/ling-3.0-flash-fin:free" "thinkingmachines/inkling:free" "openrouter/free"; do
+            label="openrouter-$(echo "$OR_MODEL" | tr '/:' '--')"
+            if run_with_retry "openrouter" "$OR_MODEL" "$label"; then
+              try_result "output-${label}.json" "$label"
+            else
+              echo "❌ Échec avec $OR_MODEL après $((MAX_RETRIES+1)) tentatives"
+            fi
+          done
+
+          # ======================================
+          # 🌐 PRIORITÉ 4 : Fallback sur HuggingFace
+          # ======================================
+          echo "======================================"
+          echo "🌐 PRIORITÉ 4 : Fallback sur HuggingFace"
+          echo "======================================"
+          if run_with_retry "huggingface" "openai/gpt-oss-120b:cerebras" "huggingface"; then
+            try_result "output-huggingface.json" "huggingface"
+          else
+            echo "❌ Échec avec HuggingFace après $((MAX_RETRIES+1)) tentatives"
+          fi
+
+          # Aucun modèle n'a complété toutes les actions demandées : on utilise le meilleur essai partiel
+          if [ -f /tmp/best_partial.json ]; then
+            echo "⚠️ Aucun modèle n'a complété toutes les actions — utilisation du meilleur essai partiel (${BEST_PARTIAL_LABEL})"
+            cp /tmp/best_partial.json output.json
+            echo "agent_failed=false" >> $GITHUB_OUTPUT
+            echo "winning_label=${BEST_PARTIAL_LABEL}" >> $GITHUB_OUTPUT
+            echo "verification_partial=true" >> $GITHUB_OUTPUT
             exit 0
           fi
-          if jq -e '.pages' output.json >/dev/null 2>&1; then
-            jq -c '{pages: .pages}' output.json > pages_payload.json
-            echo "📤 Envoi du rapport pages..."
-            curl -sS \
-              --retry 3 \
-              --retry-delay 2 \
-              -X POST \
-              "$RELAY_URL/sites/$SITE_ID/pages-report" \
-              -H "x-relay-secret: $RELAY_SECRET" \
-              -H "Content-Type: application/json" \
-              -d @pages_payload.json
-            echo
-          else
-            echo "⚠️ Aucun tableau pages exploitable"
-          fi
 
+          echo "❌ Échec final après tous les providers"
+          echo "agent_failed=true" >> $GITHUB_OUTPUT
 
-      # ========================================================
-      # ENVOYER STATUS GLOBAL
-      # ========================================================
-      - name: Envoyer le statut global
+      - name: Extraire et envoyer le résultat
         if: always()
         env:
           SITE_ID: ${{ matrix.site.id }}
           RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
           RELAY_URL: ${{ secrets.RELAY_URL }}
+          WINNING_LABEL: ${{ steps.agent_run.outputs.winning_label }}
+          VERIFICATION_PARTIAL: ${{ steps.agent_run.outputs.verification_partial }}
         run: |
-          set +e
-          STATUS="ERROR"
-          MESSAGE="Agent Q execution error"
-          if [ -f output.json ]; then
-            STATUS=$(jq -r '.overall_status // "ERROR"' output.json | tr '[:lower:]' '[:upper:]')
-            MESSAGE=$(jq -c '{
-              site_type: .site_type,
-              actions_completed: .actions_completed,
-              model_used: .model_used,
-              fallback_used: .fallback_used,
-              pages: .pages
-            }' output.json)
+          if [ ! -f output.json ] || [ ! -s output.json ]; then
+            STATUS="ERROR"
+            REASON="Agent output missing or empty"
+            PAGES_JSON=""
+          elif [ "${{ steps.agent_run.outputs.agent_failed }}" == "true" ]; then
+            STATUS="ERROR"
+            REASON="Agent execution failed after all attempts"
+            PAGES_JSON=""
+          else
+            AGENT_TEXT=$(cat output.json)
+            PAGES_JSON=$(printf '%s' "$AGENT_TEXT" | awk '
+              /```json/ { capture=1; buf=""; next }
+              /```/ { if (capture) { last=buf; capture=0 } ; next }
+              capture { buf = buf $0 "\n" }
+              END { printf "%s", last }
+            ')
+
+            if echo "$PAGES_JSON" | jq -e '.overall_status and .pages' > /dev/null 2>&1; then
+              STATUS=$(echo "$PAGES_JSON" | jq -r '.overall_status // "UNKNOWN"' | tr '[:lower:]' '[:upper:]')
+              SITE_TYPE=$(echo "$PAGES_JSON" | jq -r '.site_type // "non détecté"')
+              PAGES_JSON=$(echo "$PAGES_JSON" | jq -c '.pages |= map(.status |= (if . then ascii_upcase else "UNKNOWN" end))')
+              REASON=$(echo "$PAGES_JSON" | jq -c '.pages')
+              echo "$PAGES_JSON" > pages.json
+              echo "🏷️ Type de site détecté : $SITE_TYPE"
+              echo "📄 $(echo "$PAGES_JSON" | jq '.pages | length') page(s) rapportée(s) :"
+              echo "$PAGES_JSON" | jq -r '.pages[] | "  - \(.url) → \(.status) (http=\(.http_code // "n/a")) : \(.action_tested // "navigation simple") — \(.note // "")"'
+
+              MAX_DUP=$(echo "$PAGES_JSON" | jq '[.pages[].note] | group_by(.) | map(length) | max')
+              TOTAL_PAGES=$(echo "$PAGES_JSON" | jq '.pages | length')
+              if [ -n "$MAX_DUP" ] && [ -n "$TOTAL_PAGES" ] && [ "$TOTAL_PAGES" -gt 0 ] && [ "$MAX_DUP" -ge $(( (TOTAL_PAGES + 1) / 2 )) ]; then
+                echo "⚠️ ${MAX_DUP}/${TOTAL_PAGES} pages partagent une note identique — vérification probablement bâclée"
+                REASON="⚠️ VÉRIFICATION SUSPECTE (notes dupliquées, ${MAX_DUP}/${TOTAL_PAGES} pages identiques) — $REASON"
+              fi
+            else
+              echo "⚠️ Bloc JSON structuré introuvable, repli sur extraction texte"
+              if echo "$AGENT_TEXT" | grep -qi "up"; then
+                STATUS="UP"
+                REASON="Site appears operational (extracted from text)"
+              elif echo "$AGENT_TEXT" | grep -qi "down"; then
+                STATUS="DOWN"
+                REASON="Site appears down (extracted from text)"
+              else
+                STATUS="UNKNOWN"
+                REASON="No status indicator found in output"
+              fi
+              PAGES_JSON=""
+            fi
           fi
-          echo "======================================"
-          echo "📡 STATUT : $STATUS"
-          echo "======================================"
-          echo "$MESSAGE"
-          jq -nc \
-            --arg status "$STATUS" \
-            --arg message "$MESSAGE" \
-            '{status: $status, message: $message}' \
-            > status_payload.json
-          curl -sS \
-            --retry 3 \
-            --retry-delay 2 \
-            -X POST \
-            "$RELAY_URL/sites/$SITE_ID/mark-crawled" \
-            -H "x-relay-secret: $RELAY_SECRET" \
-            -H "Content-Type: application/json" \
-            -d @status_payload.json
-          echo
 
+          if [ "$VERIFICATION_PARTIAL" == "true" ]; then
+            REASON="⚠️ VÉRIFICATION PARTIELLE (aucun modèle n'a complété toutes les actions demandées) — $REASON"
+          fi
 
-      # ========================================================
-      # LISTER VIDÉOS
-      # ========================================================
-      - name: Lister les vidéos Playwright
+          echo "Statut final: $STATUS"
+          echo "Message: $REASON"
+
+          if [ -n "$PAGES_JSON" ] && echo "$PAGES_JSON" | jq -e '.pages' > /dev/null 2>&1; then
+            echo "📤 Envoi du rapport pages à $RELAY_URL/sites/$SITE_ID/pages-report"
+            echo "$PAGES_JSON" | jq -c '{pages: .pages}' > pages_payload.json
+            curl -X POST "$RELAY_URL/sites/$SITE_ID/pages-report" -H "x-relay-secret: $RELAY_SECRET" -H "Content-Type: application/json" -d @pages_payload.json || echo "⚠️ Échec envoi pages-report"
+          fi
+
+          echo "📤 Envoi du statut global à $RELAY_URL/sites/$SITE_ID/mark-crawled"
+          jq -nc --arg status "$STATUS" --arg message "$REASON" '{status: $status, message: $message}' > status_payload.json
+          curl -X POST "$RELAY_URL/sites/$SITE_ID/mark-crawled" -H "x-relay-secret: $RELAY_SECRET" -H "Content-Type: application/json" -d @status_payload.json || echo "⚠️ Échec envoi mark-crawled"
+
+      - name: Lister toutes les vidéos enregistrées (Aucun filtrage)
         if: always()
         run: |
-          echo "======================================"
-          echo "🎥 VIDÉOS PLAYWRIGHT"
-          echo "======================================"
-          find recordings \
-            -maxdepth 2 \
-            -type f \
-            -printf "%p - %s bytes\n" \
-            2>/dev/null \
-            || echo "Aucune vidéo"
+          echo "=== Vidéos enregistrées (TOUTES conservées pour l'artefact) ==="
+          ls -lah recordings/ 2>/dev/null || echo "(aucune vidéo trouvée)"
 
-
-      # ========================================================
-      # LISTER TRACES
-      # ========================================================
-      - name: Lister les traces Playwright
-        if: always()
-        run: |
-          echo "======================================"
-          echo "🧪 TRACES PLAYWRIGHT"
-          echo "======================================"
-          find traces \
-            -maxdepth 2 \
-            -type f \
-            -printf "%p - %s bytes\n" \
-            2>/dev/null \
-            || echo "Aucune trace"
-
-
-      # ========================================================
-      # UPLOAD ARTIFACTS
-      # ========================================================
-      - name: Uploader les artifacts Agent Q
+      - name: Uploader la vidéo (artifact)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: agent-q-monitoring-${{ matrix.site.id }}
-          path: |
-            recordings/
-            traces/
-            screenshots/
-            agent-output/
-            output.json
-            run_agent_q.py
+          name: hermes-recordings-${{ matrix.site.id }}
+          path: recordings/*
           if-no-files-found: ignore
           retention-days: 7
