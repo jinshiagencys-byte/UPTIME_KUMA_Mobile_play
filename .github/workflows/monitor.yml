@@ -132,13 +132,17 @@ jobs:
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
           DISPLAY: ":99"
           AGENT_BROWSER_HEADED: "1"
-          # ✅ FIX : séparateur newline au lieu de virgule pour éviter que
-          # --window-size=1280,800 ne soit coupé en deux arguments
+          # ✅ FIX RACINE : AUCUNE valeur ne contient de virgule interne.
+          # --window-size=1280,800 est SUPPRIMÉ : sa virgule interne était
+          # re-sérialisée par Hermes en chaîne séparée par virgules pour
+          # agent-browser, coupant le flag en "--window-size=1280" + "800",
+          # et "800" nu devenait une URL (hôte numérique -> 0.0.3.32).
+          # Redondant de toute façon : Xvfb est déjà en 1280x800 et
+          # --start-maximized maximise la fenêtre dans le display virtuel.
           AGENT_BROWSER_ARGS: |
             --no-sandbox
             --disable-dev-shm-usage
             --disable-blink-features=AutomationControlled
-            --window-size=1280,800
             --start-maximized
             --no-first-run
             --no-default-browser-check
@@ -296,11 +300,11 @@ jobs:
         env:
           DISPLAY: ":99"
           AGENT_BROWSER_HEADED: "1"
+          # ✅ Même liste sans virgule interne que dans l'étape de config
           AGENT_BROWSER_ARGS: |
             --no-sandbox
             --disable-dev-shm-usage
             --disable-blink-features=AutomationControlled
-            --window-size=1280,800
             --start-maximized
             --no-first-run
             --no-default-browser-check
@@ -489,6 +493,22 @@ jobs:
           echo "📤 Envoi du statut global à $RELAY_URL/sites/$SITE_ID/mark-crawled"
           jq -nc --arg status "$STATUS" --arg message "$REASON" '{status: $status, message: $message}' > status_payload.json
           curl -X POST "$RELAY_URL/sites/$SITE_ID/mark-crawled" -H "x-relay-secret: $RELAY_SECRET" -H "Content-Type: application/json" -d @status_payload.json || echo "⚠️ Échec envoi mark-crawled"
+
+      - name: Ne garder que la vidéo de la tentative gagnante
+        if: always()
+        env:
+          WINNING_LABEL: ${{ steps.agent_run.outputs.winning_label }}
+        run: |
+          echo "=== Vidéos avant filtrage ==="
+          ls -lah recordings/ 2>/dev/null || echo "(aucune)"
+          if [ -n "$WINNING_LABEL" ]; then
+            echo "🎬 Conservation uniquement de : ${WINNING_LABEL}.webm"
+            find recordings -type f -name '*.webm' ! -name "${WINNING_LABEL}.webm" -delete
+          else
+            echo "⚠️ Pas de tentative gagnante : toutes les vidéos sont conservées pour debug"
+          fi
+          echo "=== Vidéos après filtrage ==="
+          ls -lah recordings/ 2>/dev/null || echo "(aucune)"
 
       - name: Uploader la vidéo (artifact)
         if: always()
