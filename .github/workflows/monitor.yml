@@ -132,13 +132,6 @@ jobs:
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
           DISPLAY: ":99"
           AGENT_BROWSER_HEADED: "1"
-          # ✅ FIX RACINE : AUCUNE valeur ne contient de virgule interne.
-          # --window-size=1280,800 est SUPPRIMÉ : sa virgule interne était
-          # re-sérialisée en chaîne séparée par virgules avant d'atteindre
-          # agent-browser, coupant le flag en "--window-size=1280" + "800",
-          # et "800" nu devenait une URL (hôte numérique -> 0.0.3.32).
-          # Redondant de toute façon : Xvfb est déjà en 1280x800 et
-          # --start-maximized maximise la fenêtre dans le display virtuel.
           AGENT_BROWSER_ARGS: |
             --no-sandbox
             --disable-dev-shm-usage
@@ -315,7 +308,6 @@ jobs:
         env:
           DISPLAY: ":99"
           AGENT_BROWSER_HEADED: "1"
-          # ✅ Même liste sans virgule interne que dans l'étape de config
           AGENT_BROWSER_ARGS: |
             --no-sandbox
             --disable-dev-shm-usage
@@ -401,16 +393,10 @@ jobs:
             grep -qiE '"overall_status"\s*:\s*"(up|down)"' "$1"
           }
 
-          # Un JSON valide où actions_completed=false n'est PAS considéré
-          # comme une vérification fiable : le modèle a pu naviguer sans
-          # jamais exécuter les actions interactives demandées (panier,
-          # formulaire, etc.), voire recopier un verdict générique sans
-          # visiter chaque page individuellement.
           is_fully_verified() {
             is_json_valid "$1" && ! grep -qiE '"actions_completed"\s*:\s*false' "$1"
           }
 
-          # $1 = fichier output brut de cette tentative, $2 = label
           try_result() {
             cp "$1" output.json
             if is_fully_verified output.json; then
@@ -426,8 +412,20 @@ jobs:
             fi
           }
 
+          # ======================================
+          # 🥇 PRIORITÉ 1 : NVIDIA NIM (Modèle principal)
+          # ======================================
           echo "======================================"
-          echo "🔁 Chaîne de repli OpenRouter (modèles gratuits)"
+          echo "🥇 PRIORITÉ 1 : NVIDIA NIM"
+          echo "======================================"
+          run_agent "nvidia" "moonshotai/kimi-k3" "nvidia1"
+          try_result "output-nvidia1.json" "nvidia1"
+
+          # ======================================
+          # 🥈 PRIORITÉ 2 : Chaîne de repli OpenRouter (modèles gratuits)
+          # ======================================
+          echo "======================================"
+          echo "🔁 PRIORITÉ 2 : Chaîne de repli OpenRouter"
           echo "======================================"
           for OR_MODEL in "poolside/laguna-s-2.1:free" "inclusionai/ling-3.0-flash-fin:free" "thinkingmachines/inkling:free" "openrouter/free"; do
             label="openrouter-$(echo "$OR_MODEL" | tr '/:' '--')"
@@ -435,8 +433,11 @@ jobs:
             try_result "output-${label}.json" "$label"
           done
 
+          # ======================================
+          # 🥉 PRIORITÉ 3 : Fallback sur Mistral / Gemini / HuggingFace
+          # ======================================
           echo "======================================"
-          echo "🔁 Fallback sur Mistral / Gemini / HuggingFace"
+          echo "🔁 PRIORITÉ 3 : Fallback sur Mistral / Gemini / HuggingFace"
           echo "======================================"
           for PAIR in "custom:mistral|mistral-small-latest" "gemini|gemini-3.1-pro-preview" "huggingface|openai/gpt-oss-120b:cerebras"; do
             provider="${PAIR%%|*}"
@@ -446,15 +447,7 @@ jobs:
             try_result "output-${label}.json" "$label"
           done
 
-          echo "======================================"
-          echo "🔁 Dernier recours : NVIDIA NIM"
-          echo "======================================"
-          run_agent "nvidia" "moonshotai/kimi-k3" "nvidia1"
-          try_result "output-nvidia1.json" "nvidia1"
-
-          # Aucun modèle — y compris NVIDIA — n'a complété toutes les
-          # actions demandées : on utilise le meilleur essai partiel plutôt
-          # que de tout perdre, mais on le signale explicitement.
+          # Aucun modèle n'a complété toutes les actions demandées : on utilise le meilleur essai partiel
           if [ -f /tmp/best_partial.json ]; then
             echo "⚠️ Aucun modèle n'a complété toutes les actions — utilisation du meilleur essai partiel (${BEST_PARTIAL_LABEL})"
             cp /tmp/best_partial.json output.json
@@ -503,10 +496,6 @@ jobs:
               echo "📄 $(echo "$PAGES_JSON" | jq '.pages | length') page(s) rapportée(s) :"
               echo "$PAGES_JSON" | jq -r '.pages[] | "  - \(.url) → \(.status) (http=\(.http_code // "n/a")) : \(.action_tested // "navigation simple") — \(.note // "")"'
 
-              # ⚠️ Détection de notes dupliquées : signe que le modèle a
-              # recopié un verdict générique au lieu de visiter chaque page
-              # individuellement (ex: "Contenu vide" identique sur 5 pages
-              # sans rapport entre elles).
               MAX_DUP=$(echo "$PAGES_JSON" | jq '[.pages[].note] | group_by(.) | map(length) | max')
               TOTAL_PAGES=$(echo "$PAGES_JSON" | jq '.pages | length')
               if [ -n "$MAX_DUP" ] && [ -n "$TOTAL_PAGES" ] && [ "$TOTAL_PAGES" -gt 0 ] && [ "$MAX_DUP" -ge $(( (TOTAL_PAGES + 1) / 2 )) ]; then
@@ -546,21 +535,11 @@ jobs:
           jq -nc --arg status "$STATUS" --arg message "$REASON" '{status: $status, message: $message}' > status_payload.json
           curl -X POST "$RELAY_URL/sites/$SITE_ID/mark-crawled" -H "x-relay-secret: $RELAY_SECRET" -H "Content-Type: application/json" -d @status_payload.json || echo "⚠️ Échec envoi mark-crawled"
 
-      - name: Ne garder que la vidéo de la tentative gagnante
+      - name: Lister toutes les vidéos enregistrées (Aucun filtrage)
         if: always()
-        env:
-          WINNING_LABEL: ${{ steps.agent_run.outputs.winning_label }}
         run: |
-          echo "=== Vidéos avant filtrage ==="
-          ls -lah recordings/ 2>/dev/null || echo "(aucune)"
-          if [ -n "$WINNING_LABEL" ]; then
-            echo "🎬 Conservation uniquement de : ${WINNING_LABEL}.webm"
-            find recordings -type f -name '*.webm' ! -name "${WINNING_LABEL}.webm" -delete
-          else
-            echo "⚠️ Pas de tentative gagnante : toutes les vidéos sont conservées pour debug"
-          fi
-          echo "=== Vidéos après filtrage ==="
-          ls -lah recordings/ 2>/dev/null || echo "(aucune)"
+          echo "=== Vidéos enregistrées (TOUTES conservées pour l'artefact) ==="
+          ls -lah recordings/ 2>/dev/null || echo "(aucune vidéo trouvée)"
 
       - name: Uploader la vidéo (artifact)
         if: always()
