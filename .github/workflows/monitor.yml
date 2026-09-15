@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       site_id:
-        description: 'ID du site à tester spécifiquement (optionnel)'
+        description: "ID du site à tester spécifiquement (optionnel)"
         required: false
         type: string
 
@@ -227,7 +227,7 @@ jobs:
 
     env:
       # ========================================================
-      # MODÈLE UNIQUE — AUCUN FALLBACK
+      # MODÈLE UNIQUE
       # ========================================================
       AGENT_Q_MODEL: "openrouter/thinkingmachines/inkling:free"
 
@@ -247,12 +247,7 @@ jobs:
 
       # ========================================================
       # PYTHON
-      #
-      # IMPORTANT :
-      # PAS DE cache: pip ici.
-      #
-      # Le repository SentinelSite n'a pas de
-      # requirements.txt/pyproject.toml à la racine.
+      # PAS DE cache: pip
       # ========================================================
       - name: Installer Python 3.10
         uses: actions/setup-python@v5
@@ -286,7 +281,7 @@ jobs:
 
 
       # ========================================================
-      # CACHE DU CODE STORE AGENT Q
+      # CACHE CODE STORE AGENT Q
       # ========================================================
       - name: Restaurer le code store Agent Q
         uses: actions/cache@v4
@@ -316,18 +311,17 @@ jobs:
 
 
       # ========================================================
-      # INSTALLER LES DÉPENDANCES EXACTES D'AGENT Q
+      # INSTALLER EXACTEMENT L'ENVIRONNEMENT AGENT Q
       #
-      # On utilise le Pipfile.lock du dépôt Agent Q.
-      # Cela évite de recréer manuellement son environnement.
+      # Agent Q fournit son Pipfile/Pipfile.lock.
       # ========================================================
-      - name: Installer les dépendances Agent Q depuis Pipfile.lock
+      - name: Installer les dépendances Agent Q
         working-directory: agent-q
         run: |
           set -euo pipefail
 
           echo "======================================"
-          echo "📦 INSTALLATION AGENT Q"
+          echo "📦 ENVIRONNEMENT AGENT Q"
           echo "======================================"
 
           pipenv sync
@@ -337,36 +331,60 @@ jobs:
 
 
       # ========================================================
-      # INSTALLER CHROMIUM PLAYWRIGHT
-      #
-      # On utilise l'environnement Pipenv d'Agent Q.
+      # VÉRIFICATION CRITIQUE :
+      # PLAYWRIGHT DOIT ÊTRE DANS LE VENV AGENT Q
+      # ========================================================
+      - name: Vérifier Playwright dans Agent Q
+        working-directory: agent-q
+        run: |
+          set -euo pipefail
+
+          echo "======================================"
+          echo "🔎 VÉRIFICATION PLAYWRIGHT"
+          echo "======================================"
+
+          pipenv run python --version
+
+          pipenv run python -c "
+          import playwright
+          print('✅ Playwright Python trouvé :', playwright.__file__)
+          "
+
+          pipenv run python -c "
+          from playwright.sync_api import sync_playwright
+          print('✅ playwright.sync_api import OK')
+          "
+
+
+      # ========================================================
+      # INSTALLER CHROMIUM
       # ========================================================
       - name: Installer Chromium Playwright
         working-directory: agent-q
         run: |
           set -euo pipefail
 
+          echo "======================================"
+          echo "🌐 INSTALLATION CHROMIUM"
+          echo "======================================"
+
           pipenv run playwright install --with-deps chromium
 
-          echo "======================================"
-          echo "🌐 PLAYWRIGHT"
-          echo "======================================"
-
+          echo
           pipenv run playwright --version
 
 
       # ========================================================
-      # RÉPERTOIRES DE SORTIE
+      # RÉPERTOIRES
       # ========================================================
       - name: Préparer les répertoires
         run: |
           set -euo pipefail
 
-          mkdir -p \
-            recordings \
-            traces \
-            screenshots \
-            agent-output
+          mkdir -p recordings
+          mkdir -p traces
+          mkdir -p screenshots
+          mkdir -p agent-output
 
           echo "✅ Répertoires prêts"
 
@@ -381,6 +399,7 @@ jobs:
         run: |
 
           cat > run_agent_q.py <<'PYTHON'
+
           import json
           import os
           import sys
@@ -391,13 +410,42 @@ jobs:
 
 
           # =====================================================
+          # CHEMINS ABSOLUS
+          # =====================================================
+
+          ROOT = Path(__file__).resolve().parent
+
+          AGENT_Q_ROOT = ROOT / "agent-q"
+
+          RECORDINGS_DIR = ROOT / "recordings"
+          TRACES_DIR = ROOT / "traces"
+          OUTPUT_DIR = ROOT / "agent-output"
+
+
+          RECORDINGS_DIR.mkdir(
+              parents=True,
+              exist_ok=True
+          )
+
+          TRACES_DIR.mkdir(
+              parents=True,
+              exist_ok=True
+          )
+
+          OUTPUT_DIR.mkdir(
+              parents=True,
+              exist_ok=True
+          )
+
+
+          # =====================================================
           # IMPORT AGENT Q
           # =====================================================
 
-          AGENT_Q_ROOT = Path("agent-q").resolve()
-
-          if str(AGENT_Q_ROOT) not in sys.path:
-              sys.path.insert(0, str(AGENT_Q_ROOT))
+          sys.path.insert(
+              0,
+              str(AGENT_Q_ROOT)
+          )
 
           from src.agent.web_agent.web_agent import WebAgent
 
@@ -407,6 +455,7 @@ jobs:
           # =====================================================
 
           SITE_URL = os.environ["SITE_URL"]
+
           SITE_ID = os.environ["SITE_ID"]
 
           MODEL_ID = os.environ.get(
@@ -418,22 +467,30 @@ jobs:
               "OPENROUTER_API_KEY"
           )
 
+
           if not OPENROUTER_API_KEY:
               raise RuntimeError(
-                  "OPENROUTER_API_KEY absent des secrets GitHub."
+                  "OPENROUTER_API_KEY absent."
               )
 
 
           # =====================================================
-          # PAGES CONNUES
+          # PAGES
           # =====================================================
 
           try:
+
               pages = json.loads(
-                  os.environ.get("PAGES_JSON", "[]")
+                  os.environ.get(
+                      "PAGES_JSON",
+                      "[]"
+                  )
               )
+
           except Exception:
+
               pages = []
+
 
           pages_list = "\n".join(
               f"- {page.get('url')}"
@@ -443,7 +500,7 @@ jobs:
 
 
           # =====================================================
-          # TÂCHE AGENT Q
+          # TÂCHE
           # =====================================================
 
           task = f"""
@@ -465,34 +522,32 @@ jobs:
           Tester réellement le fonctionnement du site comme un
           utilisateur humain.
 
-          Tu dois utiliser le navigateur.
+          Utilise réellement le navigateur.
 
-          Tu ne dois pas seulement analyser le HTML ou expliquer
-          ce qu'il faudrait faire.
-
-          Tu dois réellement effectuer les actions.
+          Ne te contente pas d'analyser le HTML.
 
           ======================================================
-          ÉTAPE 1 — SITE
+          PAGE PRINCIPALE
           ======================================================
 
-          Ouvre d'abord :
+          Ouvre :
 
           {SITE_URL}
 
-          Vérifie que la page correspond réellement au site attendu.
+          Vérifie que le contenu correspond au site attendu.
 
           Attention aux :
+
           - pages de parking ;
           - pages d'hébergement ;
           - "It works!" ;
           - erreurs DNS ;
           - erreurs SSL ;
           - placeholders ;
-          - pages totalement vides.
+          - pages vides.
 
           ======================================================
-          ÉTAPE 2 — TYPE DE SITE
+          TYPE DE SITE
           ======================================================
 
           Détermine :
@@ -504,91 +559,87 @@ jobs:
           autre
 
           ======================================================
-          ÉTAPE 3 — PAGES
+          PAGES
           ======================================================
 
-          Les pages suivantes sont connues :
+          Les pages connues :
 
           {pages_list}
 
           Visite réellement les pages pertinentes.
 
-          Ne prétends jamais avoir visité une page simplement parce
-          que son URL était fournie.
+          Ne prétends jamais avoir visité une page que tu n'as
+          pas réellement ouverte.
 
           ======================================================
-          ÉTAPE 4 — ACTION INTERACTIVE
+          ACTION INTERACTIVE OBLIGATOIRE
           ======================================================
 
-          Tu dois effectuer AU MOINS UNE vraie action interactive.
+          Tu dois effectuer au moins une vraie action interactive.
 
           E-COMMERCE :
 
-          - trouver un vrai produit ;
-          - ouvrir sa fiche ;
-          - cliquer réellement sur Ajouter au panier / Add to cart
-            ou équivalent ;
+          - trouver un produit réel ;
+          - ouvrir la fiche ;
+          - cliquer réellement sur Ajouter au panier ;
           - ouvrir le panier ;
-          - vérifier le résultat réel ;
-          - vérifier nom, quantité et prix.
+          - vérifier le produit ;
+          - vérifier quantité et prix.
 
           AUTH :
 
           - ouvrir réellement la page d'authentification ;
           - effectuer une action pertinente ;
-          - ne jamais utiliser de vrai compte ;
-          - utiliser des données fictives ;
+          - utiliser uniquement des données fictives ;
           - observer réellement la réponse.
 
           RECHERCHE :
 
           - effectuer réellement une recherche ;
-          - observer réellement les résultats.
+          - vérifier les résultats.
 
           FORMULAIRE :
 
           - remplir réellement le formulaire ;
-          - utiliser "TEST AUTOMATISÉ" lorsqu'un message est approprié ;
-          - soumettre réellement ;
-          - observer le résultat.
+          - utiliser "TEST AUTOMATISÉ" si pertinent ;
+          - soumettre ;
+          - vérifier le résultat.
 
           ======================================================
-          IMPORTANT
+          DONNÉES DYNAMIQUES
           ======================================================
 
-          Un bouton présent n'est PAS la preuve que la fonction marche.
+          Si des données attendues sont :
 
-          Exemple :
-
-          FAUX :
-          "Le bouton Ajouter au panier existe donc le panier marche."
-
-          CORRECT :
-          "J'ai cliqué sur Ajouter au panier, puis ouvert le panier
-          et constaté que le produit X apparaît avec quantité Y
-          et prix Z."
-
-          ======================================================
-          DONNÉES BACKEND
-          ======================================================
-
-          Si la page possède des données dynamiques attendues
-          et qu'elles sont :
           - vides ;
           - undefined ;
           - null ;
           - bloquées ;
           - absentes ;
 
-          considère cela comme une anomalie fonctionnelle,
-          même si HTTP = 200.
+          considère cela comme une anomalie fonctionnelle même
+          si HTTP = 200.
 
           ======================================================
-          RÉSULTAT
+          RÈGLE CRITIQUE
           ======================================================
 
-          À la fin, produis un résultat JSON suivant exactement
-          cette structure :
+          Un bouton présent ne signifie PAS que la fonctionnalité
+          fonctionne.
+
+          Il faut :
+
+          clic réel
+          +
+          résultat réel
+          +
+          vérification.
+
+          ======================================================
+          JSON FINAL
+          ======================================================
+
+          Produis à la fin exactement :
 
           {{
             "overall_status": "UP",
@@ -599,30 +650,25 @@ jobs:
                 "url": "URL exacte",
                 "status": "UP",
                 "http_code": 200,
-                "action_tested": "description de l'action",
-                "note": "résultat réel observé"
+                "action_tested": "description",
+                "note": "résultat réellement observé"
               }}
             ]
           }}
 
-          Règles :
-
           overall_status :
-            uniquement UP ou DOWN
+          UP ou DOWN uniquement.
 
           status :
-            uniquement UP ou DOWN
+          UP ou DOWN uniquement.
 
           actions_completed :
-            true uniquement si les actions exécutées ont réellement
-            été effectuées et vérifiées.
+          true uniquement si les actions ont été réellement exécutées
+          et vérifiées.
 
-          Une action métier qui échoue signifie DOWN.
+          Un échec métier réel = DOWN.
 
-          Une page HTTP 200 avec un backend inutilisable peut également
-          être DOWN.
-
-          Ne jamais inventer une action qui n'a pas été exécutée.
+          Ne jamais inventer une action.
           """
 
 
@@ -633,8 +679,17 @@ jobs:
           print("======================================")
           print("🤖 AGENT Q")
           print("======================================")
-          print(f"Site   : {SITE_URL}")
-          print(f"Model  : {MODEL_ID}")
+
+          print(
+              "Site :",
+              SITE_URL
+          )
+
+          print(
+              "Model :",
+              MODEL_ID
+          )
+
           print()
 
 
@@ -651,7 +706,9 @@ jobs:
           with sync_playwright() as playwright:
 
               browser = playwright.chromium.launch(
+
                   headless=True,
+
                   args=[
                       "--no-sandbox",
                       "--disable-dev-shm-usage",
@@ -661,7 +718,9 @@ jobs:
                   ],
               )
 
+
               context = browser.new_context(
+
                   viewport={
                       "width": 1280,
                       "height": 800,
@@ -680,14 +739,15 @@ jobs:
                       "Safari/537.36"
                   ),
 
-                  # ============================================
-                  # VIDÉO PLAYWRIGHT
-                  # ============================================
+                  # =================================================
+                  # VIDÉO NATIVE PLAYWRIGHT
+                  # =================================================
 
                   record_video={
                       "dir": str(
-                          Path("recordings").resolve()
+                          RECORDINGS_DIR
                       ),
+
                       "size": {
                           "width": 1280,
                           "height": 800,
@@ -696,9 +756,9 @@ jobs:
               )
 
 
-              # ================================================
+              # ==================================================
               # TRACE
-              # ================================================
+              # ==================================================
 
               context.tracing.start(
                   screenshots=True,
@@ -706,56 +766,83 @@ jobs:
                   sources=True,
               )
 
+
               page = context.new_page()
 
 
               try:
 
-                  # ==========================================
-                  # OUVERTURE DU SITE
-                  # ==========================================
+                  # ==============================================
+                  # OUVERTURE INITIALE
+                  # ==============================================
 
-                  print("🌐 Ouverture du site...")
+                  print(
+                      "🌐 Ouverture du site..."
+                  )
+
 
                   page.goto(
+
                       SITE_URL,
+
                       wait_until="domcontentloaded",
+
                       timeout=30000,
                   )
 
+
                   print(
-                      "✅ Page initiale chargée :",
+                      "✅ Page chargée :",
                       page.url
                   )
 
 
-                  # ==========================================
+                  # ==============================================
                   # AGENT Q
-                  # ==========================================
+                  # ==============================================
 
                   agent = WebAgent(
                       page,
                       model
                   )
 
+
                   agent.init_agent()
 
 
-                  # ==========================================
+                  # ==============================================
                   # PREMIÈRE TENTATIVE
-                  # ==========================================
+                  # ==============================================
 
                   print()
-                  print("🤖 Exécution Agent Q...")
+                  print(
+                      "🤖 Exécution Agent Q..."
+                  )
 
-                  result = agent.do(task)
+
+                  result = agent.do(
+                      task
+                  )
+
 
                   print()
-                  print("✅ Agent Q terminé.")
+                  print(
+                      "✅ Agent Q terminé"
+                  )
 
-                  print("Résultat :")
-                  print(result)
 
+                  print(
+                      "Résultat :"
+                  )
+
+                  print(
+                      result
+                  )
+
+
+                  # ==============================================
+                  # RAW RESULT
+                  # ==============================================
 
                   output = {
                       "site_id": SITE_ID,
@@ -764,15 +851,19 @@ jobs:
                       "result": result,
                   }
 
-                  Path(
-                      "agent-output/raw-result.json"
+
+                  (
+                      OUTPUT_DIR /
+                      "raw-result.json"
                   ).write_text(
+
                       json.dumps(
                           output,
                           ensure_ascii=False,
                           indent=2,
                           default=str,
                       ),
+
                       encoding="utf-8",
                   )
 
@@ -781,15 +872,26 @@ jobs:
 
                   print()
                   print(
-                      "❌ Première exécution Agent Q échouée :"
+                      "❌ Première tentative Agent Q échouée"
                   )
 
-                  print(repr(error))
+                  print(
+                      repr(error)
+                  )
+
+
+                  # ==============================================
+                  # RE-GÉNÉRATION
+                  #
+                  # MÊME modèle.
+                  # Pas de fallback.
+                  # ==============================================
 
                   print()
                   print(
                       "🔄 Régénération avec le même modèle..."
                   )
+
 
                   try:
 
@@ -798,9 +900,11 @@ jobs:
                           force_regenerate=True,
                       )
 
+
                       print(
-                          "✅ Régénération réussie."
+                          "✅ Régénération réussie"
                       )
+
 
                       output = {
                           "site_id": SITE_ID,
@@ -810,62 +914,78 @@ jobs:
                           "regenerated": True,
                       }
 
-                      Path(
-                          "agent-output/raw-result.json"
+
+                      (
+                          OUTPUT_DIR /
+                          "raw-result.json"
                       ).write_text(
+
                           json.dumps(
                               output,
                               ensure_ascii=False,
                               indent=2,
                               default=str,
                           ),
+
                           encoding="utf-8",
                       )
+
 
                   except Exception as regeneration_error:
 
                       print()
                       print(
-                          "❌ Régénération Agent Q échouée :"
+                          "❌ Régénération échouée"
                       )
 
                       print(
-                          repr(regeneration_error)
+                          repr(
+                              regeneration_error
+                          )
                       )
+
 
                       output = {
                           "site_id": SITE_ID,
                           "site_url": SITE_URL,
                           "model": MODEL_ID,
-                          "error": str(regeneration_error),
+                          "error": str(
+                              regeneration_error
+                          ),
                       }
 
-                      Path(
-                          "agent-output/raw-result.json"
+
+                      (
+                          OUTPUT_DIR /
+                          "raw-result.json"
                       ).write_text(
+
                           json.dumps(
                               output,
                               ensure_ascii=False,
                               indent=2,
                           ),
+
                           encoding="utf-8",
                       )
+
 
                       raise
 
 
               finally:
 
-                  # ==========================================
-                  # ARRÊT TRACE
-                  # ==========================================
+                  # ==============================================
+                  # ARRÊTER TRACE
+                  # ==============================================
 
                   try:
 
                       context.tracing.stop(
+
                           path=str(
-                              Path("traces")
-                              / f"trace-{SITE_ID}.zip"
+                              TRACES_DIR /
+                              f"trace-{SITE_ID}.zip"
                           )
                       )
 
@@ -876,30 +996,35 @@ jobs:
                           trace_error
                       )
 
-                  # ==========================================
-                  # FERMETURE
+
+                  # ==============================================
+                  # FERMER CONTEXTE
                   #
-                  # La fermeture du BrowserContext finalise
-                  # la vidéo Playwright.
-                  # ==========================================
+                  # La fermeture finalise la vidéo Playwright.
+                  # ==============================================
 
                   context.close()
+
                   browser.close()
 
 
           print()
           print(
-              "🎥 BrowserContext fermé."
+              "✅ BrowserContext fermé"
           )
 
           print(
-              "✅ Vidéo Playwright finalisée."
+              "🎥 Vidéo Playwright finalisée"
           )
+
           PYTHON
 
 
       # ========================================================
       # EXÉCUTER AGENT Q
+      #
+      # IMPORTANT :
+      # pipenv run = environnement où Playwright est installé.
       # ========================================================
       - name: Exécuter Agent Q
         env:
@@ -914,7 +1039,44 @@ jobs:
         run: |
           set -euo pipefail
 
-          python run_agent_q.py
+          echo "======================================"
+          echo "🤖 LANCEMENT AGENT Q"
+          echo "======================================"
+
+          echo
+          echo "Python système :"
+          python --version
+
+          echo
+          echo "Python Agent Q :"
+          cd agent-q
+          pipenv run python --version
+
+          echo
+          echo "Playwright Agent Q :"
+          pipenv run python -c "
+          import playwright
+          print(playwright.__file__)
+          "
+
+          echo
+          echo "Import Playwright :"
+          pipenv run python -c "
+          from playwright.sync_api import sync_playwright
+          print('✅ playwright.sync_api OK')
+          "
+
+          echo
+          echo "Lancement du runner..."
+          echo
+
+          cd ..
+
+          pipenv --python 3.10 >/dev/null 2>&1 || true
+
+          cd agent-q
+
+          pipenv run python ../run_agent_q.py
 
 
       # ========================================================
@@ -970,16 +1132,22 @@ jobs:
               )
           )
 
-          raw_result = data.get("result")
+
+          raw_result = data.get(
+              "result"
+          )
 
           candidate = None
 
 
           # ==================================================
-          # DICT
+          # RESULTAT DICT
           # ==================================================
 
-          if isinstance(raw_result, dict):
+          if isinstance(
+              raw_result,
+              dict
+          ):
 
               if (
                   "overall_status" in raw_result
@@ -991,10 +1159,13 @@ jobs:
 
 
           # ==================================================
-          # STRING
+          # RESULTAT STRING
           # ==================================================
 
-          elif isinstance(raw_result, str):
+          elif isinstance(
+              raw_result,
+              str
+          ):
 
               try:
 
@@ -1003,11 +1174,16 @@ jobs:
                   )
 
                   if (
-                      isinstance(parsed, dict)
+                      isinstance(
+                          parsed,
+                          dict
+                      )
                       and
-                      "overall_status" in parsed
+                      "overall_status"
+                      in parsed
                       and
-                      "pages" in parsed
+                      "pages"
+                      in parsed
                   ):
 
                       candidate = parsed
@@ -1019,10 +1195,14 @@ jobs:
               if candidate is None:
 
                   match = re.search(
+
                       r"```json\s*(\{.*?\})\s*```",
+
                       raw_result,
+
                       re.DOTALL | re.IGNORECASE,
                   )
+
 
                   if match:
 
@@ -1044,7 +1224,7 @@ jobs:
 
 
           # ==================================================
-          # PAS DE JSON
+          # AUCUN JSON
           # ==================================================
 
           if candidate is None:
@@ -1055,13 +1235,14 @@ jobs:
                   "actions_completed": False,
                   "pages": [],
                   "error": (
-                      "Agent Q n'a pas produit le JSON attendu."
+                      "Agent Q n'a pas produit "
+                      "le JSON attendu."
                   ),
               }
 
 
           # ==================================================
-          # NORMALISER LE STATUT
+          # NORMALISER
           # ==================================================
 
           candidate["overall_status"] = str(
@@ -1107,19 +1288,32 @@ jobs:
           )
 
 
-          echo = json.dumps(
-              candidate,
-              ensure_ascii=False,
-              indent=2
+          print()
+          print(
+              "======================================"
           )
 
-          print(echo)
+          print(
+              "📄 output.json"
+          )
+
+          print(
+              "======================================"
+          )
+
+          print(
+              json.dumps(
+                  candidate,
+                  ensure_ascii=False,
+                  indent=2,
+              )
+          )
 
           PYTHON
 
 
       # ========================================================
-      # AFFICHER RÉSULTAT
+      # AFFICHER LE RÉSULTAT
       # ========================================================
       - name: Afficher le résultat final
         if: always()
@@ -1137,7 +1331,7 @@ jobs:
 
 
       # ========================================================
-      # RAPPORT PAGES
+      # ENVOYER PAGES-REPORT
       # ========================================================
       - name: Envoyer le rapport des pages
         if: always()
@@ -1164,7 +1358,9 @@ jobs:
               output.json \
               > pages_payload.json
 
+
             echo "📤 Envoi du rapport pages..."
+
 
             curl -sS \
               --retry 3 \
@@ -1174,6 +1370,7 @@ jobs:
               -H "x-relay-secret: $RELAY_SECRET" \
               -H "Content-Type: application/json" \
               -d @pages_payload.json
+
 
             echo
 
@@ -1185,7 +1382,7 @@ jobs:
 
 
       # ========================================================
-      # STATUT GLOBAL
+      # ENVOYER STATUS GLOBAL
       # ========================================================
       - name: Envoyer le statut global
         if: always()
@@ -1210,6 +1407,7 @@ jobs:
               output.json \
               | tr '[:lower:]' '[:upper:]'
             )
+
 
             MESSAGE=$(jq -c '
               {
@@ -1248,6 +1446,7 @@ jobs:
             -H "Content-Type: application/json" \
             -d @status_payload.json
 
+
           echo
 
 
@@ -1259,7 +1458,7 @@ jobs:
         run: |
 
           echo "======================================"
-          echo "🎥 VIDÉOS"
+          echo "🎥 VIDÉOS PLAYWRIGHT"
           echo "======================================"
 
           find recordings \
@@ -1278,7 +1477,7 @@ jobs:
         run: |
 
           echo "======================================"
-          echo "🧪 TRACES"
+          echo "🧪 TRACES PLAYWRIGHT"
           echo "======================================"
 
           find traces \
@@ -1290,7 +1489,7 @@ jobs:
 
 
       # ========================================================
-      # ARTIFACT
+      # ARTIFACTS
       # ========================================================
       - name: Uploader les artifacts Agent Q
         if: always()
