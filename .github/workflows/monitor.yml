@@ -234,17 +234,28 @@ jobs:
       #
       # Essayés dans l'ordre, séparés par des virgules.
       # Si un modèle échoue (erreur API, quota, 403 "agentic
-      # harness only", timeout, JSON invalide...), le runner
-      # passe automatiquement au suivant.
+      # harness only", 429 rate limit, timeout, JSON invalide...),
+      # le runner passe automatiquement au suivant.
+      #
+      # Le premier modèle (nvidia_nim/...) utilise le quota
+      # gratuit NVIDIA NIM (build.nvidia.com), séparé du quota
+      # OpenRouter. S'il échoue ou si son quota est épuisé, le
+      # runner bascule sur les modèles OpenRouter suivants.
       #
       # ⚠️ Avant d'ajouter un modèle gratuit OpenRouter ici,
       # vérifier sur sa page openrouter.ai qu'il n'exige pas
       # d'être appelé depuis un "agentic harness" reconnu
       # (cause du 403 sur thinkingmachines/inkling:free).
       # ========================================================
-      AGENT_Q_MODELS: "openrouter/cohere/north-mini-code:free,openrouter/poolside/laguna-xs-2.1:free,openrouter/poolside/laguna-s-2.1:free"
+      AGENT_Q_MODELS: "nvidia_nim/moonshotai/kimi-k2.6,openrouter/cohere/north-mini-code:free,openrouter/poolside/laguna-xs-2.1:free,openrouter/poolside/laguna-s-2.1:free"
 
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+
+      # Clé NVIDIA NIM (build.nvidia.com) — créer un compte
+      # développeur gratuit sur build.nvidia.com, générer une
+      # clé (préfixe nvapi-...) et l'ajouter comme secret GitHub
+      # NVIDIA_API_KEY. LiteLLM lit NVIDIA_NIM_API_KEY.
+      NVIDIA_NIM_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
 
       SITE_ID: ${{ matrix.site.id }}
       SITE_URL: ${{ matrix.site.url }}
@@ -551,10 +562,37 @@ jobs:
               "OPENROUTER_API_KEY"
           )
 
+          NVIDIA_NIM_API_KEY = os.environ.get(
+              "NVIDIA_NIM_API_KEY"
+          )
 
-          if not OPENROUTER_API_KEY:
+
+          def resolve_api_key(model_id):
+              """
+              Choisit la bonne clé API selon le préfixe du modèle :
+              - nvidia_nim/...  -> clé NVIDIA NIM (build.nvidia.com)
+              - openrouter/...  -> clé OpenRouter
+              Retourne None si la clé nécessaire est absente, pour
+              que l'appelant puisse sauter ce modèle proprement au
+              lieu de planter tout le run.
+              """
+
+              if model_id.startswith("nvidia_nim/"):
+                  return NVIDIA_NIM_API_KEY
+
+              if model_id.startswith("openrouter/"):
+                  return OPENROUTER_API_KEY
+
+              # Préfixe inconnu : on retente quand même avec la clé
+              # OpenRouter par défaut, au cas où.
+              return OPENROUTER_API_KEY
+
+
+          if not OPENROUTER_API_KEY and not NVIDIA_NIM_API_KEY:
               raise RuntimeError(
-                  "OPENROUTER_API_KEY absent des secrets GitHub."
+                  "Aucune clé API disponible : ni OPENROUTER_API_KEY "
+                  "ni NVIDIA_NIM_API_KEY ne sont configurées dans "
+                  "les secrets GitHub."
               )
 
           if not MODEL_IDS:
@@ -850,9 +888,26 @@ jobs:
               print(f"🤖 TENTATIVE — MODÈLE : {model_id}")
               print("======================================")
 
+              api_key = resolve_api_key(model_id)
+
+              if not api_key:
+                  print(
+                      f"⚠️ Aucune clé API disponible pour {model_id}, "
+                      "modèle sauté."
+                  )
+                  return (
+                      {
+                          "site_id": SITE_ID,
+                          "site_url": SITE_URL,
+                          "model": model_id,
+                          "error": "Clé API manquante pour ce modèle.",
+                      },
+                      False,
+                  )
+
               model = LiteLLMModel(
                   model_id=model_id,
-                  api_key=OPENROUTER_API_KEY,
+                  api_key=api_key,
               )
 
               with sync_playwright() as playwright:
@@ -1130,7 +1185,9 @@ jobs:
 
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
 
-          AGENT_Q_MODELS: "openrouter/cohere/north-mini-code:free,openrouter/poolside/laguna-xs-2.1:free,openrouter/poolside/laguna-s-2.1:free"
+          NVIDIA_NIM_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+
+          AGENT_Q_MODELS: "nvidia_nim/moonshotai/kimi-k2.6,openrouter/cohere/north-mini-code:free,openrouter/poolside/laguna-xs-2.1:free,openrouter/poolside/laguna-s-2.1:free"
 
         run: |
 
