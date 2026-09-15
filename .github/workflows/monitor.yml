@@ -97,28 +97,28 @@ jobs:
       - name: Dépendances système (ffmpeg + chromium + agent-browser + Playwright + Xvfb + WM)
         run: |
           set -e
-          
+
           echo "=== ffmpeg ==="
           if ! command -v ffmpeg >/dev/null 2>&1; then
             sudo apt-get update -qq
             sudo apt-get install -y -qq ffmpeg
           fi
           ffmpeg -version 2>/dev/null | head -1
-          
+
           echo "=== symlink chromium ==="
           if ! command -v chromium >/dev/null 2>&1 && command -v google-chrome >/dev/null 2>&1; then
             sudo ln -sf "$(command -v google-chrome)" /usr/local/bin/chromium
           fi
           command -v chromium && chromium --version
-          
+
           echo "=== agent-browser global ==="
           npm install -g agent-browser || echo "⚠️ npm install failed"
           which agent-browser && agent-browser --version || true
-          
+
           echo "=== Playwright deps ==="
           sudo npx playwright install-deps chromium || echo "⚠️ playwright install-deps failed"
           npx playwright install chromium || echo "⚠️ playwright install chromium failed"
-          
+
           echo "=== Xvfb + gestionnaire de fenêtres ==="
           sudo apt-get install -y -qq matchbox-window-manager || echo "⚠️ matchbox non installé"
           which Xvfb && echo "✅ Xvfb présent" || echo "❌ Xvfb absent"
@@ -134,7 +134,7 @@ jobs:
           AGENT_BROWSER_HEADED: "1"
           # ✅ FIX RACINE : AUCUNE valeur ne contient de virgule interne.
           # --window-size=1280,800 est SUPPRIMÉ : sa virgule interne était
-          # re-sérialisée par Hermes en chaîne séparée par virgules pour
+          # re-sérialisée en chaîne séparée par virgules avant d'atteindre
           # agent-browser, coupant le flag en "--window-size=1280" + "800",
           # et "800" nu devenait une URL (hôte numérique -> 0.0.3.32).
           # Redondant de toute façon : Xvfb est déjà en 1280x800 et
@@ -261,6 +261,17 @@ jobs:
           - Recherche : vérifie que des résultats s'affichent réellement.
           - Sinon : les 2-3 actions les plus représentatives du site.
 
+          IMPORTANT — CHAQUE page listée doit être RÉELLEMENT VISITÉE
+          INDIVIDUELLEMENT, et chaque action choisie RÉELLEMENT EXÉCUTÉE
+          (cliquée/soumise), pas seulement observée depuis une autre page.
+          "Le panier a une structure" n'est PAS un test — le test est "j'ai
+          cliqué ajouter, PUIS j'ai vérifié que le produit apparaît". Si deux
+          pages différentes ont exactement la même note, c'est suspect : tu
+          ne les as probablement pas visitées séparément. Si tu ne peux pas
+          exécuter une action ou visiter une page, dis-le explicitement dans
+          "note" ET mets actions_completed à false — ne mets JAMAIS
+          actions_completed à true juste parce qu'une page a chargé.
+
           Pour chaque page listée, vérifie au minimum qu'elle répond correctement
           (HTTP 200, contenu attendu). Explore aussi les liens internes pour
           détecter d'éventuelles pages non listées et signale-les dans le JSON
@@ -275,6 +286,7 @@ jobs:
           {
             "overall_status": "UP",
             "site_type": "ecommerce",
+            "actions_completed": true,
             "pages": [
               {
                 "url": "URL exacte",
@@ -287,12 +299,15 @@ jobs:
           }
           \`\`\`
           Règles : status/overall_status = "UP" ou "DOWN" uniquement.
-          site_type = ecommerce|auth|vitrine|blog|autre. Une entrée par page
-          visitée (départ + chaque URL distincte, y compris erreurs/404). Un
-          parcours métier qui échoue (panier vide après ajout, recherche sans
-          résultat, form qui ne soumet rien) = DOWN même si HTTP 200. Une page
-          par défaut d'hébergeur ou des données backend manquantes/vides
-          alors qu'elles sont attendues = DOWN même si HTTP 200.
+          site_type = ecommerce|auth|vitrine|blog|autre. actions_completed =
+          true UNIQUEMENT si tu as réellement exécuté chaque action choisie ET
+          observé son résultat ; false si tu as seulement navigué sans
+          compléter les étapes interactives. Une entrée par page visitée
+          (départ + chaque URL distincte, y compris erreurs/404). Un parcours
+          métier qui échoue (panier vide après ajout, recherche sans résultat,
+          form qui ne soumet rien) = DOWN même si HTTP 200. Une page par
+          défaut d'hébergeur ou des données backend manquantes/vides alors
+          qu'elles sont attendues = DOWN même si HTTP 200.
           EOF
 
       - name: Lancer Hermes Agent avec capture vidéo
@@ -323,6 +338,8 @@ jobs:
 
           TASK_CONTENT=$(cat task.md)
           mkdir -p recordings
+          rm -f /tmp/best_partial.json
+          BEST_PARTIAL_LABEL=""
 
           run_agent() {
             local provider=$1
@@ -380,8 +397,33 @@ jobs:
             fi
           }
 
-          is_success() {
+          is_json_valid() {
             grep -qiE '"overall_status"\s*:\s*"(up|down)"' "$1"
+          }
+
+          # Un JSON valide où actions_completed=false n'est PAS considéré
+          # comme une vérification fiable : le modèle a pu naviguer sans
+          # jamais exécuter les actions interactives demandées (panier,
+          # formulaire, etc.), voire recopier un verdict générique sans
+          # visiter chaque page individuellement.
+          is_fully_verified() {
+            is_json_valid "$1" && ! grep -qiE '"actions_completed"\s*:\s*false' "$1"
+          }
+
+          # $1 = fichier output brut de cette tentative, $2 = label
+          try_result() {
+            cp "$1" output.json
+            if is_fully_verified output.json; then
+              echo "✅ Succès complet avec ${2}"
+              echo "agent_failed=false" >> $GITHUB_OUTPUT
+              echo "winning_label=${2}" >> $GITHUB_OUTPUT
+              echo "verification_partial=false" >> $GITHUB_OUTPUT
+              exit 0
+            elif is_json_valid output.json; then
+              echo "⚠️ ${2} : JSON valide mais actions_completed=false — mis en réserve, on continue la chaîne"
+              cp output.json /tmp/best_partial.json
+              BEST_PARTIAL_LABEL="${2}"
+            fi
           }
 
           echo "======================================"
@@ -390,13 +432,7 @@ jobs:
           for OR_MODEL in "poolside/laguna-s-2.1:free" "inclusionai/ling-3.0-flash-fin:free" "thinkingmachines/inkling:free" "openrouter/free"; do
             label="openrouter-$(echo "$OR_MODEL" | tr '/:' '--')"
             run_agent "openrouter" "$OR_MODEL" "$label"
-            cp "output-${label}.json" output.json
-            if is_success output.json; then
-              echo "✅ Succès avec OpenRouter ($OR_MODEL)"
-              echo "agent_failed=false" >> $GITHUB_OUTPUT
-              echo "winning_label=${label}" >> $GITHUB_OUTPUT
-              exit 0
-            fi
+            try_result "output-${label}.json" "$label"
           done
 
           echo "======================================"
@@ -407,24 +443,24 @@ jobs:
             model="${PAIR#*|}"
             label="$(echo "${provider}-${model}" | tr '/:' '--')"
             run_agent "$provider" "$model" "$label"
-            cp "output-${label}.json" output.json
-            if is_success output.json; then
-              echo "✅ Succès avec $provider/$model"
-              echo "agent_failed=false" >> $GITHUB_OUTPUT
-              echo "winning_label=${label}" >> $GITHUB_OUTPUT
-              exit 0
-            fi
+            try_result "output-${label}.json" "$label"
           done
 
           echo "======================================"
           echo "🔁 Dernier recours : NVIDIA NIM"
           echo "======================================"
           run_agent "nvidia" "moonshotai/kimi-k3" "nvidia1"
-          cp "output-nvidia1.json" output.json
-          if is_success output.json; then
-            echo "✅ Succès avec NVIDIA (moonshotai/kimi-k3)"
+          try_result "output-nvidia1.json" "nvidia1"
+
+          # Aucun modèle — y compris NVIDIA — n'a complété toutes les
+          # actions demandées : on utilise le meilleur essai partiel plutôt
+          # que de tout perdre, mais on le signale explicitement.
+          if [ -f /tmp/best_partial.json ]; then
+            echo "⚠️ Aucun modèle n'a complété toutes les actions — utilisation du meilleur essai partiel (${BEST_PARTIAL_LABEL})"
+            cp /tmp/best_partial.json output.json
             echo "agent_failed=false" >> $GITHUB_OUTPUT
-            echo "winning_label=nvidia1" >> $GITHUB_OUTPUT
+            echo "winning_label=${BEST_PARTIAL_LABEL}" >> $GITHUB_OUTPUT
+            echo "verification_partial=true" >> $GITHUB_OUTPUT
             exit 0
           fi
 
@@ -438,6 +474,7 @@ jobs:
           RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
           RELAY_URL: ${{ secrets.RELAY_URL }}
           WINNING_LABEL: ${{ steps.agent_run.outputs.winning_label }}
+          VERIFICATION_PARTIAL: ${{ steps.agent_run.outputs.verification_partial }}
         run: |
           if [ ! -f output.json ] || [ ! -s output.json ]; then
             STATUS="ERROR"
@@ -465,6 +502,17 @@ jobs:
               echo "🏷️ Type de site détecté : $SITE_TYPE"
               echo "📄 $(echo "$PAGES_JSON" | jq '.pages | length') page(s) rapportée(s) :"
               echo "$PAGES_JSON" | jq -r '.pages[] | "  - \(.url) → \(.status) (http=\(.http_code // "n/a")) : \(.action_tested // "navigation simple") — \(.note // "")"'
+
+              # ⚠️ Détection de notes dupliquées : signe que le modèle a
+              # recopié un verdict générique au lieu de visiter chaque page
+              # individuellement (ex: "Contenu vide" identique sur 5 pages
+              # sans rapport entre elles).
+              MAX_DUP=$(echo "$PAGES_JSON" | jq '[.pages[].note] | group_by(.) | map(length) | max')
+              TOTAL_PAGES=$(echo "$PAGES_JSON" | jq '.pages | length')
+              if [ -n "$MAX_DUP" ] && [ -n "$TOTAL_PAGES" ] && [ "$TOTAL_PAGES" -gt 0 ] && [ "$MAX_DUP" -ge $(( (TOTAL_PAGES + 1) / 2 )) ]; then
+                echo "⚠️ ${MAX_DUP}/${TOTAL_PAGES} pages partagent une note identique — vérification probablement bâclée"
+                REASON="⚠️ VÉRIFICATION SUSPECTE (notes dupliquées, ${MAX_DUP}/${TOTAL_PAGES} pages identiques) — $REASON"
+              fi
             else
               echo "⚠️ Bloc JSON structuré introuvable, repli sur extraction texte"
               if echo "$AGENT_TEXT" | grep -qi "up"; then
@@ -479,6 +527,10 @@ jobs:
               fi
               PAGES_JSON=""
             fi
+          fi
+
+          if [ "$VERIFICATION_PARTIAL" == "true" ]; then
+            REASON="⚠️ VÉRIFICATION PARTIELLE (aucun modèle n'a complété toutes les actions demandées) — $REASON"
           fi
 
           echo "Statut final: $STATUS"
