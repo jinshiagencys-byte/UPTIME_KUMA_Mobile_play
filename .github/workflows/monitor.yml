@@ -94,11 +94,11 @@ jobs:
           source ~/.bashrc || true
           hermes --version
 
-      - name: Dépendances système (ffmpeg + chromium + agent-browser + Playwright + Xvfb)
+      - name: Dépendances système (ffmpeg + chromium + agent-browser + Playwright + Xvfb + WM)
         run: |
           set -e
           
-          echo "=== ffmpeg (requis pour l'enregistrement vidéo .webm) ==="
+          echo "=== ffmpeg ==="
           if ! command -v ffmpeg >/dev/null 2>&1; then
             sudo apt-get update -qq
             sudo apt-get install -y -qq ffmpeg
@@ -111,18 +111,19 @@ jobs:
           fi
           command -v chromium && chromium --version
           
-          echo "=== Installation GLOBALE de agent-browser ==="
-          npm install -g agent-browser || echo "⚠️ npm install failed, will rely on npx"
+          echo "=== agent-browser global ==="
+          npm install -g agent-browser || echo "⚠️ npm install failed"
           which agent-browser && agent-browser --version || true
           
-          echo "=== Installation des dépendances Playwright ==="
+          echo "=== Playwright deps ==="
           sudo npx playwright install-deps chromium || echo "⚠️ playwright install-deps failed"
           npx playwright install chromium || echo "⚠️ playwright install chromium failed"
           
-          echo "=== Vérifier que Xvfb est bien installé ==="
+          echo "=== Xvfb + gestionnaire de fenêtres (fenêtre maximisée, pas de bandes noires) ==="
+          sudo apt-get install -y -qq matchbox-window-manager || echo "⚠️ matchbox non installé"
           which Xvfb && echo "✅ Xvfb présent" || echo "❌ Xvfb absent"
 
-      - name: Démarrer Xvfb + Configurer Hermes (navigateur HEADED)
+      - name: Démarrer Xvfb + WM + Configurer Hermes
         env:
           MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
@@ -131,7 +132,7 @@ jobs:
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
           DISPLAY: ":99"
           AGENT_BROWSER_HEADED: "1"
-          AGENT_BROWSER_ARGS: "--no-sandbox,--disable-dev-shm-usage,--disable-blink-features=AutomationControlled,--window-size=1280,800,--no-first-run,--no-default-browser-check"
+          AGENT_BROWSER_ARGS: "--no-sandbox,--disable-dev-shm-usage,--disable-blink-features=AutomationControlled,--window-size=1280,800,--start-maximized,--no-first-run,--no-default-browser-check"
         run: |
           mkdir -p ~/.hermes
           mkdir -p ~/.hermes/browser_recordings
@@ -139,10 +140,9 @@ jobs:
           unset BROWSERBASE_API_KEY || true
           unset BROWSER_USE_API_KEY || true
 
-          echo "=== Démarrage de Xvfb (display virtuel) ==="
+          echo "=== Démarrage de Xvfb ==="
           Xvfb :99 -screen 0 1280x800x24 -ac +extension GLX +render -noreset > /tmp/xvfb.log 2>&1 &
           XVFB_PID=$!
-          echo "Xvfb démarré avec PID $XVFB_PID"
           sleep 2
           if kill -0 $XVFB_PID 2>/dev/null; then
             echo "✅ Xvfb actif sur DISPLAY=:99"
@@ -152,6 +152,11 @@ jobs:
             cat /tmp/xvfb.log
             exit 1
           fi
+
+          echo "=== Démarrage du gestionnaire de fenêtres ==="
+          DISPLAY=:99 matchbox-window-manager > /tmp/wm.log 2>&1 &
+          sleep 1
+          echo "✅ matchbox-window-manager lancé"
 
           cat > ~/.hermes/.env << EOF
           MISTRAL_API_KEY=${MISTRAL_API_KEY}
@@ -197,15 +202,6 @@ jobs:
 
           echo "=== hermes doctor --fix ==="
           hermes doctor --fix || true
-          
-          echo "=== Test : navigateur headed sur Xvfb ==="
-          agent-browser open "https://example.com" || true
-          agent-browser screenshot /tmp/test-headed.png || echo "⚠️ screenshot failed"
-          if [ -f /tmp/test-headed.png ]; then
-            echo "✅ Navigateur headed fonctionne (screenshot créé)"
-            ls -lah /tmp/test-headed.png
-          fi
-          agent-browser close --all || true
 
       - name: Générer la tâche
         env:
@@ -217,6 +213,14 @@ jobs:
           cat > task.md << EOF
           Va sur $SITE_URL avec l'outil de navigateur. Explore comme un
           humain (scroll, structure) et détecte le type de site.
+
+          GESTION DES ONGLETS (IMPORTANT POUR LA VIDÉO) :
+          - Reste dans UN SEUL onglet autant que possible : utilise la
+            navigation dans l'onglet courant plutôt que d'ouvrir de nouveaux
+            onglets.
+          - Si un clic ouvre un nouvel onglet, ferme l'onglet précédent.
+          - Ignore et ferme tout onglet "Loading..." ou affichant une URL
+            du type "0.0.3.32" qui ne charge jamais.
 
           VÉRIFICATION CRITIQUE avant tout le reste : le contenu affiché
           correspond-il vraiment au site attendu, ou est-ce une page par
@@ -278,24 +282,44 @@ jobs:
           alors qu'elles sont attendues = DOWN même si HTTP 200.
           EOF
 
-      - name: Lancer Hermes Agent avec capture vidéo ffmpeg
+      - name: Lancer Hermes Agent avec capture vidéo + watchdog de focus
         id: agent_run
         env:
           DISPLAY: ":99"
           AGENT_BROWSER_HEADED: "1"
-          AGENT_BROWSER_ARGS: "--no-sandbox,--disable-dev-shm-usage,--disable-blink-features=AutomationControlled,--window-size=1280,800,--no-first-run,--no-default-browser-check"
+          AGENT_BROWSER_ARGS: "--no-sandbox,--disable-dev-shm-usage,--disable-blink-features=AutomationControlled,--window-size=1280,800,--start-maximized,--no-first-run,--no-default-browser-check"
         run: |
           set +e
 
-          # S'assurer que Xvfb tourne toujours
           if ! pgrep -f "Xvfb :99" > /dev/null; then
             echo "⚠️ Xvfb arrêté, redémarrage..."
             Xvfb :99 -screen 0 1280x800x24 -ac +extension GLX +render -noreset > /tmp/xvfb.log 2>&1 &
             sleep 2
           fi
+          if ! pgrep -f matchbox-window-manager > /dev/null; then
+            DISPLAY=:99 matchbox-window-manager > /tmp/wm.log 2>&1 &
+            sleep 1
+          fi
 
           TASK_CONTENT=$(cat task.md)
           mkdir -p recordings
+
+          # 🐕 WATCHDOG : toutes les 3 s, active le DERNIER onglet ouvert.
+          # Les onglets créés via CDP ne prennent pas le focus à l'écran ;
+          # sans ce watchdog, la capture Xvfb filmerait un onglet mort
+          # (ex: 0.0.3.32) pendant que le vrai travail se fait en arrière-plan.
+          start_watchdog() {
+            (
+              while true; do
+                LAST=$(agent-browser tab list 2>/dev/null | awk '/^[[:space:]]*[0-9]+/ {n=$1} END {print n}')
+                if [ -n "$LAST" ]; then
+                  agent-browser tab "$LAST" >/dev/null 2>&1
+                fi
+                sleep 3
+              done
+            ) &
+            echo $!
+          }
 
           run_agent() {
             local provider=$1
@@ -308,7 +332,6 @@ jobs:
             export DISPLAY=:99
             RECORDING_PATH="recordings/${label}.webm"
 
-            # 🎥 CAPTURE UNIQUE via ffmpeg sur le display Xvfb :99
             echo "🎥 Démarrage capture ffmpeg sur DISPLAY=:99..."
             ffmpeg -y -f x11grab -video_size 1280x800 -framerate 15 \
               -i :99.0 \
@@ -324,11 +347,17 @@ jobs:
               cat /tmp/ffmpeg-${label}.log | tail -10
             fi
 
-            # Lancer Hermes (il ouvrira son propre navigateur headed sur :99)
+            echo "🐕 Démarrage du watchdog de focus..."
+            WATCHDOG_PID=$(start_watchdog)
+            echo "watchdog PID: $WATCHDOG_PID"
+
             hermes -z "$TASK_CONTENT" --provider "$provider" -m "$model" -t "browser,terminal" --yolo > "output-${label}.json" 2>&1
             HERMES_EXIT=$?
 
-            # 🎥 Arrêt propre de ffmpeg (SIGINT pour finaliser le WebM)
+            echo "🐕 Arrêt du watchdog..."
+            kill $WATCHDOG_PID 2>/dev/null || true
+            wait $WATCHDOG_PID 2>/dev/null || true
+
             echo "🎥 Arrêt de ffmpeg..."
             if kill -0 $FFMPEG_PID 2>/dev/null; then
               kill -INT $FFMPEG_PID
@@ -336,7 +365,6 @@ jobs:
               echo "✅ ffmpeg arrêté"
             fi
 
-            # Fermer toute session navigateur résiduelle
             agent-browser close --all 2>/dev/null || true
 
             echo "exit_code=$HERMES_EXIT"
@@ -471,7 +499,7 @@ jobs:
           jq -nc --arg status "$STATUS" --arg message "$REASON" '{status: $status, message: $message}' > status_payload.json
           curl -X POST "$RELAY_URL/sites/$SITE_ID/mark-crawled" -H "x-relay-secret: $RELAY_SECRET" -H "Content-Type: application/json" -d @status_payload.json || echo "⚠️ Échec envoi mark-crawled"
 
-      - name: Uploader les vidéos (artifacts)
+      - name: Uploader la vidéo (artifact)
         if: always()
         uses: actions/upload-artifact@v4
         with:
