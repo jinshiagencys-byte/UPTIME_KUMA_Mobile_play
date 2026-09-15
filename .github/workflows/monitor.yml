@@ -230,9 +230,19 @@ jobs:
     env:
 
       # ========================================================
-      # MODÈLE UNIQUE — PAS DE FALLBACK
+      # LISTE DE MODÈLES AVEC FALLBACK AUTOMATIQUE
+      #
+      # Essayés dans l'ordre, séparés par des virgules.
+      # Si un modèle échoue (erreur API, quota, 403 "agentic
+      # harness only", timeout, JSON invalide...), le runner
+      # passe automatiquement au suivant.
+      #
+      # ⚠️ Avant d'ajouter un modèle gratuit OpenRouter ici,
+      # vérifier sur sa page openrouter.ai qu'il n'exige pas
+      # d'être appelé depuis un "agentic harness" reconnu
+      # (cause du 403 sur thinkingmachines/inkling:free).
       # ========================================================
-      AGENT_Q_MODEL: "openrouter/thinkingmachines/inkling:free"
+      AGENT_Q_MODELS: "openrouter/cohere/north-mini-code:free,openrouter/poolside/laguna-xs-2.1:free,openrouter/poolside/laguna-s-2.1:free"
 
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
 
@@ -525,10 +535,17 @@ jobs:
 
           SITE_ID = os.environ["SITE_ID"]
 
-          MODEL_ID = os.environ.get(
-              "AGENT_Q_MODEL",
-              "openrouter/thinkingmachines/inkling:free"
-          )
+          # Liste de modèles séparés par des virgules, essayés
+          # dans l'ordre jusqu'à ce qu'un résultat exploitable
+          # soit obtenu.
+          MODEL_IDS = [
+              m.strip()
+              for m in os.environ.get(
+                  "AGENT_Q_MODELS",
+                  "openrouter/cohere/north-mini-code:free"
+              ).split(",")
+              if m.strip()
+          ]
 
           OPENROUTER_API_KEY = os.environ.get(
               "OPENROUTER_API_KEY"
@@ -538,6 +555,11 @@ jobs:
           if not OPENROUTER_API_KEY:
               raise RuntimeError(
                   "OPENROUTER_API_KEY absent des secrets GitHub."
+              )
+
+          if not MODEL_IDS:
+              raise RuntimeError(
+                  "AGENT_Q_MODELS est vide : aucun modèle à essayer."
               )
 
 
@@ -750,331 +772,343 @@ jobs:
 
 
           # =====================================================
-          # MODÈLE
+          # VALIDATION D'UN RÉSULTAT
+          #
+          # Reprend la même logique que l'étape "Construire
+          # output.json" pour décider si un résultat de modèle
+          # est exploitable ou si on doit basculer sur le
+          # modèle suivant de la liste.
           # =====================================================
 
-          print("======================================")
-          print("🤖 AGENT Q")
-          print("======================================")
-
-          print(
-              "Site :",
-              SITE_URL
-          )
-
-          print(
-              "Model :",
-              MODEL_ID
-          )
-
-          print()
+          import re
 
 
-          model = LiteLLMModel(
-              model_id=MODEL_ID,
-              api_key=OPENROUTER_API_KEY,
-          )
+          def extract_candidate(raw_result):
+
+              candidate = None
+
+              if isinstance(raw_result, dict):
+
+                  if (
+                      "overall_status" in raw_result
+                      and "pages" in raw_result
+                  ):
+                      candidate = raw_result
+
+              elif isinstance(raw_result, str):
+
+                  try:
+                      parsed = json.loads(raw_result)
+
+                      if (
+                          isinstance(parsed, dict)
+                          and "overall_status" in parsed
+                          and "pages" in parsed
+                      ):
+                          candidate = parsed
+
+                  except Exception:
+                      pass
+
+                  if candidate is None:
+
+                      match = re.search(
+                          r"```json\s*(\{.*?\})\s*```",
+                          raw_result,
+                          re.DOTALL | re.IGNORECASE,
+                      )
+
+                      if match:
+                          try:
+                              parsed = json.loads(match.group(1))
+
+                              if isinstance(parsed, dict):
+                                  candidate = parsed
+
+                          except Exception:
+                              pass
+
+              return candidate
 
 
           # =====================================================
-          # PLAYWRIGHT
+          # EXÉCUTION D'UNE TENTATIVE POUR UN MODÈLE DONNÉ
           # =====================================================
 
-          with sync_playwright() as playwright:
+          def run_attempt(model_id):
+              """
+              Lance une tentative complète (navigateur + agent)
+              pour un modèle donné.
 
-              browser = playwright.chromium.launch(
-                  headless=True,
-                  args=[
-                      "--no-sandbox",
-                      "--disable-dev-shm-usage",
-                      "--disable-blink-features=AutomationControlled",
-                      "--no-first-run",
-                      "--no-default-browser-check",
-                  ],
+              Retourne (output_dict, success: bool).
+              Lève une exception seulement en cas d'erreur
+              irrécupérable (ex : navigation impossible).
+              """
+
+              print()
+              print("======================================")
+              print(f"🤖 TENTATIVE — MODÈLE : {model_id}")
+              print("======================================")
+
+              model = LiteLLMModel(
+                  model_id=model_id,
+                  api_key=OPENROUTER_API_KEY,
               )
 
+              with sync_playwright() as playwright:
 
-              # ==================================================
-              # CORRECTION IMPORTANTE
-              #
-              # Playwright Python utilise :
-              # record_video_dir
-              # record_video_size
-              #
-              # et NON :
-              # record_video={...}
-              # ==================================================
-
-              context = browser.new_context(
-
-                  viewport={
-                      "width": 1280,
-                      "height": 800,
-                  },
-
-                  locale="fr-FR",
-
-                  timezone_id="Africa/Porto-Novo",
-
-                  user_agent=(
-                      "Mozilla/5.0 "
-                      "(X11; Linux x86_64) "
-                      "AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) "
-                      "Chrome/131.0.0.0 "
-                      "Safari/537.36"
-                  ),
-
-                  record_video_dir=str(
-                      RECORDINGS_DIR
-                  ),
-
-                  record_video_size={
-                      "width": 1280,
-                      "height": 800,
-                  },
-              )
-
-
-              # ==================================================
-              # TRACE
-              # ==================================================
-
-              context.tracing.start(
-                  screenshots=True,
-                  snapshots=True,
-                  sources=True,
-              )
-
-
-              page = context.new_page()
-
-
-              try:
-
-                  print()
-                  print(
-                      "🌐 Ouverture du site..."
+                  browser = playwright.chromium.launch(
+                      headless=True,
+                      args=[
+                          "--no-sandbox",
+                          "--disable-dev-shm-usage",
+                          "--disable-blink-features=AutomationControlled",
+                          "--no-first-run",
+                          "--no-default-browser-check",
+                      ],
                   )
 
+                  context = browser.new_context(
 
-                  page.goto(
-                      SITE_URL,
-                      wait_until="domcontentloaded",
-                      timeout=30000,
-                  )
+                      viewport={
+                          "width": 1280,
+                          "height": 800,
+                      },
 
+                      locale="fr-FR",
 
-                  print(
-                      "✅ Page chargée :",
-                      page.url
-                  )
+                      timezone_id="Africa/Porto-Novo",
 
-
-                  # =================================================
-                  # AGENT Q
-                  # =================================================
-
-                  agent = WebAgent(
-                      page,
-                      model
-                  )
-
-                  agent.init_agent()
-
-
-                  print()
-                  print(
-                      "🤖 Exécution Agent Q..."
-                  )
-
-
-                  result = agent.do(
-                      task
-                  )
-
-
-                  print()
-                  print(
-                      "✅ Agent Q terminé"
-                  )
-
-                  print()
-                  print(
-                      "Résultat :"
-                  )
-
-                  print(
-                      result
-                  )
-
-
-                  output = {
-                      "site_id": SITE_ID,
-                      "site_url": SITE_URL,
-                      "model": MODEL_ID,
-                      "result": result,
-                  }
-
-
-                  (
-                      OUTPUT_DIR /
-                      "raw-result.json"
-                  ).write_text(
-
-                      json.dumps(
-                          output,
-                          ensure_ascii=False,
-                          indent=2,
-                          default=str,
+                      user_agent=(
+                          "Mozilla/5.0 "
+                          "(X11; Linux x86_64) "
+                          "AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) "
+                          "Chrome/131.0.0.0 "
+                          "Safari/537.36"
                       ),
 
-                      encoding="utf-8",
+                      record_video_dir=str(RECORDINGS_DIR),
+
+                      record_video_size={
+                          "width": 1280,
+                          "height": 800,
+                      },
                   )
 
-
-              except Exception as error:
-
-                  print()
-                  print(
-                      "❌ Première exécution Agent Q échouée :"
+                  context.tracing.start(
+                      screenshots=True,
+                      snapshots=True,
+                      sources=True,
                   )
 
-                  print(
-                      repr(error)
-                  )
+                  page = context.new_page()
 
-
-                  print()
-                  print(
-                      "🔄 Régénération avec le même modèle..."
-                  )
-
+                  raw_result = None
+                  error_text = None
 
                   try:
 
-                      result = agent.do(
-                          task,
-                          force_regenerate=True,
+                      print()
+                      print("🌐 Ouverture du site...")
+
+                      page.goto(
+                          SITE_URL,
+                          wait_until="domcontentloaded",
+                          timeout=30000,
                       )
 
+                      print("✅ Page chargée :", page.url)
 
-                      print(
-                          "✅ Régénération réussie"
-                      )
+                      agent = WebAgent(page, model)
+                      agent.init_agent()
 
+                      print()
+                      print(f"🤖 Exécution Agent Q avec {model_id}...")
 
-                      output = {
-                          "site_id": SITE_ID,
-                          "site_url": SITE_URL,
-                          "model": MODEL_ID,
-                          "result": result,
-                          "regenerated": True,
-                      }
+                      try:
+                          raw_result = agent.do(task)
 
+                      except Exception as first_error:
 
-                      (
-                          OUTPUT_DIR /
-                          "raw-result.json"
-                      ).write_text(
+                          print()
+                          print(
+                              "❌ Première exécution échouée :",
+                              repr(first_error)
+                          )
 
-                          json.dumps(
-                              output,
-                              ensure_ascii=False,
-                              indent=2,
-                              default=str,
-                          ),
+                          print(
+                              "🔄 Nouvelle tentative (force_regenerate) "
+                              "avec le même modèle..."
+                          )
 
-                          encoding="utf-8",
-                      )
+                          raw_result = agent.do(
+                              task,
+                              force_regenerate=True,
+                          )
 
+                      print()
+                      print("✅ Agent Q terminé")
+                      print()
+                      print("Résultat brut :")
+                      print(raw_result)
 
-                  except Exception as regeneration_error:
+                  except Exception as error:
+
+                      error_text = repr(error)
 
                       print()
                       print(
-                          "❌ Régénération échouée :"
+                          f"❌ Modèle {model_id} indisponible ou en échec : "
+                          f"{error_text}"
                       )
 
-                      print(
-                          repr(
-                              regeneration_error
+                  finally:
+
+                      try:
+                          context.tracing.stop(
+                              path=str(
+                                  TRACES_DIR / f"trace-{SITE_ID}.zip"
+                              )
                           )
-                      )
-
-
-                      output = {
-                          "site_id": SITE_ID,
-                          "site_url": SITE_URL,
-                          "model": MODEL_ID,
-                          "error": str(
-                              regeneration_error
-                          ),
-                      }
-
-
-                      (
-                          OUTPUT_DIR /
-                          "raw-result.json"
-                      ).write_text(
-
-                          json.dumps(
-                              output,
-                              ensure_ascii=False,
-                              indent=2,
-                          ),
-
-                          encoding="utf-8",
-                      )
-
-
-                      raise
-
-
-              finally:
-
-                  # =================================================
-                  # ARRÊT TRACE
-                  # =================================================
-
-                  try:
-
-                      context.tracing.stop(
-
-                          path=str(
-                              TRACES_DIR /
-                              f"trace-{SITE_ID}.zip"
+                      except Exception as trace_error:
+                          print(
+                              "⚠️ Trace non sauvegardée :",
+                              trace_error
                           )
-                      )
 
-                  except Exception as trace_error:
+                      context.close()
+                      browser.close()
 
-                      print(
-                          "⚠️ Trace non sauvegardée :",
-                          trace_error
-                      )
+              candidate = extract_candidate(raw_result)
+
+              output = {
+                  "site_id": SITE_ID,
+                  "site_url": SITE_URL,
+                  "model": model_id,
+                  "raw_result": raw_result,
+              }
+
+              if error_text:
+                  output["error"] = error_text
+
+              if candidate is not None:
+                  output["result"] = candidate
+                  return output, True
+
+              return output, False
 
 
-                  # =================================================
-                  # FERMETURE CONTEXT
-                  #
-                  # La fermeture du BrowserContext permet à
-                  # Playwright de finaliser la vidéo.
-                  # =================================================
+          # =====================================================
+          # BOUCLE DE FALLBACK SUR LES MODÈLES
+          # =====================================================
 
-                  context.close()
+          print("======================================")
+          print("🤖 AGENT Q — MODÈLES DISPONIBLES")
+          print("======================================")
 
-                  browser.close()
+          print("Site :", SITE_URL)
+          print("Modèles (dans l'ordre) :", ", ".join(MODEL_IDS))
+
+          final_output = None
+          success = False
+
+          for index, model_id in enumerate(MODEL_IDS, start=1):
+
+              try:
+                  attempt_output, attempt_success = run_attempt(model_id)
+
+              except Exception as fatal_error:
+
+                  # Erreur irrécupérable (ex : navigation impossible),
+                  # indépendante du modèle : inutile d'essayer les
+                  # modèles suivants pour ce genre de panne, mais on
+                  # continue quand même par prudence.
+                  print()
+                  print(
+                      f"❌ Erreur fatale avec {model_id} : "
+                      f"{repr(fatal_error)}"
+                  )
+
+                  attempt_output = {
+                      "site_id": SITE_ID,
+                      "site_url": SITE_URL,
+                      "model": model_id,
+                      "error": repr(fatal_error),
+                  }
+
+                  attempt_success = False
+
+              final_output = attempt_output
+
+              if attempt_success:
+
+                  print()
+                  print(
+                      f"✅ Modèle retenu : {model_id} "
+                      f"(tentative {index}/{len(MODEL_IDS)})"
+                  )
+
+                  success = True
+                  break
+
+              print()
+
+              if index < len(MODEL_IDS):
+                  print(
+                      f"➡️ Passage au modèle suivant "
+                      f"({index}/{len(MODEL_IDS)} essayés)..."
+                  )
+              else:
+                  print(
+                      "❌ Tous les modèles de la liste ont échoué."
+                  )
+
+
+          if final_output is None:
+
+              final_output = {
+                  "site_id": SITE_ID,
+                  "site_url": SITE_URL,
+                  "model": None,
+                  "error": "Aucun modèle n'a pu être exécuté.",
+              }
+
+
+          final_output["fallback_used"] = not success or (
+              MODEL_IDS.index(final_output.get("model", MODEL_IDS[0])) > 0
+              if final_output.get("model") in MODEL_IDS
+              else False
+          )
+
+
+          (OUTPUT_DIR / "raw-result.json").write_text(
+
+              json.dumps(
+                  final_output,
+                  ensure_ascii=False,
+                  indent=2,
+                  default=str,
+              ),
+
+              encoding="utf-8",
+          )
 
 
           print()
           print(
-              "✅ BrowserContext fermé"
+              "✅ BrowserContext(s) fermé(s)"
           )
 
           print(
-              "🎥 Vidéo Playwright finalisée"
+              "🎥 Vidéo(s) Playwright finalisée(s)"
           )
+
+          if not success:
+              raise RuntimeError(
+                  "Aucun des modèles configurés n'a produit "
+                  "de résultat exploitable."
+              )
 
           PYTHON
 
@@ -1096,7 +1130,7 @@ jobs:
 
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
 
-          AGENT_Q_MODEL: "openrouter/thinkingmachines/inkling:free"
+          AGENT_Q_MODELS: "openrouter/cohere/north-mini-code:free,openrouter/poolside/laguna-xs-2.1:free,openrouter/poolside/laguna-s-2.1:free"
 
         run: |
 
@@ -1160,10 +1194,16 @@ jobs:
 
           echo
           echo "======================================"
-          echo "🚀 LANCEMENT DU RUNNER"
+          echo "🚀 LANCEMENT DU RUNNER (avec fallback modèles)"
           echo "======================================"
 
-          pipenv run python ../run_agent_q.py
+          # ⚠️ Le runner gère lui-même le fallback multi-modèles.
+          # S'il ne trouve aucun résultat exploitable après avoir
+          # essayé tous les modèles de AGENT_Q_MODELS, il se
+          # termine avec un code d'erreur non nul, mais
+          # agent-output/raw-result.json contient toujours un
+          # diagnostic exploitable par l'étape suivante.
+          pipenv run python ../run_agent_q.py || true
 
 
       # ========================================================
@@ -1221,99 +1261,103 @@ jobs:
           )
 
 
-          raw_result = data.get(
-              "result"
-          )
+          # Le runner (avec fallback) place déjà le JSON validé
+          # dans data["result"] quand un modèle a réussi. On
+          # retombe sur l'ancienne logique de parsing si jamais
+          # ce champ est absent (compatibilité).
+
+          candidate = data.get("result")
 
 
-          candidate = None
+          if candidate is None:
 
+              raw_result = data.get("raw_result")
 
-          # ==================================================
-          # DICT
-          # ==================================================
+              # ==================================================
+              # DICT
+              # ==================================================
 
-          if isinstance(
-              raw_result,
-              dict
-          ):
-
-              if (
-                  "overall_status" in raw_result
-                  and
-                  "pages" in raw_result
+              if isinstance(
+                  raw_result,
+                  dict
               ):
 
-                  candidate = raw_result
-
-
-          # ==================================================
-          # STRING
-          # ==================================================
-
-          elif isinstance(
-              raw_result,
-              str
-          ):
-
-              try:
-
-                  parsed = json.loads(
-                      raw_result
-                  )
-
-
                   if (
-                      isinstance(
-                          parsed,
-                          dict
-                      )
+                      "overall_status" in raw_result
                       and
-                      "overall_status"
-                      in parsed
-                      and
-                      "pages"
-                      in parsed
+                      "pages" in raw_result
                   ):
 
-                      candidate = parsed
+                      candidate = raw_result
 
 
-              except Exception:
-                  pass
+              # ==================================================
+              # STRING
+              # ==================================================
+
+              elif isinstance(
+                  raw_result,
+                  str
+              ):
+
+                  try:
+
+                      parsed = json.loads(
+                          raw_result
+                      )
 
 
-              if candidate is None:
-
-                  match = re.search(
-
-                      r"```json\s*(\{.*?\})\s*```",
-
-                      raw_result,
-
-                      re.DOTALL | re.IGNORECASE,
-                  )
-
-
-                  if match:
-
-                      try:
-
-                          parsed = json.loads(
-                              match.group(1)
-                          )
-
-
-                          if isinstance(
+                      if (
+                          isinstance(
                               parsed,
                               dict
-                          ):
+                          )
+                          and
+                          "overall_status"
+                          in parsed
+                          and
+                          "pages"
+                          in parsed
+                      ):
 
-                              candidate = parsed
+                          candidate = parsed
 
 
-                      except Exception:
-                          pass
+                  except Exception:
+                      pass
+
+
+                  if candidate is None:
+
+                      match = re.search(
+
+                          r"```json\s*(\{.*?\})\s*```",
+
+                          raw_result,
+
+                          re.DOTALL | re.IGNORECASE,
+                      )
+
+
+                      if match:
+
+                          try:
+
+                              parsed = json.loads(
+                                  match.group(1)
+                              )
+
+
+                              if isinstance(
+                                  parsed,
+                                  dict
+                              ):
+
+                                  candidate = parsed
+
+
+                          except Exception:
+                              pass
 
 
           # ==================================================
@@ -1328,8 +1372,9 @@ jobs:
                   "actions_completed": False,
                   "pages": [],
                   "error": (
-                      "Agent Q n'a pas produit "
-                      "le JSON attendu."
+                      data.get("error")
+                      or "Agent Q n'a pas produit le JSON attendu "
+                         "(tous les modèles ont échoué)."
                   ),
               }
 
@@ -1373,6 +1418,14 @@ jobs:
               )
 
           )
+
+
+          # Traçabilité : quel modèle a produit ce résultat.
+          if data.get("model"):
+              candidate["model_used"] = data["model"]
+
+          if data.get("fallback_used"):
+              candidate["fallback_used"] = True
 
 
           output_file.write_text(
@@ -1515,6 +1568,8 @@ jobs:
                 {
                   site_type: .site_type,
                   actions_completed: .actions_completed,
+                  model_used: .model_used,
+                  fallback_used: .fallback_used,
                   pages: .pages
                 }
               ' output.json
