@@ -231,12 +231,10 @@ jobs:
       # PRIORITÉ ABSOLUE À GOOGLE AI STUDIO
       GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
       
-      # Modèles dans l'ordre de priorité (Gemini 3.x gratuits en premier)
-      # - gemini-3.5-flash : le plus rapide et le plus disponible (60 RPM)
-      # - gemini-3.6-flash : bon backup avec plus de contexte
-      # - gemini-2.5-pro : pour les cas complexes nécessitant plus de raisonnement
-      # - NVIDIA NIM et OpenRouter : fallbacks secondaires
-      AGENT_Q_MODELS: "gemini-3.5-flash,gemini-3.6-flash,gemini-2.5-pro,nvidia_nim/moonshotai/kimi-k2.6,openrouter/cohere/north-mini-code:free,openrouter/poolside/laguna-xs-2.1:free,openrouter/poolside/laguna-s-2.1:free"
+      # CORRECTION CRITIQUE : préfixe "gemini/" pour Google AI Studio
+      # - gemini/gemini-3.5-flash : accès direct à Google AI Studio
+      # - pas de dépendance vers google-auth nécessaire
+      AGENT_Q_MODELS: "gemini/gemini-3.5-flash,gemini/gemini-3.6-flash,gemini/gemini-2.5-pro,nvidia_nim/moonshotai/kimi-k2.6,openrouter/cohere/north-mini-code:free,openrouter/poolside/laguna-xs-2.1:free,openrouter/poolside/laguna-s-2.1:free"
 
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
       NVIDIA_NIM_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
@@ -315,6 +313,24 @@ jobs:
 
           pipenv --version
 
+
+      # ========================================================
+      # INSTALLER LES DÉPENDANCES SPÉCIFIQUES À GOOGLE
+      # ========================================================
+      - name: Installer les dépendances Google
+        working-directory: agent-q
+        run: |
+          set -euo pipefail
+          
+          echo "======================================"
+          echo "🔍 INSTALLATION DES DÉPENDANCES GOOGLE"
+          echo "======================================"
+          
+          # Installer google-generativeai pour une compatibilité maximale
+          pipenv run pip install google-generativeai --upgrade
+          
+          echo "✅ Packages Google installés"
+      
 
       # ========================================================
       # ENVIRONNEMENT AGENT Q
@@ -541,7 +557,7 @@ jobs:
               m.strip()
               for m in os.environ.get(
                   "AGENT_Q_MODELS",
-                  "gemini-3.5-flash,gemini-3.6-flash,gemini-2.5-pro"
+                  "gemini/gemini-3.5-flash,gemini/gemini-3.6-flash,gemini/gemini-2.5-pro"
               ).split(",")
               if m.strip()
           ]
@@ -557,7 +573,8 @@ jobs:
                       "limit exceeded",
                       "rate limit",
                       "429",
-                      "too many requests"
+                      "too many requests",
+                      "402"
                   ]
               )
 
@@ -565,13 +582,11 @@ jobs:
           def resolve_api_key(model_id):
               """
               Choisit la bonne clé API selon le préfixe du modèle :
-              - gemini-3.* → GOOGLE_API_KEY
-              - nvidia_nim/...  → NVIDIA_NIM_API_KEY
-              - openrouter/...  → OPENROUTER_API_KEY
-              Retourne None si la clé nécessaire est absente, pour
-              que l'appelant puisse sauter ce modèle proprement.
+              - gemini/gemini-... → GOOGLE_API_KEY
+              - nvidia_nim/... → NVIDIA_NIM_API_KEY
+              - openrouter/... → OPENROUTER_API_KEY
               """
-              if model_id.startswith("gemini-3."):
+              if model_id.startswith("gemini/gemini-"):
                   return GOOGLE_API_KEY
 
               if model_id.startswith("nvidia_nim/"):
@@ -580,8 +595,7 @@ jobs:
               if model_id.startswith("openrouter/"):
                   return OPENROUTER_API_KEY
 
-              # Préfixe inconnu : on retente quand même avec la clé
-              # OpenRouter par défaut, au cas où.
+              # Préfixe inconnu : on retente avec la clé OpenRouter
               return OPENROUTER_API_KEY
 
 
@@ -847,8 +861,6 @@ jobs:
               """
               Lance une tentative complète (navigateur + agent)
               pour un modèle donné.
-
-              Retourne (output_dict, success: bool).
               """
               print()
               print("======================================")
@@ -869,9 +881,16 @@ jobs:
                       False,
                   )
 
+              # Configuration spéciale pour Google AI Studio
+              extra_headers = None
+              if model_id.startswith("gemini/gemini-"):
+                  # Utiliser l'API Google AI Studio directement
+                  extra_headers = {"Authorization": f"Bearer {api_key}"}
+
               model = LiteLLMModel(
                   model_id=model_id,
                   api_key=api_key,
+                  extra_headers=extra_headers  # Important pour Google AI Studio
               )
 
               with sync_playwright() as playwright:
@@ -1073,9 +1092,6 @@ jobs:
 
       # ========================================================
       # EXÉCUTER AGENT Q
-      #
-      # IMPORTANT :
-      # On utilise le Python du virtualenv Agent Q.
       # ========================================================
       - name: Exécuter Agent Q
         env:
@@ -1085,7 +1101,8 @@ jobs:
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           NVIDIA_NIM_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-          AGENT_Q_MODELS: "gemini-3.5-flash,gemini-3.6-flash,gemini-2.5-pro,nvidia_nim/moonshotai/kimi-k2.6,openrouter/cohere/north-mini-code:free,openrouter/poolside/laguna-xs-2.1:free,openrouter/poolside/laguna-s-2.1:free"
+          # CORRECTION : préfixe "gemini/" ajouté
+          AGENT_Q_MODELS: "gemini/gemini-3.5-flash,gemini/gemini-3.6-flash,gemini/gemini-2.5-pro,nvidia_nim/moonshotai/kimi-k2.6,openrouter/cohere/north-mini-code:free,openrouter/poolside/laguna-xs-2.1:free,openrouter/poolside/laguna-s-2.1:free"
 
         run: |
           set -euo pipefail
@@ -1103,13 +1120,6 @@ jobs:
           echo
           echo "Python Agent Q :"
           pipenv run python --version
-
-          echo
-          echo "Playwright Agent Q :"
-          pipenv run python -c "
-          import playwright
-          print(playwright.__file__)
-          "
 
           echo
           echo "Torch :"
