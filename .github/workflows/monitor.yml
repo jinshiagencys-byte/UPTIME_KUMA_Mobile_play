@@ -1187,7 +1187,7 @@ jobs:
 
           NVIDIA_NIM_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
 
-          AGENT_Q_MODELS: "nvidia_nim/moonshotai/kimi-k2.6,openrouter/cohere/north-mini-code:free,openrouter/poolside/laguna-xs-2.1:free,openrouter/poolside/laguna-s-2.1:free"
+          AGENT_Q_MODELS: "openrouter/thinkingmachines-inkling:free,nvidia_nim/moonshotai/kimi-k2.6,openrouter/cohere/north-mini-code:free,openrouter/poolside/laguna-xs-2.1:free,openrouter/poolside/laguna-s-2.1:free"
 
         run: |
 
