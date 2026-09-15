@@ -204,7 +204,7 @@ jobs:
 
 
   # ============================================================
-  # 2. AGENT Q - CORRIGÉ POUR GOOGLE AI STUDIO
+  # 2. AGENT Q
   # ============================================================
   agent-q-test:
 
@@ -231,10 +231,14 @@ jobs:
       # PRIORITÉ ABSOLUE À GOOGLE AI STUDIO
       GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
       
-      # CORRECTION DÉFINITIVE : préfixe "gemini/" pour Google AI Studio
-      # - gemini/gemini-3.5-flash : accès correct à Google AI Studio avec clé API
-      # - Note : le nom complet du modèle est "gemini-3.5-flash"
+      # Configuration optimisée avec gestion des erreurs
       AGENT_Q_MODELS: "gemini/gemini-3.5-flash,gemini/gemini-3.6-flash,gemini/gemini-2.5-pro,nvidia_nim/moonshotai/kimi-k2.6,openrouter/cohere/north-mini-code:free,openrouter/poolside/laguna-xs-2.1:free,openrouter/poolside/laguna-s-2.1:free"
+      
+      # Paramètres critiques pour gérer les surcharges
+      MAX_RETRIES: "3"
+      RETRY_DELAY_BASE: "2"
+      MIN_RETRY_DELAY: "1"
+      MAX_RETRY_DELAY: "30"
 
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
       NVIDIA_NIM_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
@@ -474,15 +478,25 @@ jobs:
           import os
           import sys
           import re
+          import time
+          import random
           from pathlib import Path
           from playwright.sync_api import sync_playwright
           from smolagents import LiteLLMModel
 
 
           # =====================================================
+          # CONFIGURATION DES RETRIES
+          # =====================================================
+          MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "3"))
+          RETRY_DELAY_BASE = float(os.environ.get("RETRY_DELAY_BASE", "2"))
+          MIN_RETRY_DELAY = float(os.environ.get("MIN_RETRY_DELAY", "1"))
+          MAX_RETRY_DELAY = float(os.environ.get("MAX_RETRY_DELAY", "30"))
+
+
+          # =====================================================
           # CHEMINS ABSOLUS
           # =====================================================
-
           ROOT = Path(__file__).resolve().parent
 
           AGENT_Q_ROOT = ROOT / "agent-q"
@@ -511,7 +525,6 @@ jobs:
           # =====================================================
           # IMPORT AGENT Q
           # =====================================================
-
           sys.path.insert(
               0,
               str(AGENT_Q_ROOT)
@@ -523,7 +536,6 @@ jobs:
           # =====================================================
           # CONFIGURATION
           # =====================================================
-
           SITE_URL = os.environ["SITE_URL"]
           SITE_ID = os.environ["SITE_ID"]
           
@@ -545,18 +557,62 @@ jobs:
           ]
 
 
+          # =====================================================
+          # DÉTECTION DES ERREURS
+          # =====================================================
+          def is_temporary_error(error):
+              """Détecte les erreurs temporaires qui justifient un retry"""
+              error_str = str(error).lower()
+              return any(
+                  phrase in error_str
+                  for phrase in [
+                      "503",
+                      "serviceunavailableerror",
+                      "high demand",
+                      "spikes in demand",
+                      "rate limit",
+                      "429",
+                      "too many requests",
+                      "524",
+                      "gateway timeout",
+                      "connection reset",
+                      "connection aborted",
+                      "network error",
+                      "service temporarily unavailable",
+                      "internal server error",
+                      "500"
+                  ]
+              )
+
+
           def is_quota_error(error):
-              """Détecte les erreurs de quota Google AI Studio"""
+              """Détecte les erreurs de quota définitives"""
               error_str = str(error).lower()
               return any(
                   phrase in error_str
                   for phrase in [
                       "quota",
                       "limit exceeded",
-                      "rate limit",
-                      "429",
-                      "too many requests",
-                      "402"
+                      "402",
+                      "billing",
+                      "payment required",
+                      "403",
+                      "permission denied",
+                      "api key disabled"
+                  ]
+              )
+
+
+          def is_model_not_available(error):
+              """Détecte si le modèle spécifique n'est pas disponible"""
+              error_str = str(error).lower()
+              return any(
+                  phrase in error_str
+                  for phrase in [
+                      "model not found",
+                      "invalid model",
+                      "model not available",
+                      "404"
                   ]
               )
 
@@ -597,7 +653,6 @@ jobs:
           # =====================================================
           # PAGES
           # =====================================================
-
           try:
               pages = json.loads(
                   os.environ.get(
@@ -619,7 +674,6 @@ jobs:
           # =====================================================
           # TÂCHE AGENT Q
           # =====================================================
-
           task = f"""
           TU ES L'AGENT D'EXÉCUTION E2E DE SENTINELSITE.
 
@@ -802,7 +856,6 @@ jobs:
           # =====================================================
           # VALIDATION D'UN RÉSULTAT
           # =====================================================
-
           def extract_candidate(raw_result):
               candidate = None
 
@@ -836,13 +889,42 @@ jobs:
 
 
           # =====================================================
+          # FONCTION DE RETRY AVEC BACKOFF EXPONENTIEL
+          # =====================================================
+          def retry_with_backoff(func, max_retries=MAX_RETRIES, delay_base=RETRY_DELAY_BASE):
+              """
+              Exécute une fonction avec retry et backoff exponentiel.
+              Gère spécifiquement les erreurs temporaires de Google AI Studio.
+              """
+              for attempt in range(max_retries + 1):
+                  try:
+                      return func(), None
+                  except Exception as e:
+                      if attempt == max_retries:
+                          return None, e
+                      
+                      if is_temporary_error(e):
+                          # Calcul du délai avec backoff exponentiel et randomisation
+                          delay = min(
+                              MAX_RETRY_DELAY,
+                              delay_base * (2 ** attempt) + random.uniform(0, 1)
+                          )
+                          delay = max(MIN_RETRY_DELAY, delay)
+                          
+                          print(f"⚠️ Erreur temporaire détectée (tentative {attempt+1}/{max_retries}) - Attente de {delay:.2f}s")
+                          time.sleep(delay)
+                      else:
+                          return None, e
+              return None, Exception("Échec après tous les retries")
+
+
+          # =====================================================
           # EXÉCUTION D'UNE TENTATIVE POUR UN MODÈLE DONNÉ
           # =====================================================
-
           def run_attempt(model_id):
               """
               Lance une tentative complète (navigateur + agent)
-              pour un modèle donné.
+              pour un modèle donné avec gestion avancée des erreurs.
               """
               print()
               print("======================================")
@@ -863,8 +945,6 @@ jobs:
                       False,
                   )
 
-              # Configuration spécifique pour Google AI Studio
-              # Note : pas besoin de extra_headers, LiteLLM gère l'authentification
               model = LiteLLMModel(
                   model_id=model_id,
                   api_key=api_key,
@@ -933,25 +1013,32 @@ jobs:
                       print()
                       print(f"🤖 Exécution Agent Q avec {model_id}...")
 
-                      try:
-                          raw_result = agent.do(task)
-                      except Exception as first_error:
-                          print()
-                          print("❌ Première exécution échouée :", repr(first_error))
-                          
-                          # Si c'est une erreur de quota, ne pas réessayer avec le même modèle
-                          if is_quota_error(first_error):
-                              print("⚠️ Erreur de quota détectée - passage au modèle suivant")
-                              raise
-                              
-                          print("🔄 Nouvelle tentative (force_regenerate) avec le même modèle...")
-                          raw_result = agent.do(task, force_regenerate=True)
+                      # Fonction d'exécution pour le retry
+                      def execute_agent():
+                          return agent.do(task)
 
-                      print()
-                      print("✅ Agent Q terminé")
-                      print()
-                      print("Résultat brut :")
-                      print(raw_result)
+                      # Exécution avec retry intelligent
+                      raw_result, error = retry_with_backoff(
+                          execute_agent,
+                          max_retries=MAX_RETRIES,
+                          delay_base=RETRY_DELAY_BASE
+                      )
+
+                      if error:
+                          error_text = str(error)
+                          print()
+                          print(f"❌ Échec définitif après {MAX_RETRIES+1} tentatives : {error_text}")
+                          
+                          # Si c'est une erreur de quota, on ne réessaie pas avec le même modèle
+                          if is_quota_error(error):
+                              print("⚠️ Erreur de quota détectée - passage au modèle suivant")
+                              raise error
+                      else:
+                          print()
+                          print("✅ Agent Q terminé")
+                          print()
+                          print("Résultat brut :")
+                          print(raw_result)
 
                   except Exception as error:
                       error_text = repr(error)
@@ -991,7 +1078,6 @@ jobs:
           # =====================================================
           # BOUCLE DE FALLBACK SUR LES MODÈLES
           # =====================================================
-
           print("======================================")
           print("🤖 AGENT Q — MODÈLES DISPONIBLES")
           print("======================================")
@@ -1004,6 +1090,7 @@ jobs:
 
           for index, model_id in enumerate(MODEL_IDS, start=1):
               try:
+                  print(f"\n🔄 Essai avec {model_id} (tentative {index}/{len(MODEL_IDS)})")
                   attempt_output, attempt_success = run_attempt(model_id)
               except Exception as fatal_error:
                   print()
@@ -1026,8 +1113,11 @@ jobs:
 
               print()
 
+              # Pause entre les modèles pour éviter de saturer les APIs
               if index < len(MODEL_IDS):
-                  print(f"➡️ Passage au modèle suivant ({index}/{len(MODEL_IDS)} essayés)...")
+                  delay = random.uniform(0.5, 1.5)
+                  print(f"➡️ Passage au modèle suivant dans {delay:.1f} seconde(s)...")
+                  time.sleep(delay)
               else:
                   print("❌ Tous les modèles de la liste ont échoué.")
 
@@ -1078,7 +1168,10 @@ jobs:
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           NVIDIA_NIM_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-          # CORRECTION DÉFINITIVE : préfixe "gemini/" ajouté
+          MAX_RETRIES: ${{ env.MAX_RETRIES }}
+          RETRY_DELAY_BASE: ${{ env.RETRY_DELAY_BASE }}
+          MIN_RETRY_DELAY: ${{ env.MIN_RETRY_DELAY }}
+          MAX_RETRY_DELAY: ${{ env.MAX_RETRY_DELAY }}
           AGENT_Q_MODELS: "gemini/gemini-3.5-flash,gemini/gemini-3.6-flash,gemini/gemini-2.5-pro,nvidia_nim/moonshotai/kimi-k2.6,openrouter/cohere/north-mini-code:free,openrouter/poolside/laguna-xs-2.1:free,openrouter/poolside/laguna-s-2.1:free"
 
         run: |
