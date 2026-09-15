@@ -342,13 +342,12 @@ jobs:
             echo "======================================"
 
             export DISPLAY=:99
-            RECORDING_PATH="recordings/${label}.webm"
+            RECORDING_PATH="recordings/${label}.mp4"
 
-            echo "🎥 Démarrage capture ffmpeg sur DISPLAY=:99..."
-            ffmpeg -y -f x11grab -video_size 1280x800 -framerate 15 \
+            echo "🎥 Démarrage capture ffmpeg optimisée (léger) sur DISPLAY=:99..."
+            ffmpeg -y -f x11grab -video_size 1280x800 -framerate 10 \
               -i :99.0 \
-              -c:v libvpx-vp9 -b:v 1M -pix_fmt yuv420p \
-              -preset ultrafast -an \
+              -c:v libx264 -crf 28 -preset fast -tune stillimage -pix_fmt yuv420p -an \
               "$RECORDING_PATH" > /tmp/ffmpeg-${label}.log 2>&1 &
             FFMPEG_PID=$!
             sleep 1
@@ -546,6 +545,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: hermes-recordings-${{ matrix.site.id }}
-          path: recordings/*.webm
+          path: recordings/*
           if-no-files-found: ignore
           retention-days: 7
