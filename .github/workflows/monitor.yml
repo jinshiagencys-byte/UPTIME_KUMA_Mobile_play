@@ -26,6 +26,7 @@ jobs:
       sites: ${{ steps.get-sites.outputs.sites }}
 
     steps:
+
       - name: Récupérer les sites actifs et leurs pages
         id: get-sites
 
@@ -145,6 +146,7 @@ jobs:
             SITES_ARRAY="[]"
 
             while IFS= read -r site; do
+
               [ -z "$site" ] && continue
 
               SID=$(echo "$site" | jq -r '.id')
@@ -226,6 +228,7 @@ jobs:
         site: ${{ fromJson(needs.fetch-sites.outputs.sites) }}
 
     env:
+
       # ========================================================
       # MODÈLE UNIQUE
       # ========================================================
@@ -247,7 +250,10 @@ jobs:
 
       # ========================================================
       # PYTHON
-      # PAS DE cache: pip
+      #
+      # Pas de cache pip :
+      # le repo SentinelSite n'a pas de requirements.txt /
+      # pyproject.toml à la racine.
       # ========================================================
       - name: Installer Python 3.10
         uses: actions/setup-python@v5
@@ -311,9 +317,7 @@ jobs:
 
 
       # ========================================================
-      # INSTALLER EXACTEMENT L'ENVIRONNEMENT AGENT Q
-      #
-      # Agent Q fournit son Pipfile/Pipfile.lock.
+      # INSTALLER L'ENVIRONNEMENT EXACT D'AGENT Q
       # ========================================================
       - name: Installer les dépendances Agent Q
         working-directory: agent-q
@@ -321,7 +325,7 @@ jobs:
           set -euo pipefail
 
           echo "======================================"
-          echo "📦 ENVIRONNEMENT AGENT Q"
+          echo "📦 INSTALLATION AGENT Q"
           echo "======================================"
 
           pipenv sync
@@ -331,28 +335,102 @@ jobs:
 
 
       # ========================================================
-      # VÉRIFICATION CRITIQUE :
-      # PLAYWRIGHT DOIT ÊTRE DANS LE VENV AGENT Q
+      # IMPORTANT :
+      # AGENT Q DEMANDE TORCH 2.5.1.
+      #
+      # Sur le runner GitHub sans GPU NVIDIA, la version PyPI
+      # peut charger les dépendances CUDA et provoquer :
+      #
+      # libcudart.so.12 not found
+      # libcublas.so.* not found
+      #
+      # On remplace donc uniquement torch par la build CPU.
       # ========================================================
-      - name: Vérifier Playwright dans Agent Q
+      - name: Remplacer Torch CUDA par Torch CPU
         working-directory: agent-q
         run: |
           set -euo pipefail
 
           echo "======================================"
-          echo "🔎 VÉRIFICATION PLAYWRIGHT"
+          echo "🧠 TORCH CPU"
+          echo "======================================"
+
+          echo "Suppression de Torch installé par Pipenv..."
+
+          pipenv run pip uninstall -y torch || true
+
+          echo
+          echo "Installation de Torch CPU..."
+
+          pipenv run pip install \
+            --index-url https://download.pytorch.org/whl/cpu \
+            "torch==2.5.1"
+
+          echo
+          echo "✅ Torch CPU installé"
+
+
+      # ========================================================
+      # VÉRIFICATION TORCH
+      # ========================================================
+      - name: Vérifier Torch et smolagents
+        working-directory: agent-q
+        run: |
+          set -euo pipefail
+
+          echo "======================================"
+          echo "🔎 VÉRIFICATION TORCH"
+          echo "======================================"
+
+          pipenv run python -c "
+          import torch
+          print('✅ torch :', torch.__version__)
+          print('✅ CUDA disponible :', torch.cuda.is_available())
+          "
+
+          echo
+          echo "======================================"
+          echo "🔎 VÉRIFICATION SMOLAGENTS"
+          echo "======================================"
+
+          pipenv run python -c "
+          import smolagents
+          print('✅ smolagents import OK')
+          "
+
+          echo
+          echo "======================================"
+          echo "🔎 VÉRIFICATION LITELLM"
+          echo "======================================"
+
+          pipenv run python -c "
+          from smolagents import LiteLLMModel
+          print('✅ LiteLLMModel import OK')
+          "
+
+
+      # ========================================================
+      # PLAYWRIGHT
+      # ========================================================
+      - name: Vérifier Playwright Agent Q
+        working-directory: agent-q
+        run: |
+          set -euo pipefail
+
+          echo "======================================"
+          echo "🌐 VÉRIFICATION PLAYWRIGHT"
           echo "======================================"
 
           pipenv run python --version
 
           pipenv run python -c "
           import playwright
-          print('✅ Playwright Python trouvé :', playwright.__file__)
+          print('✅ Playwright :', playwright.__file__)
           "
 
           pipenv run python -c "
           from playwright.sync_api import sync_playwright
-          print('✅ playwright.sync_api import OK')
+          print('✅ playwright.sync_api OK')
           "
 
 
@@ -393,6 +471,7 @@ jobs:
       # GÉNÉRER LE RUNNER AGENT Q
       # ========================================================
       - name: Générer le runner Agent Q
+
         env:
           PAGES_JSON: ${{ toJson(matrix.site.pages) }}
 
@@ -470,16 +549,15 @@ jobs:
 
           if not OPENROUTER_API_KEY:
               raise RuntimeError(
-                  "OPENROUTER_API_KEY absent."
+                  "OPENROUTER_API_KEY absent des secrets GitHub."
               )
 
 
           # =====================================================
-          # PAGES
+          # PAGES CONNUES
           # =====================================================
 
           try:
-
               pages = json.loads(
                   os.environ.get(
                       "PAGES_JSON",
@@ -488,7 +566,6 @@ jobs:
               )
 
           except Exception:
-
               pages = []
 
 
@@ -522,7 +599,7 @@ jobs:
           Tester réellement le fonctionnement du site comme un
           utilisateur humain.
 
-          Utilise réellement le navigateur.
+          Utilise le navigateur et effectue réellement les actions.
 
           Ne te contente pas d'analyser le HTML.
 
@@ -534,7 +611,7 @@ jobs:
 
           {SITE_URL}
 
-          Vérifie que le contenu correspond au site attendu.
+          Vérifie que le contenu correspond réellement au site attendu.
 
           Attention aux :
 
@@ -562,7 +639,7 @@ jobs:
           PAGES
           ======================================================
 
-          Les pages connues :
+          Les pages connues sont :
 
           {pages_list}
 
@@ -572,7 +649,7 @@ jobs:
           pas réellement ouverte.
 
           ======================================================
-          ACTION INTERACTIVE OBLIGATOIRE
+          ACTION INTERACTIVE
           ======================================================
 
           Tu dois effectuer au moins une vraie action interactive.
@@ -591,7 +668,7 @@ jobs:
           - ouvrir réellement la page d'authentification ;
           - effectuer une action pertinente ;
           - utiliser uniquement des données fictives ;
-          - observer réellement la réponse.
+          - observer réellement le résultat.
 
           RECHERCHE :
 
@@ -617,8 +694,8 @@ jobs:
           - bloquées ;
           - absentes ;
 
-          considère cela comme une anomalie fonctionnelle même
-          si HTTP = 200.
+          considère cela comme une anomalie fonctionnelle,
+          même avec HTTP 200.
 
           ======================================================
           RÈGLE CRITIQUE
@@ -629,7 +706,7 @@ jobs:
 
           Il faut :
 
-          clic réel
+          action réelle
           +
           résultat réel
           +
@@ -680,17 +757,8 @@ jobs:
           print("🤖 AGENT Q")
           print("======================================")
 
-          print(
-              "Site :",
-              SITE_URL
-          )
-
-          print(
-              "Model :",
-              MODEL_ID
-          )
-
-          print()
+          print("Site :", SITE_URL)
+          print("Model :", MODEL_ID)
 
 
           model = LiteLLMModel(
@@ -739,14 +807,8 @@ jobs:
                       "Safari/537.36"
                   ),
 
-                  # =================================================
-                  # VIDÉO NATIVE PLAYWRIGHT
-                  # =================================================
-
                   record_video={
-                      "dir": str(
-                          RECORDINGS_DIR
-                      ),
+                      "dir": str(RECORDINGS_DIR),
 
                       "size": {
                           "width": 1280,
@@ -756,9 +818,9 @@ jobs:
               )
 
 
-              # ==================================================
-              # TRACE
-              # ==================================================
+              # =================================================
+              # TRACE PLAYWRIGHT
+              # =================================================
 
               context.tracing.start(
                   screenshots=True,
@@ -772,21 +834,13 @@ jobs:
 
               try:
 
-                  # ==============================================
-                  # OUVERTURE INITIALE
-                  # ==============================================
-
-                  print(
-                      "🌐 Ouverture du site..."
-                  )
+                  print()
+                  print("🌐 Ouverture du site...")
 
 
                   page.goto(
-
                       SITE_URL,
-
                       wait_until="domcontentloaded",
-
                       timeout=30000,
                   )
 
@@ -797,52 +851,31 @@ jobs:
                   )
 
 
-                  # ==============================================
+                  # =================================================
                   # AGENT Q
-                  # ==============================================
+                  # =================================================
 
                   agent = WebAgent(
                       page,
                       model
                   )
 
-
                   agent.init_agent()
 
 
-                  # ==============================================
-                  # PREMIÈRE TENTATIVE
-                  # ==============================================
-
                   print()
-                  print(
-                      "🤖 Exécution Agent Q..."
-                  )
+                  print("🤖 Exécution Agent Q...")
 
 
-                  result = agent.do(
-                      task
-                  )
+                  result = agent.do(task)
 
 
                   print()
-                  print(
-                      "✅ Agent Q terminé"
-                  )
+                  print("✅ Agent Q terminé")
 
+                  print()
+                  print(result)
 
-                  print(
-                      "Résultat :"
-                  )
-
-                  print(
-                      result
-                  )
-
-
-                  # ==============================================
-                  # RAW RESULT
-                  # ==============================================
 
                   output = {
                       "site_id": SITE_ID,
@@ -872,20 +905,13 @@ jobs:
 
                   print()
                   print(
-                      "❌ Première tentative Agent Q échouée"
+                      "❌ Première exécution Agent Q échouée :"
                   )
 
                   print(
                       repr(error)
                   )
 
-
-                  # ==============================================
-                  # RE-GÉNÉRATION
-                  #
-                  # MÊME modèle.
-                  # Pas de fallback.
-                  # ==============================================
 
                   print()
                   print(
@@ -935,13 +961,11 @@ jobs:
 
                       print()
                       print(
-                          "❌ Régénération échouée"
+                          "❌ Régénération échouée :"
                       )
 
                       print(
-                          repr(
-                              regeneration_error
-                          )
+                          repr(regeneration_error)
                       )
 
 
@@ -975,9 +999,9 @@ jobs:
 
               finally:
 
-                  # ==============================================
+                  # =================================================
                   # ARRÊTER TRACE
-                  # ==============================================
+                  # =================================================
 
                   try:
 
@@ -997,11 +1021,9 @@ jobs:
                       )
 
 
-                  # ==============================================
+                  # =================================================
                   # FERMER CONTEXTE
-                  #
-                  # La fermeture finalise la vidéo Playwright.
-                  # ==============================================
+                  # =================================================
 
                   context.close()
 
@@ -1024,12 +1046,15 @@ jobs:
       # EXÉCUTER AGENT Q
       #
       # IMPORTANT :
-      # pipenv run = environnement où Playwright est installé.
+      # On utilise le Python du virtualenv Agent Q.
       # ========================================================
       - name: Exécuter Agent Q
         env:
+
           SITE_ID: ${{ matrix.site.id }}
+
           SITE_URL: ${{ matrix.site.url }}
+
           PAGES_JSON: ${{ toJson(matrix.site.pages) }}
 
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
@@ -1037,6 +1062,7 @@ jobs:
           AGENT_Q_MODEL: "openrouter/thinkingmachines/inkling:free"
 
         run: |
+
           set -euo pipefail
 
           echo "======================================"
@@ -1045,36 +1071,51 @@ jobs:
 
           echo
           echo "Python système :"
+
           python --version
+
+
+          cd agent-q
+
 
           echo
           echo "Python Agent Q :"
-          cd agent-q
+
           pipenv run python --version
+
 
           echo
           echo "Playwright Agent Q :"
+
           pipenv run python -c "
           import playwright
           print(playwright.__file__)
           "
 
+
           echo
-          echo "Import Playwright :"
+          echo "Torch :"
+
           pipenv run python -c "
-          from playwright.sync_api import sync_playwright
-          print('✅ playwright.sync_api OK')
+          import torch
+          print('torch =', torch.__version__)
+          print('cuda =', torch.cuda.is_available())
           "
+
+
+          echo
+          echo "smolagents :"
+
+          pipenv run python -c "
+          import smolagents
+          print('smolagents import OK')
+          "
+
 
           echo
           echo "Lancement du runner..."
           echo
 
-          cd ..
-
-          pipenv --python 3.10 >/dev/null 2>&1 || true
-
-          cd agent-q
 
           pipenv run python ../run_agent_q.py
 
@@ -1137,11 +1178,12 @@ jobs:
               "result"
           )
 
+
           candidate = None
 
 
           # ==================================================
-          # RESULTAT DICT
+          # DICT
           # ==================================================
 
           if isinstance(
@@ -1159,7 +1201,7 @@ jobs:
 
 
           # ==================================================
-          # RESULTAT STRING
+          # STRING
           # ==================================================
 
           elif isinstance(
@@ -1212,6 +1254,7 @@ jobs:
                               match.group(1)
                           )
 
+
                           if isinstance(
                               parsed,
                               dict
@@ -1242,14 +1285,16 @@ jobs:
 
 
           # ==================================================
-          # NORMALISER
+          # NORMALISATION
           # ==================================================
 
           candidate["overall_status"] = str(
+
               candidate.get(
                   "overall_status",
                   "ERROR"
               )
+
           ).upper()
 
 
@@ -1271,24 +1316,29 @@ jobs:
 
 
           candidate["actions_completed"] = bool(
+
               candidate.get(
                   "actions_completed",
                   False
               )
+
           )
 
 
           output_file.write_text(
+
               json.dumps(
                   candidate,
                   ensure_ascii=False,
                   indent=2,
               ),
+
               encoding="utf-8",
           )
 
 
           print()
+
           print(
               "======================================"
           )
@@ -1331,7 +1381,7 @@ jobs:
 
 
       # ========================================================
-      # ENVOYER PAGES-REPORT
+      # ENVOYER PAGES REPORT
       # ========================================================
       - name: Envoyer le rapport des pages
         if: always()
@@ -1397,25 +1447,34 @@ jobs:
           set +e
 
           STATUS="ERROR"
+
           MESSAGE="Agent Q execution error"
 
 
           if [ -f output.json ]; then
 
-            STATUS=$(jq -r \
-              '.overall_status // "ERROR"' \
-              output.json \
-              | tr '[:lower:]' '[:upper:]'
+            STATUS=$(
+
+              jq -r \
+                '.overall_status // "ERROR"' \
+                output.json |
+
+              tr '[:lower:]' '[:upper:]'
+
             )
 
 
-            MESSAGE=$(jq -c '
-              {
-                site_type: .site_type,
-                actions_completed: .actions_completed,
-                pages: .pages
-              }
-            ' output.json)
+            MESSAGE=$(
+
+              jq -c '
+                {
+                  site_type: .site_type,
+                  actions_completed: .actions_completed,
+                  pages: .pages
+                }
+              ' output.json
+
+            )
 
           fi
 
@@ -1451,7 +1510,7 @@ jobs:
 
 
       # ========================================================
-      # VIDÉOS
+      # LISTER VIDÉOS
       # ========================================================
       - name: Lister les vidéos Playwright
         if: always()
@@ -1470,7 +1529,7 @@ jobs:
 
 
       # ========================================================
-      # TRACES
+      # LISTER TRACES
       # ========================================================
       - name: Lister les traces Playwright
         if: always()
@@ -1497,6 +1556,7 @@ jobs:
         uses: actions/upload-artifact@v4
 
         with:
+
           name: agent-q-monitoring-${{ matrix.site.id }}
 
           path: |
