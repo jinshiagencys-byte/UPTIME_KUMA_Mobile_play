@@ -134,7 +134,7 @@ jobs:
               2>/dev/null || echo "[]")
 
             if [ -z "$SITES_RAW" ] || [ "$SITES_RAW" = "null" ]; then
-              echo "⚠️ Réponse Supabase/relay illisible ou vide"
+              echo "⚠️ Réponse active-sites illisible ou vide"
               SITES_RAW="[]"
             fi
 
@@ -247,12 +247,17 @@ jobs:
 
       # ========================================================
       # PYTHON
+      #
+      # IMPORTANT :
+      # PAS DE cache: pip ici.
+      #
+      # Le repository SentinelSite n'a pas de
+      # requirements.txt/pyproject.toml à la racine.
       # ========================================================
       - name: Installer Python 3.10
         uses: actions/setup-python@v5
         with:
           python-version: "3.10"
-          cache: "pip"
 
 
       # ========================================================
@@ -282,10 +287,6 @@ jobs:
 
       # ========================================================
       # CACHE DU CODE STORE AGENT Q
-      #
-      # Agent Q stocke les scripts réussis dans code_store.
-      # GitHub Actions étant éphémère, on conserve ce dossier
-      # entre les exécutions.
       # ========================================================
       - name: Restaurer le code store Agent Q
         uses: actions/cache@v4
@@ -293,7 +294,7 @@ jobs:
         with:
           path: agent-q/code_store
 
-          key: agent-q-code-store-${{ matrix.site.id }}-${{ hashFiles('agent-q/src/**/*.py', 'agent-q/Pipfile') }}
+          key: agent-q-code-store-${{ matrix.site.id }}-${{ hashFiles('agent-q/src/**/*.py', 'agent-q/Pipfile', 'agent-q/Pipfile.lock') }}
 
           restore-keys: |
             agent-q-code-store-${{ matrix.site.id }}-
@@ -301,52 +302,61 @@ jobs:
 
 
       # ========================================================
-      # DÉPENDANCES AGENT Q
-      #
-      # Versions provenant du Pipfile du repository Agent Q.
+      # INSTALLER PIPENV
       # ========================================================
-      - name: Installer les dépendances Agent Q
+      - name: Installer Pipenv
+        run: |
+          set -euo pipefail
+
+          python -m pip install --upgrade pip
+
+          python -m pip install pipenv
+
+          pipenv --version
+
+
+      # ========================================================
+      # INSTALLER LES DÉPENDANCES EXACTES D'AGENT Q
+      #
+      # On utilise le Pipfile.lock du dépôt Agent Q.
+      # Cela évite de recréer manuellement son environnement.
+      # ========================================================
+      - name: Installer les dépendances Agent Q depuis Pipfile.lock
         working-directory: agent-q
         run: |
           set -euo pipefail
 
-          python -m pip install --upgrade pip setuptools wheel
+          echo "======================================"
+          echo "📦 INSTALLATION AGENT Q"
+          echo "======================================"
 
-          pip install \
-            "pytest==6.2.5" \
-            "python-dotenv==1.0.1" \
-            "smolagents==1.2.2" \
-            "litellm==1.57.8" \
-            "playwright==1.49.1" \
-            "html-sanitizer==2.5.0" \
-            "beautifulsoup4==4.12.3" \
-            "requests==2.32.3" \
-            "torch==2.5.1" \
-            "ollama==0.4.7"
+          pipenv sync
 
           echo
           echo "✅ Dépendances Agent Q installées"
 
 
       # ========================================================
-      # PLAYWRIGHT + CHROMIUM
+      # INSTALLER CHROMIUM PLAYWRIGHT
+      #
+      # On utilise l'environnement Pipenv d'Agent Q.
       # ========================================================
       - name: Installer Chromium Playwright
         working-directory: agent-q
         run: |
           set -euo pipefail
 
-          python -m playwright install --with-deps chromium
+          pipenv run playwright install --with-deps chromium
 
           echo "======================================"
           echo "🌐 PLAYWRIGHT"
           echo "======================================"
 
-          python -m playwright --version
+          pipenv run playwright --version
 
 
       # ========================================================
-      # RÉPERTOIRES
+      # RÉPERTOIRES DE SORTIE
       # ========================================================
       - name: Préparer les répertoires
         run: |
@@ -378,6 +388,7 @@ jobs:
 
           from playwright.sync_api import sync_playwright
           from smolagents import LiteLLMModel
+
 
           # =====================================================
           # IMPORT AGENT Q
@@ -616,7 +627,7 @@ jobs:
 
 
           # =====================================================
-          # INITIALISER MODÈLE
+          # MODÈLE
           # =====================================================
 
           print("======================================")
@@ -686,15 +697,14 @@ jobs:
 
 
               # ================================================
-              # TRACE PLAYWRIGHT
+              # TRACE
               # ================================================
 
               context.tracing.start(
                   screenshots=True,
                   snapshots=True,
                   sources=True,
-                )
-
+              )
 
               page = context.new_page()
 
@@ -702,7 +712,7 @@ jobs:
               try:
 
                   # ==========================================
-                  # PAGE INITIALE
+                  # OUVERTURE DU SITE
                   # ==========================================
 
                   print("🌐 Ouverture du site...")
@@ -732,36 +742,20 @@ jobs:
 
 
                   # ==========================================
-                  # PREMIÈRE EXÉCUTION
+                  # PREMIÈRE TENTATIVE
                   # ==========================================
 
                   print()
-                  print(
-                      "🤖 Exécution Agent Q..."
-                  )
+                  print("🤖 Exécution Agent Q...")
 
                   result = agent.do(task)
 
-
-                  # ==========================================
-                  # RÉSULTAT
-                  # ==========================================
-
                   print()
-                  print(
-                      "✅ Agent Q a terminé."
-                  )
+                  print("✅ Agent Q terminé.")
 
-                  print(
-                      "Résultat :"
-                  )
-
+                  print("Résultat :")
                   print(result)
 
-
-                  # ==========================================
-                  # SAUVEGARDE
-                  # ==========================================
 
                   output = {
                       "site_id": SITE_ID,
@@ -787,24 +781,14 @@ jobs:
 
                   print()
                   print(
-                      "❌ Agent Q a échoué :"
+                      "❌ Première exécution Agent Q échouée :"
                   )
 
-                  print(
-                      repr(error)
-                  )
-
-                  # ==========================================
-                  # DEUXIÈME ESSAI :
-                  # uniquement une régénération du même modèle.
-                  #
-                  # Ce n'est PAS un fallback de modèle.
-                  # ==========================================
+                  print(repr(error))
 
                   print()
                   print(
-                      "🔄 Tentative de régénération Agent Q "
-                      "avec le même modèle..."
+                      "🔄 Régénération avec le même modèle..."
                   )
 
                   try:
@@ -840,8 +824,9 @@ jobs:
 
                   except Exception as regeneration_error:
 
+                      print()
                       print(
-                          "❌ Échec de la régénération."
+                          "❌ Régénération Agent Q échouée :"
                       )
 
                       print(
@@ -872,7 +857,7 @@ jobs:
               finally:
 
                   # ==========================================
-                  # ARRÊTER TRACE
+                  # ARRÊT TRACE
                   # ==========================================
 
                   try:
@@ -884,33 +869,31 @@ jobs:
                           )
                       )
 
-                  except Exception as error:
+                  except Exception as trace_error:
 
                       print(
-                          "⚠️ Impossible de sauvegarder la trace :",
-                          error
+                          "⚠️ Trace non sauvegardée :",
+                          trace_error
                       )
 
                   # ==========================================
-                  # FERMER CONTEXT
+                  # FERMETURE
                   #
-                  # IMPORTANT :
-                  # Playwright finalise la vidéo à la fermeture
-                  # du BrowserContext.
+                  # La fermeture du BrowserContext finalise
+                  # la vidéo Playwright.
                   # ==========================================
 
                   context.close()
-
                   browser.close()
 
 
           print()
           print(
-              "🎥 Le contexte Playwright a été fermé."
+              "🎥 BrowserContext fermé."
           )
 
           print(
-              "La vidéo devrait maintenant être finalisée."
+              "✅ Vidéo Playwright finalisée."
           )
           PYTHON
 
@@ -935,7 +918,7 @@ jobs:
 
 
       # ========================================================
-      # TRANSFORMER LE RÉSULTAT AGENT Q
+      # CONSTRUIRE output.json
       # ========================================================
       - name: Construire output.json
         if: always()
@@ -957,10 +940,6 @@ jobs:
           )
 
 
-          # ==================================================
-          # AUCUN RÉSULTAT
-          # ==================================================
-
           if not raw_file.exists():
 
               result = {
@@ -968,7 +947,9 @@ jobs:
                   "site_type": "autre",
                   "actions_completed": False,
                   "pages": [],
-                  "error": "Agent Q n'a produit aucun résultat."
+                  "error": (
+                      "Agent Q n'a produit aucun résultat."
+                  ),
               }
 
               output_file.write_text(
@@ -989,43 +970,31 @@ jobs:
               )
           )
 
-
           raw_result = data.get("result")
-
 
           candidate = None
 
 
           # ==================================================
-          # SI DICT DIRECT
+          # DICT
           # ==================================================
 
-          if isinstance(
-              raw_result,
-              dict
-          ):
+          if isinstance(raw_result, dict):
 
               if (
-                  "overall_status"
-                  in raw_result
+                  "overall_status" in raw_result
                   and
-                  "pages"
-                  in raw_result
+                  "pages" in raw_result
               ):
 
                   candidate = raw_result
 
 
           # ==================================================
-          # SI STRING
+          # STRING
           # ==================================================
 
-          elif isinstance(
-              raw_result,
-              str
-          ):
-
-              # JSON direct
+          elif isinstance(raw_result, str):
 
               try:
 
@@ -1036,11 +1005,9 @@ jobs:
                   if (
                       isinstance(parsed, dict)
                       and
-                      "overall_status"
-                      in parsed
+                      "overall_status" in parsed
                       and
-                      "pages"
-                      in parsed
+                      "pages" in parsed
                   ):
 
                       candidate = parsed
@@ -1048,8 +1015,6 @@ jobs:
               except Exception:
                   pass
 
-
-              # JSON dans un bloc Markdown
 
               if candidate is None:
 
@@ -1079,7 +1044,7 @@ jobs:
 
 
           # ==================================================
-          # SI JSON NON EXPLOITABLE
+          # PAS DE JSON
           # ==================================================
 
           if candidate is None:
@@ -1090,25 +1055,21 @@ jobs:
                   "actions_completed": False,
                   "pages": [],
                   "error": (
-                      "Agent Q n'a pas produit le JSON "
-                      "attendu."
+                      "Agent Q n'a pas produit le JSON attendu."
                   ),
               }
 
 
           # ==================================================
-          # NORMALISATION
+          # NORMALISER LE STATUT
           # ==================================================
 
-          candidate["overall_status"] = (
-              str(
-                  candidate.get(
-                      "overall_status",
-                      "ERROR"
-                  )
+          candidate["overall_status"] = str(
+              candidate.get(
+                  "overall_status",
+                  "ERROR"
               )
-              .upper()
-          )
+          ).upper()
 
 
           if candidate["overall_status"] not in {
@@ -1136,10 +1097,6 @@ jobs:
           )
 
 
-          # ==================================================
-          # ÉCRIRE
-          # ==================================================
-
           output_file.write_text(
               json.dumps(
                   candidate,
@@ -1150,38 +1107,26 @@ jobs:
           )
 
 
-          print(
-              "======================================"
+          echo = json.dumps(
+              candidate,
+              ensure_ascii=False,
+              indent=2
           )
 
-          print(
-              "📄 output.json"
-          )
-
-          print(
-              "======================================"
-          )
-
-          print(
-              json.dumps(
-                  candidate,
-                  ensure_ascii=False,
-                  indent=2,
-              )
-          )
+          print(echo)
 
           PYTHON
 
 
       # ========================================================
-      # AFFICHER LE RÉSULTAT
+      # AFFICHER RÉSULTAT
       # ========================================================
-      - name: Afficher le résultat
+      - name: Afficher le résultat final
         if: always()
         run: |
 
           echo "======================================"
-          echo "📊 RÉSULTAT FINAL"
+          echo "📊 RÉSULTAT AGENT Q"
           echo "======================================"
 
           if [ -f output.json ]; then
@@ -1192,7 +1137,7 @@ jobs:
 
 
       # ========================================================
-      # ENVOYER LES PAGES AU RELAY
+      # RAPPORT PAGES
       # ========================================================
       - name: Envoyer le rapport des pages
         if: always()
@@ -1219,7 +1164,6 @@ jobs:
               output.json \
               > pages_payload.json
 
-
             echo "📤 Envoi du rapport pages..."
 
             curl -sS \
@@ -1235,13 +1179,13 @@ jobs:
 
           else
 
-            echo "⚠️ Aucun tableau pages."
+            echo "⚠️ Aucun tableau pages exploitable"
 
           fi
 
 
       # ========================================================
-      # ENVOYER LE STATUT GLOBAL
+      # STATUT GLOBAL
       # ========================================================
       - name: Envoyer le statut global
         if: always()
@@ -1266,7 +1210,6 @@ jobs:
               output.json \
               | tr '[:lower:]' '[:upper:]'
             )
-
 
             MESSAGE=$(jq -c '
               {
@@ -1309,14 +1252,14 @@ jobs:
 
 
       # ========================================================
-      # LISTER LES VIDÉOS
+      # VIDÉOS
       # ========================================================
-      - name: Lister les vidéos
+      - name: Lister les vidéos Playwright
         if: always()
         run: |
 
           echo "======================================"
-          echo "🎥 VIDÉOS PLAYWRIGHT"
+          echo "🎥 VIDÉOS"
           echo "======================================"
 
           find recordings \
@@ -1324,18 +1267,18 @@ jobs:
             -type f \
             -printf "%p - %s bytes\n" \
             2>/dev/null \
-            || echo "Aucune vidéo."
+            || echo "Aucune vidéo"
 
 
       # ========================================================
-      # LISTER LES TRACES
+      # TRACES
       # ========================================================
-      - name: Lister les traces
+      - name: Lister les traces Playwright
         if: always()
         run: |
 
           echo "======================================"
-          echo "🧪 TRACES PLAYWRIGHT"
+          echo "🧪 TRACES"
           echo "======================================"
 
           find traces \
@@ -1343,11 +1286,11 @@ jobs:
             -type f \
             -printf "%p - %s bytes\n" \
             2>/dev/null \
-            || echo "Aucune trace."
+            || echo "Aucune trace"
 
 
       # ========================================================
-      # UPLOAD ARTIFACTS
+      # ARTIFACT
       # ========================================================
       - name: Uploader les artifacts Agent Q
         if: always()
@@ -1355,7 +1298,7 @@ jobs:
         uses: actions/upload-artifact@v4
 
         with:
-          name: agent-q-recordings-${{ matrix.site.id }}
+          name: agent-q-monitoring-${{ matrix.site.id }}
 
           path: |
             recordings/
