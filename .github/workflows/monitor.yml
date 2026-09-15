@@ -204,7 +204,7 @@ jobs:
 
 
   # ============================================================
-  # 2. AGENT Q
+  # 2. AGENT Q - CORRIGÉ POUR GOOGLE AI STUDIO
   # ============================================================
   agent-q-test:
 
@@ -231,10 +231,9 @@ jobs:
       # PRIORITÉ ABSOLUE À GOOGLE AI STUDIO
       GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
       
-      # CORRECTION CRITIQUE : préfixe "gemini/" pour Google AI Studio
-      # - gemini/gemini-3.5-flash : accès direct à Google AI Studio
-      # - pas de dépendance vers google-auth nécessaire
-      AGENT_Q_MODELS: "gemini/gemini-3.5-flash,gemini/gemini-3.6-flash,gemini/gemini-2.5-pro,nvidia_nim/moonshotai/kimi-k2.6,openrouter/cohere/north-mini-code:free,openrouter/poolside/laguna-xs-2.1:free,openrouter/poolside/laguna-s-2.1:free"
+      # CORRECTION CRITIQUE : préfixe "google_ai/" pour Google AI Studio
+      # - google_ai/gemini-3.5-flash : accès correct à Google AI Studio avec clé API
+      AGENT_Q_MODELS: "google_ai/gemini-3.5-flash,google_ai/gemini-3.6-flash,google_ai/gemini-2.5-pro,nvidia_nim/moonshotai/kimi-k2.6,openrouter/cohere/north-mini-code:free,openrouter/poolside/laguna-xs-2.1:free,openrouter/poolside/laguna-s-2.1:free"
 
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
       NVIDIA_NIM_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
@@ -313,24 +312,6 @@ jobs:
 
           pipenv --version
 
-
-      # ========================================================
-      # INSTALLER LES DÉPENDANCES SPÉCIFIQUES À GOOGLE
-      # ========================================================
-      - name: Installer les dépendances Google
-        working-directory: agent-q
-        run: |
-          set -euo pipefail
-          
-          echo "======================================"
-          echo "🔍 INSTALLATION DES DÉPENDANCES GOOGLE"
-          echo "======================================"
-          
-          # Installer google-generativeai pour une compatibilité maximale
-          pipenv run pip install google-generativeai --upgrade
-          
-          echo "✅ Packages Google installés"
-      
 
       # ========================================================
       # ENVIRONNEMENT AGENT Q
@@ -557,7 +538,7 @@ jobs:
               m.strip()
               for m in os.environ.get(
                   "AGENT_Q_MODELS",
-                  "gemini/gemini-3.5-flash,gemini/gemini-3.6-flash,gemini/gemini-2.5-pro"
+                  "google_ai/gemini-3.5-flash,google_ai/gemini-3.6-flash,google_ai/gemini-2.5-pro"
               ).split(",")
               if m.strip()
           ]
@@ -582,11 +563,11 @@ jobs:
           def resolve_api_key(model_id):
               """
               Choisit la bonne clé API selon le préfixe du modèle :
-              - gemini/gemini-... → GOOGLE_API_KEY
+              - google_ai/gemini-... → GOOGLE_API_KEY
               - nvidia_nim/... → NVIDIA_NIM_API_KEY
               - openrouter/... → OPENROUTER_API_KEY
               """
-              if model_id.startswith("gemini/gemini-"):
+              if model_id.startswith("google_ai/gemini-"):
                   return GOOGLE_API_KEY
 
               if model_id.startswith("nvidia_nim/"):
@@ -881,16 +862,9 @@ jobs:
                       False,
                   )
 
-              # Configuration spéciale pour Google AI Studio
-              extra_headers = None
-              if model_id.startswith("gemini/gemini-"):
-                  # Utiliser l'API Google AI Studio directement
-                  extra_headers = {"Authorization": f"Bearer {api_key}"}
-
               model = LiteLLMModel(
                   model_id=model_id,
                   api_key=api_key,
-                  extra_headers=extra_headers  # Important pour Google AI Studio
               )
 
               with sync_playwright() as playwright:
@@ -1101,8 +1075,8 @@ jobs:
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           NVIDIA_NIM_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-          # CORRECTION : préfixe "gemini/" ajouté
-          AGENT_Q_MODELS: "gemini/gemini-3.5-flash,gemini/gemini-3.6-flash,gemini/gemini-2.5-pro,nvidia_nim/moonshotai/kimi-k2.6,openrouter/cohere/north-mini-code:free,openrouter/poolside/laguna-xs-2.1:free,openrouter/poolside/laguna-s-2.1:free"
+          # CORRECTION : préfixe "google_ai/" ajouté
+          AGENT_Q_MODELS: "google_ai/gemini-3.5-flash,google_ai/gemini-3.6-flash,google_ai/gemini-2.5-pro,nvidia_nim/moonshotai/kimi-k2.6,openrouter/cohere/north-mini-code:free,openrouter/poolside/laguna-xs-2.1:free,openrouter/poolside/laguna-s-2.1:free"
 
         run: |
           set -euo pipefail
