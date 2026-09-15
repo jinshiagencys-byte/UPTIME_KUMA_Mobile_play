@@ -421,10 +421,19 @@ jobs:
           }
 
           # ======================================
-          # 🥇 PRIORITÉ 1 : Chaîne OpenRouter (modèles gratuits)
+          # 🥇 PRIORITÉ 1 : Mistral
           # ======================================
           echo "======================================"
-          echo "🥇 PRIORITÉ 1 : Chaîne OpenRouter"
+          echo "🥇 PRIORITÉ 1 : Mistral"
+          echo "======================================"
+          run_agent "custom:mistral" "mistral-small-latest" "mistral"
+          try_result "output-mistral.json" "mistral"
+
+          # ======================================
+          # 🥈 PRIORITÉ 2 : Chaîne OpenRouter (modèles gratuits)
+          # ======================================
+          echo "======================================"
+          echo "🥈 PRIORITÉ 2 : Chaîne OpenRouter"
           echo "======================================"
           for OR_MODEL in "poolside/laguna-s-2.1:free" "inclusionai/ling-3.0-flash-fin:free" "thinkingmachines/inkling:free" "openrouter/free"; do
             label="openrouter-$(echo "$OR_MODEL" | tr '/:' '--')"
@@ -433,12 +442,12 @@ jobs:
           done
 
           # ======================================
-          # 🥈 PRIORITÉ 2 : Fallback sur Mistral / Gemini / HuggingFace
+          # 🥉 PRIORITÉ 3 : Fallback sur Gemini / HuggingFace
           # ======================================
           echo "======================================"
-          echo "🔁 PRIORITÉ 2 : Fallback sur Mistral / Gemini / HuggingFace"
+          echo "🔁 PRIORITÉ 3 : Fallback sur Gemini / HuggingFace"
           echo "======================================"
-          for PAIR in "custom:mistral|mistral-small-latest" "gemini|gemini-3.1-pro-preview" "huggingface|openai/gpt-oss-120b:cerebras"; do
+          for PAIR in "gemini|gemini-3.1-pro-preview" "huggingface|openai/gpt-oss-120b:cerebras"; do
             provider="${PAIR%%|*}"
             model="${PAIR#*|}"
             label="$(echo "${provider}-${model}" | tr '/:' '--')"
