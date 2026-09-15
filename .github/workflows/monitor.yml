@@ -131,18 +131,7 @@ jobs:
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
           DISPLAY: ":99"
           AGENT_BROWSER_HEADED: "1"
-          # ✅ FIX CRITIQUE : args séparés par des RETOURS À LA LIGNE, pas des
-          # virgules. agent-browser découpe sur les virgules, ce qui cassait
-          # --window-size=1280,800 en "--window-size=1280" + "800" ; le "800"
-          # était interprété comme une URL (http://800 → 0.0.3.32) et ouvrait
-          # un onglet blanc qui volait le focus de la capture vidéo.
-          AGENT_BROWSER_ARGS: |
-            --no-sandbox
-            --disable-dev-shm-usage
-            --disable-blink-features=AutomationControlled
-            --window-size=1280,800
-            --no-first-run
-            --no-default-browser-check
+          AGENT_BROWSER_ARGS: "--no-sandbox,--disable-dev-shm-usage,--disable-blink-features=AutomationControlled,--window-size=1280,800,--no-first-run,--no-default-browser-check"
         run: |
           mkdir -p ~/.hermes
           mkdir -p ~/.hermes/browser_recordings
@@ -209,10 +198,8 @@ jobs:
           echo "=== hermes doctor --fix ==="
           hermes doctor --fix || true
           
-          echo "=== Test : navigateur headed sur Xvfb (vérif pas d'onglet parasite) ==="
+          echo "=== Test : navigateur headed sur Xvfb ==="
           agent-browser open "https://example.com" || true
-          echo "--- Onglets ouverts (doit être exactement 1) ---"
-          agent-browser tab list || true
           agent-browser screenshot /tmp/test-headed.png || echo "⚠️ screenshot failed"
           if [ -f /tmp/test-headed.png ]; then
             echo "✅ Navigateur headed fonctionne (screenshot créé)"
@@ -291,19 +278,12 @@ jobs:
           alors qu'elles sont attendues = DOWN même si HTTP 200.
           EOF
 
-      - name: Lancer Hermes Agent avec enregistrement vidéo
+      - name: Lancer Hermes Agent avec capture vidéo ffmpeg
         id: agent_run
         env:
           DISPLAY: ":99"
           AGENT_BROWSER_HEADED: "1"
-          # ✅ Même fix : séparateur newline, pas virgule
-          AGENT_BROWSER_ARGS: |
-            --no-sandbox
-            --disable-dev-shm-usage
-            --disable-blink-features=AutomationControlled
-            --window-size=1280,800
-            --no-first-run
-            --no-default-browser-check
+          AGENT_BROWSER_ARGS: "--no-sandbox,--disable-dev-shm-usage,--disable-blink-features=AutomationControlled,--window-size=1280,800,--no-first-run,--no-default-browser-check"
         run: |
           set +e
 
@@ -327,43 +307,37 @@ jobs:
 
             export DISPLAY=:99
             RECORDING_PATH="recordings/${label}.webm"
-            SCREEN_PATH="recordings/${label}-xvfb.webm"
 
-            # 🎥 CAPTURE DE SECOURS : ffmpeg enregistre le display Xvfb :99
-            echo "🎥 Démarrage capture ffmpeg de secours sur :99..."
+            # 🎥 CAPTURE UNIQUE via ffmpeg sur le display Xvfb :99
+            echo "🎥 Démarrage capture ffmpeg sur DISPLAY=:99..."
             ffmpeg -y -f x11grab -video_size 1280x800 -framerate 15 \
               -i :99.0 \
               -c:v libvpx-vp9 -b:v 1M -pix_fmt yuv420p \
               -preset ultrafast -an \
-              "$SCREEN_PATH" > /tmp/ffmpeg-${label}.log 2>&1 &
+              "$RECORDING_PATH" > /tmp/ffmpeg-${label}.log 2>&1 &
             FFMPEG_PID=$!
             sleep 1
             if kill -0 $FFMPEG_PID 2>/dev/null; then
-              echo "✅ ffmpeg de secours actif (PID $FFMPEG_PID)"
+              echo "✅ ffmpeg actif (PID $FFMPEG_PID)"
             else
-              echo "⚠️ ffmpeg de secours n'a pas démarré"
+              echo "❌ ffmpeg n'a pas démarré"
               cat /tmp/ffmpeg-${label}.log | tail -10
             fi
 
-            # 🎥 ENREGISTREMENT PRINCIPAL : agent-browser record sur l'URL du site
-            echo "🎥 Démarrage de l'enregistrement agent-browser..."
-            agent-browser record start "$RECORDING_PATH" "${{ matrix.site.url }}" || echo "⚠️ record start failed"
-
-            # Lancer Hermes
+            # Lancer Hermes (il ouvrira son propre navigateur headed sur :99)
             hermes -z "$TASK_CONTENT" --provider "$provider" -m "$model" -t "browser,terminal" --yolo > "output-${label}.json" 2>&1
             HERMES_EXIT=$?
 
-            # 🎥 Arrêt des deux captures
-            echo "🎥 Arrêt de l'enregistrement agent-browser..."
-            agent-browser record stop || echo "⚠️ record stop failed"
-
+            # 🎥 Arrêt propre de ffmpeg (SIGINT pour finaliser le WebM)
+            echo "🎥 Arrêt de ffmpeg..."
             if kill -0 $FFMPEG_PID 2>/dev/null; then
               kill -INT $FFMPEG_PID
               wait $FFMPEG_PID 2>/dev/null || true
-              echo "✅ ffmpeg de secours arrêté"
+              echo "✅ ffmpeg arrêté"
             fi
 
-            agent-browser close --all || true
+            # Fermer toute session navigateur résiduelle
+            agent-browser close --all 2>/dev/null || true
 
             echo "exit_code=$HERMES_EXIT"
 
@@ -371,18 +345,15 @@ jobs:
               echo "⚠️ ${label} : vérification terminée mais bloc JSON final tronqué — voir output-${label}.json"
             fi
 
-            echo "=== Fichiers vidéo produits ==="
-            ls -lah recordings/ || echo "(rien)"
-
             if [ -f "$RECORDING_PATH" ] && [ -s "$RECORDING_PATH" ]; then
-              echo "✅ Vidéo principale : $RECORDING_PATH ($(ls -lh "$RECORDING_PATH" | awk '{print $5}'))"
+              FILE_SIZE=$(ls -lh "$RECORDING_PATH" | awk '{print $5}')
+              echo "✅ Vidéo enregistrée : $RECORDING_PATH ($FILE_SIZE)"
             else
-              echo "❌ Vidéo principale absente/vide"
-            fi
-            if [ -f "$SCREEN_PATH" ] && [ -s "$SCREEN_PATH" ]; then
-              echo "✅ Vidéo secours Xvfb : $SCREEN_PATH ($(ls -lh "$SCREEN_PATH" | awk '{print $5}'))"
-            else
-              echo "❌ Vidéo secours absente/vide"
+              echo "❌ Fichier vidéo absent ou vide"
+              echo "=== Log ffmpeg ==="
+              cat /tmp/ffmpeg-${label}.log | tail -30
+              echo "=== Dernières lignes des logs Hermes ==="
+              tail -50 "output-${label}.json" || true
             fi
           }
 
