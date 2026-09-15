@@ -265,6 +265,15 @@ jobs:
           "note" ET mets actions_completed à false — ne mets JAMAIS
           actions_completed à true juste parce qu'une page a chargé.
 
+          RAPPEL STRICT : tu DOIS effectuer au moins une action interactive
+          réelle (clic + vérification du résultat) avant de conclure quoi
+          que ce soit sur le statut du site. Si tu termines sans avoir cliqué
+          "ajouter au panier" (ou l'équivalent pour le type de site détecté :
+          inscription/connexion, soumission de formulaire, recherche) ET
+          vérifié le résultat obtenu, mets actions_completed: false et
+          explique précisément pourquoi dans "note". Ne conclus JAMAIS "UP"
+          sur la seule base d'un chargement de page sans action exécutée.
+
           Pour chaque page listée, vérifie au minimum qu'elle répond correctement
           (HTTP 200, contenu attendu). Explore aussi les liens internes pour
           détecter d'éventuelles pages non listées et signale-les dans le JSON
@@ -412,19 +421,10 @@ jobs:
           }
 
           # ======================================
-          # 🥇 PRIORITÉ 1 : NVIDIA NIM (Modèle principal)
+          # 🥇 PRIORITÉ 1 : Chaîne OpenRouter (modèles gratuits)
           # ======================================
           echo "======================================"
-          echo "🥇 PRIORITÉ 1 : NVIDIA NIM"
-          echo "======================================"
-          run_agent "nvidia" "moonshotai/kimi-k3" "nvidia1"
-          try_result "output-nvidia1.json" "nvidia1"
-
-          # ======================================
-          # 🥈 PRIORITÉ 2 : Chaîne de repli OpenRouter (modèles gratuits)
-          # ======================================
-          echo "======================================"
-          echo "🔁 PRIORITÉ 2 : Chaîne de repli OpenRouter"
+          echo "🥇 PRIORITÉ 1 : Chaîne OpenRouter"
           echo "======================================"
           for OR_MODEL in "poolside/laguna-s-2.1:free" "inclusionai/ling-3.0-flash-fin:free" "thinkingmachines/inkling:free" "openrouter/free"; do
             label="openrouter-$(echo "$OR_MODEL" | tr '/:' '--')"
@@ -433,10 +433,10 @@ jobs:
           done
 
           # ======================================
-          # 🥉 PRIORITÉ 3 : Fallback sur Mistral / Gemini / HuggingFace
+          # 🥈 PRIORITÉ 2 : Fallback sur Mistral / Gemini / HuggingFace
           # ======================================
           echo "======================================"
-          echo "🔁 PRIORITÉ 3 : Fallback sur Mistral / Gemini / HuggingFace"
+          echo "🔁 PRIORITÉ 2 : Fallback sur Mistral / Gemini / HuggingFace"
           echo "======================================"
           for PAIR in "custom:mistral|mistral-small-latest" "gemini|gemini-3.1-pro-preview" "huggingface|openai/gpt-oss-120b:cerebras"; do
             provider="${PAIR%%|*}"
