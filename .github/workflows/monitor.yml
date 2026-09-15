@@ -231,9 +231,10 @@ jobs:
       # PRIORITÉ ABSOLUE À GOOGLE AI STUDIO
       GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
       
-      # CORRECTION CRITIQUE : préfixe "google_ai/" pour Google AI Studio
-      # - google_ai/gemini-3.5-flash : accès correct à Google AI Studio avec clé API
-      AGENT_Q_MODELS: "google_ai/gemini-3.5-flash,google_ai/gemini-3.6-flash,google_ai/gemini-2.5-pro,nvidia_nim/moonshotai/kimi-k2.6,openrouter/cohere/north-mini-code:free,openrouter/poolside/laguna-xs-2.1:free,openrouter/poolside/laguna-s-2.1:free"
+      # CORRECTION DÉFINITIVE : préfixe "gemini/" pour Google AI Studio
+      # - gemini/gemini-3.5-flash : accès correct à Google AI Studio avec clé API
+      # - Note : le nom complet du modèle est "gemini-3.5-flash"
+      AGENT_Q_MODELS: "gemini/gemini-3.5-flash,gemini/gemini-3.6-flash,gemini/gemini-2.5-pro,nvidia_nim/moonshotai/kimi-k2.6,openrouter/cohere/north-mini-code:free,openrouter/poolside/laguna-xs-2.1:free,openrouter/poolside/laguna-s-2.1:free"
 
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
       NVIDIA_NIM_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
@@ -538,7 +539,7 @@ jobs:
               m.strip()
               for m in os.environ.get(
                   "AGENT_Q_MODELS",
-                  "google_ai/gemini-3.5-flash,google_ai/gemini-3.6-flash,google_ai/gemini-2.5-pro"
+                  "gemini/gemini-3.5-flash,gemini/gemini-3.6-flash,gemini/gemini-2.5-pro"
               ).split(",")
               if m.strip()
           ]
@@ -563,11 +564,11 @@ jobs:
           def resolve_api_key(model_id):
               """
               Choisit la bonne clé API selon le préfixe du modèle :
-              - google_ai/gemini-... → GOOGLE_API_KEY
+              - gemini/gemini-... → GOOGLE_API_KEY
               - nvidia_nim/... → NVIDIA_NIM_API_KEY
               - openrouter/... → OPENROUTER_API_KEY
               """
-              if model_id.startswith("google_ai/gemini-"):
+              if model_id.startswith("gemini/gemini-"):
                   return GOOGLE_API_KEY
 
               if model_id.startswith("nvidia_nim/"):
@@ -862,6 +863,8 @@ jobs:
                       False,
                   )
 
+              # Configuration spécifique pour Google AI Studio
+              # Note : pas besoin de extra_headers, LiteLLM gère l'authentification
               model = LiteLLMModel(
                   model_id=model_id,
                   api_key=api_key,
@@ -1075,8 +1078,8 @@ jobs:
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           NVIDIA_NIM_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-          # CORRECTION : préfixe "google_ai/" ajouté
-          AGENT_Q_MODELS: "google_ai/gemini-3.5-flash,google_ai/gemini-3.6-flash,google_ai/gemini-2.5-pro,nvidia_nim/moonshotai/kimi-k2.6,openrouter/cohere/north-mini-code:free,openrouter/poolside/laguna-xs-2.1:free,openrouter/poolside/laguna-s-2.1:free"
+          # CORRECTION DÉFINITIVE : préfixe "gemini/" ajouté
+          AGENT_Q_MODELS: "gemini/gemini-3.5-flash,gemini/gemini-3.6-flash,gemini/gemini-2.5-pro,nvidia_nim/moonshotai/kimi-k2.6,openrouter/cohere/north-mini-code:free,openrouter/poolside/laguna-xs-2.1:free,openrouter/poolside/laguna-s-2.1:free"
 
         run: |
           set -euo pipefail
