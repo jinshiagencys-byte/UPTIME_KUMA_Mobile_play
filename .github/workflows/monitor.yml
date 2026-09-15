@@ -228,33 +228,17 @@ jobs:
         site: ${{ fromJson(needs.fetch-sites.outputs.sites) }}
 
     env:
-
-      # ========================================================
-      # LISTE DE MODÈLES AVEC FALLBACK AUTOMATIQUE
-      #
-      # Essayés dans l'ordre, séparés par des virgules.
-      # Si un modèle échoue (erreur API, quota, 403 "agentic
-      # harness only", 429 rate limit, timeout, JSON invalide...),
-      # le runner passe automatiquement au suivant.
-      #
-      # Le premier modèle (nvidia_nim/...) utilise le quota
-      # gratuit NVIDIA NIM (build.nvidia.com), séparé du quota
-      # OpenRouter. S'il échoue ou si son quota est épuisé, le
-      # runner bascule sur les modèles OpenRouter suivants.
-      #
-      # ⚠️ Avant d'ajouter un modèle gratuit OpenRouter ici,
-      # vérifier sur sa page openrouter.ai qu'il n'exige pas
-      # d'être appelé depuis un "agentic harness" reconnu
-      # (cause du 403 sur thinkingmachines/inkling:free).
-      # ========================================================
-      AGENT_Q_MODELS: "nvidia_nim/moonshotai/kimi-k2.6,openrouter/cohere/north-mini-code:free,openrouter/poolside/laguna-xs-2.1:free,openrouter/poolside/laguna-s-2.1:free"
+      # PRIORITÉ ABSOLUE À GOOGLE AI STUDIO
+      GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+      
+      # Modèles dans l'ordre de priorité (Gemini 3.x gratuits en premier)
+      # - gemini-3.5-flash : le plus rapide et le plus disponible (60 RPM)
+      # - gemini-3.6-flash : bon backup avec plus de contexte
+      # - gemini-2.5-pro : pour les cas complexes nécessitant plus de raisonnement
+      # - NVIDIA NIM et OpenRouter : fallbacks secondaires
+      AGENT_Q_MODELS: "gemini-3.5-flash,gemini-3.6-flash,gemini-2.5-pro,nvidia_nim/moonshotai/kimi-k2.6,openrouter/cohere/north-mini-code:free,openrouter/poolside/laguna-xs-2.1:free,openrouter/poolside/laguna-s-2.1:free"
 
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-
-      # Clé NVIDIA NIM (build.nvidia.com) — créer un compte
-      # développeur gratuit sur build.nvidia.com, générer une
-      # clé (préfixe nvapi-...) et l'ajouter comme secret GitHub
-      # NVIDIA_API_KEY. LiteLLM lit NVIDIA_NIM_API_KEY.
       NVIDIA_NIM_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
 
       SITE_ID: ${{ matrix.site.id }}
@@ -491,8 +475,8 @@ jobs:
           import json
           import os
           import sys
+          import re
           from pathlib import Path
-
           from playwright.sync_api import sync_playwright
           from smolagents import LiteLLMModel
 
@@ -543,8 +527,12 @@ jobs:
           # =====================================================
 
           SITE_URL = os.environ["SITE_URL"]
-
           SITE_ID = os.environ["SITE_ID"]
+          
+          # Clés API
+          GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
+          OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+          NVIDIA_NIM_API_KEY = os.environ.get("NVIDIA_NIM_API_KEY")
 
           # Liste de modèles séparés par des virgules, essayés
           # dans l'ordre jusqu'à ce qu'un résultat exploitable
@@ -553,29 +541,38 @@ jobs:
               m.strip()
               for m in os.environ.get(
                   "AGENT_Q_MODELS",
-                  "openrouter/cohere/north-mini-code:free"
+                  "gemini-3.5-flash,gemini-3.6-flash,gemini-2.5-pro"
               ).split(",")
               if m.strip()
           ]
 
-          OPENROUTER_API_KEY = os.environ.get(
-              "OPENROUTER_API_KEY"
-          )
 
-          NVIDIA_NIM_API_KEY = os.environ.get(
-              "NVIDIA_NIM_API_KEY"
-          )
+          def is_quota_error(error):
+              """Détecte les erreurs de quota Google AI Studio"""
+              error_str = str(error).lower()
+              return any(
+                  phrase in error_str
+                  for phrase in [
+                      "quota",
+                      "limit exceeded",
+                      "rate limit",
+                      "429",
+                      "too many requests"
+                  ]
+              )
 
 
           def resolve_api_key(model_id):
               """
               Choisit la bonne clé API selon le préfixe du modèle :
-              - nvidia_nim/...  -> clé NVIDIA NIM (build.nvidia.com)
-              - openrouter/...  -> clé OpenRouter
+              - gemini-3.* → GOOGLE_API_KEY
+              - nvidia_nim/...  → NVIDIA_NIM_API_KEY
+              - openrouter/...  → OPENROUTER_API_KEY
               Retourne None si la clé nécessaire est absente, pour
-              que l'appelant puisse sauter ce modèle proprement au
-              lieu de planter tout le run.
+              que l'appelant puisse sauter ce modèle proprement.
               """
+              if model_id.startswith("gemini-3."):
+                  return GOOGLE_API_KEY
 
               if model_id.startswith("nvidia_nim/"):
                   return NVIDIA_NIM_API_KEY
@@ -588,11 +585,11 @@ jobs:
               return OPENROUTER_API_KEY
 
 
-          if not OPENROUTER_API_KEY and not NVIDIA_NIM_API_KEY:
+          if not GOOGLE_API_KEY and not OPENROUTER_API_KEY and not NVIDIA_NIM_API_KEY:
               raise RuntimeError(
-                  "Aucune clé API disponible : ni OPENROUTER_API_KEY "
-                  "ni NVIDIA_NIM_API_KEY ne sont configurées dans "
-                  "les secrets GitHub."
+                  "Aucune clé API disponible : ni GOOGLE_API_KEY, "
+                  "ni OPENROUTER_API_KEY ni NVIDIA_NIM_API_KEY "
+                  "ne sont configurées dans les secrets GitHub."
               )
 
           if not MODEL_IDS:
@@ -606,16 +603,13 @@ jobs:
           # =====================================================
 
           try:
-
               pages = json.loads(
                   os.environ.get(
                       "PAGES_JSON",
                       "[]"
                   )
               )
-
           except Exception:
-
               pages = []
 
 
@@ -811,58 +805,34 @@ jobs:
 
           # =====================================================
           # VALIDATION D'UN RÉSULTAT
-          #
-          # Reprend la même logique que l'étape "Construire
-          # output.json" pour décider si un résultat de modèle
-          # est exploitable ou si on doit basculer sur le
-          # modèle suivant de la liste.
           # =====================================================
 
-          import re
-
-
           def extract_candidate(raw_result):
-
               candidate = None
 
               if isinstance(raw_result, dict):
-
-                  if (
-                      "overall_status" in raw_result
-                      and "pages" in raw_result
-                  ):
+                  if "overall_status" in raw_result and "pages" in raw_result:
                       candidate = raw_result
 
               elif isinstance(raw_result, str):
-
                   try:
                       parsed = json.loads(raw_result)
-
-                      if (
-                          isinstance(parsed, dict)
-                          and "overall_status" in parsed
-                          and "pages" in parsed
-                      ):
+                      if isinstance(parsed, dict) and "overall_status" in parsed and "pages" in parsed:
                           candidate = parsed
-
                   except Exception:
                       pass
 
                   if candidate is None:
-
                       match = re.search(
                           r"```json\s*(\{.*?\})\s*```",
                           raw_result,
                           re.DOTALL | re.IGNORECASE,
                       )
-
                       if match:
                           try:
                               parsed = json.loads(match.group(1))
-
                               if isinstance(parsed, dict):
                                   candidate = parsed
-
                           except Exception:
                               pass
 
@@ -879,10 +849,7 @@ jobs:
               pour un modèle donné.
 
               Retourne (output_dict, success: bool).
-              Lève une exception seulement en cas d'erreur
-              irrécupérable (ex : navigation impossible).
               """
-
               print()
               print("======================================")
               print(f"🤖 TENTATIVE — MODÈLE : {model_id}")
@@ -891,10 +858,7 @@ jobs:
               api_key = resolve_api_key(model_id)
 
               if not api_key:
-                  print(
-                      f"⚠️ Aucune clé API disponible pour {model_id}, "
-                      "modèle sauté."
-                  )
+                  print(f"⚠️ Aucune clé API disponible pour {model_id}, modèle sauté.")
                   return (
                       {
                           "site_id": SITE_ID,
@@ -911,7 +875,6 @@ jobs:
               )
 
               with sync_playwright() as playwright:
-
                   browser = playwright.chromium.launch(
                       headless=True,
                       args=[
@@ -924,16 +887,12 @@ jobs:
                   )
 
                   context = browser.new_context(
-
                       viewport={
                           "width": 1280,
                           "height": 800,
                       },
-
                       locale="fr-FR",
-
                       timezone_id="Africa/Porto-Novo",
-
                       user_agent=(
                           "Mozilla/5.0 "
                           "(X11; Linux x86_64) "
@@ -942,9 +901,7 @@ jobs:
                           "Chrome/131.0.0.0 "
                           "Safari/537.36"
                       ),
-
                       record_video_dir=str(RECORDINGS_DIR),
-
                       record_video_size={
                           "width": 1280,
                           "height": 800,
@@ -963,7 +920,6 @@ jobs:
                   error_text = None
 
                   try:
-
                       print()
                       print("🌐 Ouverture du site...")
 
@@ -983,24 +939,17 @@ jobs:
 
                       try:
                           raw_result = agent.do(task)
-
                       except Exception as first_error:
-
                           print()
-                          print(
-                              "❌ Première exécution échouée :",
-                              repr(first_error)
-                          )
-
-                          print(
-                              "🔄 Nouvelle tentative (force_regenerate) "
-                              "avec le même modèle..."
-                          )
-
-                          raw_result = agent.do(
-                              task,
-                              force_regenerate=True,
-                          )
+                          print("❌ Première exécution échouée :", repr(first_error))
+                          
+                          # Si c'est une erreur de quota, ne pas réessayer avec le même modèle
+                          if is_quota_error(first_error):
+                              print("⚠️ Erreur de quota détectée - passage au modèle suivant")
+                              raise
+                              
+                          print("🔄 Nouvelle tentative (force_regenerate) avec le même modèle...")
+                          raw_result = agent.do(task, force_regenerate=True)
 
                       print()
                       print("✅ Agent Q terminé")
@@ -1009,28 +958,17 @@ jobs:
                       print(raw_result)
 
                   except Exception as error:
-
                       error_text = repr(error)
-
                       print()
-                      print(
-                          f"❌ Modèle {model_id} indisponible ou en échec : "
-                          f"{error_text}"
-                      )
+                      print(f"❌ Modèle {model_id} indisponible ou en échec : {error_text}")
 
                   finally:
-
                       try:
                           context.tracing.stop(
-                              path=str(
-                                  TRACES_DIR / f"trace-{SITE_ID}.zip"
-                              )
+                              path=str(TRACES_DIR / f"trace-{SITE_ID}.zip")
                           )
                       except Exception as trace_error:
-                          print(
-                              "⚠️ Trace non sauvegardée :",
-                              trace_error
-                          )
+                          print("⚠️ Trace non sauvegardée :", trace_error)
 
                       context.close()
                       browser.close()
@@ -1069,59 +1007,35 @@ jobs:
           success = False
 
           for index, model_id in enumerate(MODEL_IDS, start=1):
-
               try:
                   attempt_output, attempt_success = run_attempt(model_id)
-
               except Exception as fatal_error:
-
-                  # Erreur irrécupérable (ex : navigation impossible),
-                  # indépendante du modèle : inutile d'essayer les
-                  # modèles suivants pour ce genre de panne, mais on
-                  # continue quand même par prudence.
                   print()
-                  print(
-                      f"❌ Erreur fatale avec {model_id} : "
-                      f"{repr(fatal_error)}"
-                  )
-
+                  print(f"❌ Erreur fatale avec {model_id} : {repr(fatal_error)}")
                   attempt_output = {
                       "site_id": SITE_ID,
                       "site_url": SITE_URL,
                       "model": model_id,
                       "error": repr(fatal_error),
                   }
-
                   attempt_success = False
 
               final_output = attempt_output
 
               if attempt_success:
-
                   print()
-                  print(
-                      f"✅ Modèle retenu : {model_id} "
-                      f"(tentative {index}/{len(MODEL_IDS)})"
-                  )
-
+                  print(f"✅ Modèle retenu : {model_id} (tentative {index}/{len(MODEL_IDS)})")
                   success = True
                   break
 
               print()
 
               if index < len(MODEL_IDS):
-                  print(
-                      f"➡️ Passage au modèle suivant "
-                      f"({index}/{len(MODEL_IDS)} essayés)..."
-                  )
+                  print(f"➡️ Passage au modèle suivant ({index}/{len(MODEL_IDS)} essayés)...")
               else:
-                  print(
-                      "❌ Tous les modèles de la liste ont échoué."
-                  )
-
+                  print("❌ Tous les modèles de la liste ont échoué.")
 
           if final_output is None:
-
               final_output = {
                   "site_id": SITE_ID,
                   "site_url": SITE_URL,
@@ -1129,40 +1043,29 @@ jobs:
                   "error": "Aucun modèle n'a pu être exécuté.",
               }
 
-
           final_output["fallback_used"] = not success or (
               MODEL_IDS.index(final_output.get("model", MODEL_IDS[0])) > 0
               if final_output.get("model") in MODEL_IDS
               else False
           )
 
-
           (OUTPUT_DIR / "raw-result.json").write_text(
-
               json.dumps(
                   final_output,
                   ensure_ascii=False,
                   indent=2,
                   default=str,
               ),
-
               encoding="utf-8",
           )
 
-
           print()
-          print(
-              "✅ BrowserContext(s) fermé(s)"
-          )
-
-          print(
-              "🎥 Vidéo(s) Playwright finalisée(s)"
-          )
+          print("✅ BrowserContext(s) fermé(s)")
+          print("🎥 Vidéo(s) Playwright finalisée(s)")
 
           if not success:
               raise RuntimeError(
-                  "Aucun des modèles configurés n'a produit "
-                  "de résultat exploitable."
+                  "Aucun des modèles configurés n'a produit de résultat exploitable."
               )
 
           PYTHON
@@ -1176,21 +1079,15 @@ jobs:
       # ========================================================
       - name: Exécuter Agent Q
         env:
-
           SITE_ID: ${{ matrix.site.id }}
-
           SITE_URL: ${{ matrix.site.url }}
-
           PAGES_JSON: ${{ toJson(matrix.site.pages) }}
-
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-
           NVIDIA_NIM_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
-
-          AGENT_Q_MODELS: "openrouter/thinkingmachines-inkling:free,nvidia_nim/moonshotai/kimi-k2.6,openrouter/cohere/north-mini-code:free,openrouter/poolside/laguna-xs-2.1:free,openrouter/poolside/laguna-s-2.1:free"
+          AGENT_Q_MODELS: "gemini-3.5-flash,gemini-3.6-flash,gemini-2.5-pro,nvidia_nim/moonshotai/kimi-k2.6,openrouter/cohere/north-mini-code:free,openrouter/poolside/laguna-xs-2.1:free,openrouter/poolside/laguna-s-2.1:free"
 
         run: |
-
           set -euo pipefail
 
           echo "======================================"
@@ -1199,67 +1096,49 @@ jobs:
 
           echo
           echo "Python système :"
-
           python --version
-
 
           cd agent-q
 
-
           echo
           echo "Python Agent Q :"
-
           pipenv run python --version
-
 
           echo
           echo "Playwright Agent Q :"
-
           pipenv run python -c "
           import playwright
           print(playwright.__file__)
           "
 
-
           echo
           echo "Torch :"
-
           pipenv run python -c "
           import torch
           print('torch =', torch.__version__)
           print('cuda =', torch.cuda.is_available())
           "
 
-
           echo
           echo "smolagents :"
-
           pipenv run python -c "
           import smolagents
           print('smolagents import OK')
           "
 
-
           echo
           echo "Playwright sync API :"
-
           pipenv run python -c "
           from playwright.sync_api import sync_playwright
           print('playwright.sync_api OK')
           "
-
 
           echo
           echo "======================================"
           echo "🚀 LANCEMENT DU RUNNER (avec fallback modèles)"
           echo "======================================"
 
-          # ⚠️ Le runner gère lui-même le fallback multi-modèles.
-          # S'il ne trouve aucun résultat exploitable après avoir
-          # essayé tous les modèles de AGENT_Q_MODELS, il se
-          # termine avec un code d'erreur non nul, mais
-          # agent-output/raw-result.json contient toujours un
-          # diagnostic exploitable par l'étape suivante.
+          # Le runner gère le fallback multi-modèles
           pipenv run python ../run_agent_q.py || true
 
 
@@ -1269,255 +1148,97 @@ jobs:
       - name: Construire output.json
         if: always()
         run: |
-
           python - <<'PYTHON'
-
           import json
           import re
           from pathlib import Path
 
-
-          raw_file = Path(
-              "agent-output/raw-result.json"
-          )
-
-          output_file = Path(
-              "output.json"
-          )
-
+          raw_file = Path("agent-output/raw-result.json")
+          output_file = Path("output.json")
 
           if not raw_file.exists():
-
               result = {
                   "overall_status": "ERROR",
                   "site_type": "autre",
                   "actions_completed": False,
                   "pages": [],
-                  "error": (
-                      "Agent Q n'a produit aucun résultat."
-                  ),
+                  "error": "Agent Q n'a produit aucun résultat.",
               }
-
-
               output_file.write_text(
-                  json.dumps(
-                      result,
-                      ensure_ascii=False,
-                      indent=2,
-                  ),
+                  json.dumps(result, ensure_ascii=False, indent=2),
                   encoding="utf-8",
               )
-
               raise SystemExit(0)
 
-
-          data = json.loads(
-              raw_file.read_text(
-                  encoding="utf-8"
-              )
-          )
-
-
-          # Le runner (avec fallback) place déjà le JSON validé
-          # dans data["result"] quand un modèle a réussi. On
-          # retombe sur l'ancienne logique de parsing si jamais
-          # ce champ est absent (compatibilité).
-
+          data = json.loads(raw_file.read_text(encoding="utf-8"))
           candidate = data.get("result")
 
-
           if candidate is None:
-
               raw_result = data.get("raw_result")
-
-              # ==================================================
               # DICT
-              # ==================================================
-
-              if isinstance(
-                  raw_result,
-                  dict
-              ):
-
-                  if (
-                      "overall_status" in raw_result
-                      and
-                      "pages" in raw_result
-                  ):
-
+              if isinstance(raw_result, dict):
+                  if "overall_status" in raw_result and "pages" in raw_result:
                       candidate = raw_result
-
-
-              # ==================================================
               # STRING
-              # ==================================================
-
-              elif isinstance(
-                  raw_result,
-                  str
-              ):
-
+              elif isinstance(raw_result, str):
                   try:
-
-                      parsed = json.loads(
-                          raw_result
-                      )
-
-
-                      if (
-                          isinstance(
-                              parsed,
-                              dict
-                          )
-                          and
-                          "overall_status"
-                          in parsed
-                          and
-                          "pages"
-                          in parsed
-                      ):
-
+                      parsed = json.loads(raw_result)
+                      if isinstance(parsed, dict) and "overall_status" in parsed and "pages" in parsed:
                           candidate = parsed
-
-
                   except Exception:
                       pass
-
-
                   if candidate is None:
-
                       match = re.search(
-
                           r"```json\s*(\{.*?\})\s*```",
-
                           raw_result,
-
                           re.DOTALL | re.IGNORECASE,
                       )
-
-
                       if match:
-
                           try:
-
-                              parsed = json.loads(
-                                  match.group(1)
-                              )
-
-
-                              if isinstance(
-                                  parsed,
-                                  dict
-                              ):
-
+                              parsed = json.loads(match.group(1))
+                              if isinstance(parsed, dict):
                                   candidate = parsed
-
-
                           except Exception:
                               pass
 
-
-          # ==================================================
-          # PAS DE JSON
-          # ==================================================
-
           if candidate is None:
-
               candidate = {
                   "overall_status": "ERROR",
                   "site_type": "autre",
                   "actions_completed": False,
                   "pages": [],
                   "error": (
-                      data.get("error")
-                      or "Agent Q n'a pas produit le JSON attendu "
-                         "(tous les modèles ont échoué)."
+                      data.get("error") or 
+                      "Agent Q n'a pas produit le JSON attendu (tous les modèles ont échoué)."
                   ),
               }
 
-
-          # ==================================================
           # NORMALISATION
-          # ==================================================
-
-          candidate["overall_status"] = str(
-
-              candidate.get(
-                  "overall_status",
-                  "ERROR"
-              )
-
-          ).upper()
-
-
-          if candidate["overall_status"] not in {
-              "UP",
-              "DOWN",
-              "ERROR",
-          }:
-
+          candidate["overall_status"] = str(candidate.get("overall_status", "ERROR")).upper()
+          if candidate["overall_status"] not in {"UP", "DOWN", "ERROR"}:
               candidate["overall_status"] = "ERROR"
 
-
-          if not isinstance(
-              candidate.get("pages"),
-              list
-          ):
-
+          if not isinstance(candidate.get("pages"), list):
               candidate["pages"] = []
 
+          candidate["actions_completed"] = bool(candidate.get("actions_completed", False))
 
-          candidate["actions_completed"] = bool(
-
-              candidate.get(
-                  "actions_completed",
-                  False
-              )
-
-          )
-
-
-          # Traçabilité : quel modèle a produit ce résultat.
+          # Traçabilité
           if data.get("model"):
               candidate["model_used"] = data["model"]
-
           if data.get("fallback_used"):
               candidate["fallback_used"] = True
 
-
           output_file.write_text(
-
-              json.dumps(
-                  candidate,
-                  ensure_ascii=False,
-                  indent=2,
-              ),
-
+              json.dumps(candidate, ensure_ascii=False, indent=2),
               encoding="utf-8",
           )
 
-
           print()
-          print(
-              "======================================"
-          )
-
-          print(
-              "📄 output.json"
-          )
-
-          print(
-              "======================================"
-          )
-
-          print(
-              json.dumps(
-                  candidate,
-                  ensure_ascii=False,
-                  indent=2,
-              )
-          )
-
+          print("======================================")
+          print("📄 output.json")
+          print("======================================")
+          print(json.dumps(candidate, ensure_ascii=False, indent=2))
           PYTHON
 
 
@@ -1527,11 +1248,9 @@ jobs:
       - name: Afficher le résultat final
         if: always()
         run: |
-
           echo "======================================"
           echo "📊 RÉSULTAT AGENT Q"
           echo "======================================"
-
           if [ -f output.json ]; then
             jq . output.json
           else
@@ -1544,33 +1263,19 @@ jobs:
       # ========================================================
       - name: Envoyer le rapport des pages
         if: always()
-
         env:
           SITE_ID: ${{ matrix.site.id }}
           RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
           RELAY_URL: ${{ secrets.RELAY_URL }}
-
         run: |
-
           set +e
-
           if [ ! -f output.json ]; then
             echo "⚠️ output.json absent"
             exit 0
           fi
-
-
           if jq -e '.pages' output.json >/dev/null 2>&1; then
-
-            jq -c \
-              '{pages: .pages}' \
-              output.json \
-              > pages_payload.json
-
-
+            jq -c '{pages: .pages}' output.json > pages_payload.json
             echo "📤 Envoi du rapport pages..."
-
-
             curl -sS \
               --retry 3 \
               --retry-delay 2 \
@@ -1579,14 +1284,9 @@ jobs:
               -H "x-relay-secret: $RELAY_SECRET" \
               -H "Content-Type: application/json" \
               -d @pages_payload.json
-
-
             echo
-
           else
-
             echo "⚠️ Aucun tableau pages exploitable"
-
           fi
 
 
@@ -1595,63 +1295,33 @@ jobs:
       # ========================================================
       - name: Envoyer le statut global
         if: always()
-
         env:
           SITE_ID: ${{ matrix.site.id }}
           RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
           RELAY_URL: ${{ secrets.RELAY_URL }}
-
         run: |
-
           set +e
-
           STATUS="ERROR"
-
           MESSAGE="Agent Q execution error"
-
-
           if [ -f output.json ]; then
-
-            STATUS=$(
-              jq -r \
-                '.overall_status // "ERROR"' \
-                output.json |
-              tr '[:lower:]' '[:upper:]'
-            )
-
-
-            MESSAGE=$(
-              jq -c '
-                {
-                  site_type: .site_type,
-                  actions_completed: .actions_completed,
-                  model_used: .model_used,
-                  fallback_used: .fallback_used,
-                  pages: .pages
-                }
-              ' output.json
-            )
-
+            STATUS=$(jq -r '.overall_status // "ERROR"' output.json | tr '[:lower:]' '[:upper:]')
+            MESSAGE=$(jq -c '{
+              site_type: .site_type,
+              actions_completed: .actions_completed,
+              model_used: .model_used,
+              fallback_used: .fallback_used,
+              pages: .pages
+            }' output.json)
           fi
-
-
           echo "======================================"
           echo "📡 STATUT : $STATUS"
           echo "======================================"
-
           echo "$MESSAGE"
-
-
           jq -nc \
             --arg status "$STATUS" \
             --arg message "$MESSAGE" \
-            '{
-              status: $status,
-              message: $message
-            }' \
+            '{status: $status, message: $message}' \
             > status_payload.json
-
-
           curl -sS \
             --retry 3 \
             --retry-delay 2 \
@@ -1660,8 +1330,6 @@ jobs:
             -H "x-relay-secret: $RELAY_SECRET" \
             -H "Content-Type: application/json" \
             -d @status_payload.json
-
-
           echo
 
 
@@ -1671,11 +1339,9 @@ jobs:
       - name: Lister les vidéos Playwright
         if: always()
         run: |
-
           echo "======================================"
           echo "🎥 VIDÉOS PLAYWRIGHT"
           echo "======================================"
-
           find recordings \
             -maxdepth 2 \
             -type f \
@@ -1690,11 +1356,9 @@ jobs:
       - name: Lister les traces Playwright
         if: always()
         run: |
-
           echo "======================================"
           echo "🧪 TRACES PLAYWRIGHT"
           echo "======================================"
-
           find traces \
             -maxdepth 2 \
             -type f \
@@ -1708,12 +1372,9 @@ jobs:
       # ========================================================
       - name: Uploader les artifacts Agent Q
         if: always()
-
         uses: actions/upload-artifact@v4
-
         with:
           name: agent-q-monitoring-${{ matrix.site.id }}
-
           path: |
             recordings/
             traces/
@@ -1721,7 +1382,5 @@ jobs:
             agent-output/
             output.json
             run_agent_q.py
-
           if-no-files-found: ignore
-
           retention-days: 7
