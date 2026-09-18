@@ -1,15 +1,13 @@
 """
 OpenBrowser-AI — Monitoring fonctionnel via OpenRouter.
 
-Correctifs :
-- Whitelist stricte de modèles (pas de détection dynamique bruitée)
-- Screenshot recorder en parallèle (pour compenser l'absence de vidéo native)
-- Debug des attributs de session pour trouver le context Playwright
+Détection dynamique des modèles gratuits fiables + screenshots + timelapse.
 """
 import asyncio
 import json
 import os
 import re
+import urllib.request
 
 from openbrowser import CodeAgent
 from openbrowser.llm import ChatOpenAI
@@ -29,18 +27,77 @@ print("Recordings dir : " + RECORDINGS_DIR)
 print("Shots dir : " + SHOTS_DIR)
 
 # ---------------------------------------------------------------------------
-# Whitelist stricte — modèles qui génèrent du Python valide
+# Détection des modèles gratuits fiables
 # ---------------------------------------------------------------------------
-MODEL_CHAIN = [
-    "meta-llama/llama-3.3-70b-instruct:free",
-    "meta-llama/llama-3.1-8b-instruct:free",
-    "google/gemini-2.0-flash-exp:free",
-    "mistralai/mistral-small-24b-instruct-2501:free",
-    "qwen/qwen-2.5-72b-instruct:free",
-]
-print("Chaine de modeles : " + str(MODEL_CHAIN))
+TRUSTED_PROVIDERS = (
+    "google/", "meta-llama/", "mistralai/", "qwen/", "deepseek/",
+    "microsoft/", "nousresearch/", "cohere/", "amazon/", "ai21/",
+)
 
-GLOBAL_TIMEOUT_SECONDS = 360
+
+def get_working_free_models() -> list:
+    """Récupère les modèles gratuits avec tool calling, chez des providers fiables."""
+    try:
+        req = urllib.request.Request(
+            "https://openrouter.ai/api/v1/models",
+            headers={"Authorization": "Bearer " + OPENROUTER_API_KEY},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+
+        candidates = []
+        for m in data.get("data", []):
+            mid = m.get("id", "")
+            if not mid.endswith(":free"):
+                continue
+            if not any(mid.startswith(p) for p in TRUSTED_PROVIDERS):
+                continue
+            pricing = m.get("pricing", {})
+            if str(pricing.get("prompt")) not in ("0", "0.0", "0.0000"):
+                continue
+            if str(pricing.get("completion")) not in ("0", "0.0", "0.0000"):
+                continue
+            supported = m.get("supported_parameters", [])
+            if "tools" not in supported:
+                continue
+            candidates.append(mid)
+
+        def score(mid):
+            if "gemini" in mid: return 0
+            if "llama-3.3" in mid: return 1
+            if "llama-3.1" in mid: return 2
+            if "mistral" in mid: return 3
+            if "qwen-2.5-72b" in mid: return 4
+            if "qwen-2.5" in mid: return 5
+            if "deepseek-chat" in mid: return 6
+            if "deepseek" in mid: return 7
+            if "hermes" in mid: return 8
+            return 20
+
+        candidates.sort(key=score)
+        print("Modeles gratuits fiables : " + ", ".join(candidates[:8]))
+        return candidates[:5]
+
+    except Exception as e:
+        print("Erreur listing modeles : " + str(e))
+        return []
+
+
+MODEL_CHAIN = get_working_free_models()
+
+# Fallback si la détection échoue
+if not MODEL_CHAIN:
+    MODEL_CHAIN = [
+        "google/gemini-2.0-flash-exp:free",
+        "google/gemini-flash-1.5-8b:free",
+        "mistralai/mistral-small-24b-instruct-2501:free",
+        "qwen/qwen-2.5-72b-instruct:free",
+    ]
+    print("Fallback chain : " + str(MODEL_CHAIN))
+
+print("Chaine finale : " + str(MODEL_CHAIN))
+
+GLOBAL_TIMEOUT_SECONDS = 300
 MAX_STEPS = 12
 
 # ---------------------------------------------------------------------------
@@ -52,24 +109,24 @@ SYSTEM_PROMPT_TEMPLATE = (
     "OUTPUT FORMAT (CRITICAL):\n"
     "You MUST write Python code blocks between triple backticks. Example:\n"
     "\n"
-    "Here is my reasoning.\n"
+    "I will check the page title.\n"
     "```python\n"
-    "result = await evaluate('document.title')\n"
-    "print(result)\n"
+    "title = await evaluate('document.title')\n"
+    "print(title)\n"
     "```\n"
     "\n"
-    "Do NOT use <tool_call> XML tags. Do NOT use tool_name(args) syntax.\n"
-    "ONLY use python code blocks with valid Python syntax.\n"
+    "Do NOT use XML tags. Do NOT use tool_name(args) syntax.\n"
+    "ONLY Python code blocks.\n"
     "\n"
     "RULES:\n"
     "1. Perform at least ONE real user interaction and verify with an assertion.\n"
     "2. Page loaded is NOT a test. Button exists is NOT a test.\n"
     "3. Valid test = action + observation + assertion.\n"
-    "4. Use Python assert. If assert fails, test fails.\n"
+    "4. Use Python assert.\n"
     "\n"
     "STRICT STOP CONDITION:\n"
-    "- After 8 tool calls max, call done() no matter what.\n"
-    "- Partial results are OK.\n"
+    "- After 6 tool calls max, call done() no matter what.\n"
+    "- Partial results are OK. Better DOWN with 2 anomalies than infinite loops.\n"
     "\n"
     "ANOMALIES (functional failures):\n"
     "- Text containing Erreur, Error, Failed, undefined, null, 0 produit, Aucun produit.\n"
@@ -83,7 +140,7 @@ SYSTEM_PROMPT_TEMPLATE = (
     "Call done(text=...) with ONLY a valid JSON in text:\n"
     "  overall_status, site_type, actions_completed, model_used, pages[].\n"
     "\n"
-    "Example:\n"
+    "Example done:\n"
     "```python\n"
     "import json\n"
     "result = {\"overall_status\": \"DOWN\", \"site_type\": \"__SITE_TYPE__\", "
@@ -149,8 +206,7 @@ def extract_final_result(result) -> str:
             return source
     for cell in reversed(list(cells)):
         output = getattr(cell, "output", "") or ""
-        if ('"url"' in output or '"overall_status"' in output
-                or '"anomalies"' in output):
+        if '"url"' in output or '"overall_status"' in output:
             return output
     return str(result)
 
@@ -184,10 +240,53 @@ def normalize_report(report: dict, model_name: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Screenshot recorder (compense l'absence de vidéo native)
+# Récupération de la page Playwright depuis la session OpenBrowser-AI
+# ---------------------------------------------------------------------------
+async def get_playwright_page(session):
+    """Essaie plusieurs méthodes pour récupérer la page Playwright."""
+    if session is None:
+        return None
+
+    # 1. Méthode officielle
+    for method_name in ("must_get_current_page", "get_current_page"):
+        if hasattr(session, method_name):
+            try:
+                r = getattr(session, method_name)()
+                if asyncio.iscoroutine(r):
+                    r = await r
+                if r is not None and hasattr(r, "screenshot"):
+                    return r
+            except Exception:
+                pass
+
+    # 2. Attributs directs
+    for attr in ("current_page", "page", "_page"):
+        try:
+            p = getattr(session, attr, None)
+            if p is not None and hasattr(p, "screenshot"):
+                return p
+        except Exception:
+            pass
+
+    # 3. Via get_pages()
+    if hasattr(session, "get_pages"):
+        try:
+            r = session.get_pages()
+            if asyncio.iscoroutine(r):
+                r = await r
+            if r and len(r) > 0:
+                return r[0]
+        except Exception:
+            pass
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Screenshot recorder
 # ---------------------------------------------------------------------------
 async def screenshot_recorder(agent, interval=2.0):
-    """Prend un screenshot toutes les N secondes pour créer un timelapse."""
+    """Prend un screenshot toutes les N secondes."""
     idx = 0
     misses = 0
     while True:
@@ -198,80 +297,36 @@ async def screenshot_recorder(agent, interval=2.0):
                 misses += 1
                 continue
 
-            # Chercher la page Playwright
-            page = None
-            for attr in ("page", "current_page", "_page"):
-                page = getattr(session, attr, None)
-                if page is not None:
-                    break
-
-            if page is None:
-                for ctx_attr in ("browser_context", "_browser_context",
-                                 "context", "_context", "playwright_context"):
-                    ctx = getattr(session, ctx_attr, None)
-                    if ctx is None:
-                        continue
-                    try:
-                        pages = getattr(ctx, "pages", None)
-                        if pages and len(pages) > 0:
-                            page = pages[0]
-                            break
-                    except Exception:
-                        continue
-
+            page = await get_playwright_page(session)
             if page is None:
                 misses += 1
+                if misses > 30:
+                    print("Screenshot recorder : abandon apres %d echecs" % misses)
+                    break
                 continue
 
             path = os.path.join(SHOTS_DIR, "shot_%04d.png" % idx)
             try:
-                await page.screenshot(path=path, full_page=False)
+                r = page.screenshot(path=path, full_page=False)
+                if asyncio.iscoroutine(r):
+                    await r
                 idx += 1
                 misses = 0
             except Exception:
                 misses += 1
 
         except asyncio.CancelledError:
-            print("Screenshot recorder arrete (total: %d shots, %d misses)" % (idx, misses))
+            print("Screenshot recorder arrete (%d shots)" % idx)
             break
-        except Exception as e:
-            misses += 1
-            if misses > 20:
-                print("Screenshot recorder abandonne apres trop d'echecs")
-                break
-
-
-# ---------------------------------------------------------------------------
-# Debug session
-# ---------------------------------------------------------------------------
-async def debug_session_attributes(session) -> None:
-    print("=== INSPECTION SESSION ===")
-    print("Type: " + str(type(session)))
-    try:
-        attrs = [a for a in dir(session) if not a.startswith("__")]
-    except Exception:
-        return
-    for attr in attrs:
-        try:
-            val = getattr(session, attr, None)
-            if val is None:
-                continue
-            type_name = type(val).__name__
-            interesting = any(kw in attr.lower() for kw in
-                              ["browser", "context", "page", "playwright", "video", "record"])
-            if interesting:
-                has_close = hasattr(val, "close")
-                print("  " + attr + ": " + type_name + (" [has close()]" if has_close else ""))
         except Exception:
-            pass
+            misses += 1
 
 
 # ---------------------------------------------------------------------------
-# Fermeture agressive
+# Fermeture de session (sans debug verbeux cette fois)
 # ---------------------------------------------------------------------------
 async def close_agent_session(agent) -> None:
     if agent is None:
-        print("Agent None, rien a fermer")
         return
 
     session = None
@@ -285,29 +340,6 @@ async def close_agent_session(agent) -> None:
         print("Aucune session trouvee")
         return
 
-    # Debug : lister les attributs intéressants
-    await debug_session_attributes(session)
-
-    # 1. Fermer le context Playwright en priorité
-    ctx = None
-    for ctx_attr in ("browser_context", "_browser_context",
-                     "context", "_context", "playwright_context",
-                     "playwright_browser_context", "_playwright_context"):
-        ctx = getattr(session, ctx_attr, None)
-        if ctx is not None:
-            print("Context trouve via session." + ctx_attr)
-            break
-
-    if ctx is not None and hasattr(ctx, "close"):
-        try:
-            r = ctx.close()
-            if asyncio.iscoroutine(r):
-                await r
-            print("Context Playwright ferme")
-        except Exception as e:
-            print("Echec fermeture context : " + str(e))
-
-    # 2. Fermer la session
     for method_name in ("close", "stop", "kill", "shutdown", "cleanup"):
         if not hasattr(session, method_name):
             continue
@@ -320,22 +352,13 @@ async def close_agent_session(agent) -> None:
         except Exception as e:
             print("Echec session." + method_name + "() : " + str(e))
 
-    # 3. Attendre flush
-    print("Attente flush (5s)...")
-    await asyncio.sleep(5)
+    await asyncio.sleep(3)
 
-    # 4. Bilan
     try:
-        files = os.listdir(RECORDINGS_DIR)
-        webm = [f for f in files if f.endswith(".webm")]
-        print("Fichiers dans recordings/ : " + str(files))
-        if webm:
-            print("VIDEOS TROUVEES : " + str(webm))
-        else:
-            shots = os.listdir(SHOTS_DIR) if os.path.isdir(SHOTS_DIR) else []
-            print("Aucune .webm. Screenshots captures : " + str(len(shots)))
-    except Exception as e:
-        print("Erreur listing : " + str(e))
+        shots = os.listdir(SHOTS_DIR) if os.path.isdir(SHOTS_DIR) else []
+        print("Screenshots captures : " + str(len(shots)))
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -360,8 +383,6 @@ async def run_attempt(model_name: str, task: str):
             headless=True,
             viewport_width=1280,
             viewport_height=720,
-            record_video_dir=RECORDINGS_DIR,
-            record_video_size={"width": 1280, "height": 720},
         )
 
         agent = CodeAgent(
@@ -372,7 +393,6 @@ async def run_attempt(model_name: str, task: str):
             extend_system_message=build_system_prompt(model_name),
         )
 
-        # Démarrer le recorder de screenshots en parallèle
         recorder_task = asyncio.create_task(screenshot_recorder(agent, interval=2.0))
 
         try:
@@ -383,7 +403,7 @@ async def run_attempt(model_name: str, task: str):
 
         final_text = extract_final_result(result)
         print("Resultat extrait (" + model_name + ") :")
-        print(final_text[:1000])
+        print(final_text[:800])
 
         report = extract_json_from_text(final_text)
         if report:
@@ -444,7 +464,7 @@ async def main() -> None:
         "Execute the required interactions. "
         "Use Python assertions. "
         "Detect anomalies (errors, undefined, empty listings). "
-        "HARD LIMIT: 8 tool calls max, then call done(). "
+        "HARD LIMIT: 6 tool calls max, then call done(). "
         "IMPORTANT: write ONLY valid Python code blocks between triple backticks."
     )
 
