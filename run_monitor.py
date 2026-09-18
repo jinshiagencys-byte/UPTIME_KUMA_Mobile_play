@@ -1,9 +1,9 @@
 """
 OpenBrowser-AI — Monitoring fonctionnel.
-- Priorité : Google AI Studio (Gemini, gratuit, vision + tool calling)
-- Fallback : OpenRouter (Gemini free, Gemma, Qwen-VL)
-- Screenshots + timelapse MP4 pour preuve visuelle
-- Passe au modèle suivant si 0 action réussie
+Priorité : Google AI Studio (Gemini 3.x, gratuit, vision + tool calling)
+Fallback : OpenRouter (Gemma 3, Qwen-VL, Llama)
+Screenshots + timelapse MP4 pour preuve visuelle
+Passe au modèle suivant si 0 action réussie
 """
 import asyncio
 import json
@@ -24,10 +24,10 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Env
 # ---------------------------------------------------------------------------
-SITE_URL = os.environ["SITE_URL"]
-SITE_ID = os.environ["SITE_ID"]
+SITE_URL = os.environ.get("SITE_URL", "")
+SITE_ID = os.environ.get("SITE_ID", "")
 SITE_TYPE = os.environ.get("SITE_TYPE", "generic")
-REQUIREMENTS = os.environ["REQUIREMENTS"]
+REQUIREMENTS = os.environ.get("REQUIREMENTS", "")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
 
@@ -46,18 +46,20 @@ print("OpenRouter key       : " + str(bool(OPENROUTER_API_KEY)))
 MODEL_CHAIN = []
 
 if GOOGLE_API_KEY and HAS_GOOGLE:
+    # Modèles Google AI Studio gratuits et à jour (Septembre 2026)
     for m in [
-        "gemini-2.0-flash-exp",
-        "gemini-1.5-flash",
-        "gemini-1.5-flash-8b",
+        "gemini-3.5-flash",     # Le plus rapide, idéal pour le tool-calling
+        "gemini-3.6-flash",     # Fallback avec plus de contexte
+        "gemini-2.5-pro",       # Pour les sites complexes nécessitant plus de raisonnement
     ]:
         MODEL_CHAIN.append({"provider": "google", "model": m, "key": GOOGLE_API_KEY})
 
 if OPENROUTER_API_KEY:
+    # Modèles open-source gratuits sur OpenRouter
     for m in [
-        "google/gemini-2.0-flash-exp:free",
-        "google/gemma-2-9b-it:free",
+        "google/gemma-3-27b-it:free",
         "qwen/qwen-2.5-vl-7b-instruct:free",
+        "meta-llama/llama-3.3-70b-instruct:free",
     ]:
         MODEL_CHAIN.append({"provider": "openrouter", "model": m, "key": OPENROUTER_API_KEY})
 
@@ -107,7 +109,7 @@ SYSTEM_PROMPT_TEMPLATE = (
     "- Empty product listing on a catalog page.\n"
     "\n"
     "REQUIRED INTERACTIONS:\n"
-    "__REQUIREMENTS__\n"
+    "REQUIREMENTS\n"
     "\n"
     "FINAL OUTPUT:\n"
     "Call done(text=...) with ONLY a valid JSON in text:\n"
@@ -125,16 +127,14 @@ SYSTEM_PROMPT_TEMPLATE = (
     "```\n"
 )
 
-
 def build_system_prompt(model_name: str) -> str:
     return (
         SYSTEM_PROMPT_TEMPLATE
-        .replace("__REQUIREMENTS__", REQUIREMENTS)
+        .replace("REQUIREMENTS", REQUIREMENTS)
         .replace("__SITE_TYPE__", SITE_TYPE)
         .replace("__MODEL_NAME__", model_name)
         .replace("__SITE_URL__", SITE_URL)
     )
-
 
 # ---------------------------------------------------------------------------
 # JSON helpers
@@ -142,7 +142,7 @@ def build_system_prompt(model_name: str) -> str:
 def extract_json_from_text(text: str):
     if not text:
         return None
-    match = re.search(r"\{.*\}", text, re.DOTALL)
+    match = re.search(r"{.*}", text, re.DOTALL)
     if not match:
         return None
     candidate = match.group(0)
@@ -154,7 +154,6 @@ def extract_json_from_text(text: str):
             return json.loads(cleaned)
         except json.JSONDecodeError:
             return None
-
 
 def extract_final_result(result) -> str:
     cells = getattr(result, "cells", None) or getattr(result, "history", None) or []
@@ -169,25 +168,26 @@ def extract_final_result(result) -> str:
         if match:
             return match.group(1)
         match = re.search(
-            r"done\s*\(\s*text\s*=\s*json\.dumps\(\s*([a-zA-Z_][a-zA-Z0-9_]*)",
+            r"done\s*\(\s*text\s*=\s*json\.dumps\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*)",
             source, re.DOTALL,
         )
         if match:
             output = getattr(cell, "output", "") or ""
             if output.strip():
                 return output
-            return source
+        return source
+
     for cell in reversed(list(cells)):
         output = getattr(cell, "output", "") or ""
         if '"url"' in output or '"overall_status"' in output:
             return output
     return str(result)
 
-
 def normalize_report(report: dict, model_name: str) -> dict:
     if "overall_status" in report and "pages" in report:
         report["model_used"] = model_name
         return report
+
     text_blob = json.dumps(report, ensure_ascii=False).lower()
     has_anomaly = any(
         kw in text_blob
@@ -210,7 +210,6 @@ def normalize_report(report: dict, model_name: str) -> dict:
         "model_used": model_name,
         "pages": pages,
     }
-
 
 # ---------------------------------------------------------------------------
 # Récupération de la page Playwright
@@ -245,7 +244,6 @@ async def get_playwright_page(session):
         except Exception:
             pass
     return None
-
 
 # ---------------------------------------------------------------------------
 # Screenshot recorder
@@ -282,7 +280,6 @@ async def screenshot_recorder(agent, interval=2.0):
         except Exception:
             misses += 1
 
-
 # ---------------------------------------------------------------------------
 # Fermeture de session
 # ---------------------------------------------------------------------------
@@ -315,7 +312,6 @@ async def close_agent_session(agent) -> None:
     except Exception:
         pass
 
-
 # ---------------------------------------------------------------------------
 # Tentative
 # ---------------------------------------------------------------------------
@@ -330,6 +326,7 @@ async def run_attempt(model_config: dict, task: str):
 
     agent = None
     recorder_task = None
+
     try:
         if provider == "google":
             llm = ChatGoogleGenerativeAI(
@@ -378,7 +375,6 @@ async def run_attempt(model_config: dict, task: str):
                 successful_cells += 1
 
         print("Cellules totales : %d, reussies : %d" % (len(cells), successful_cells))
-
         if successful_cells == 0:
             print("ATTENTION : %s n'a effectue AUCUNE action reussie" % model_name)
             return None
@@ -397,6 +393,7 @@ async def run_attempt(model_config: dict, task: str):
             for kw in ["erreur", "error", "undefined", "0 produit",
                        "no results", "aucun produit", "anomalies_detected"]
         )
+
         anomalies = []
         if "erreur lors du chargement des sliders" in text_lower:
             anomalies.append("carrousel casse")
@@ -426,6 +423,7 @@ async def run_attempt(model_config: dict, task: str):
     except Exception as err:
         print("Echec avec " + model_name + " : " + str(err))
         return None
+
     finally:
         if recorder_task is not None:
             recorder_task.cancel()
@@ -434,7 +432,6 @@ async def run_attempt(model_config: dict, task: str):
             except (asyncio.CancelledError, Exception):
                 pass
         await close_agent_session(agent)
-
 
 # ---------------------------------------------------------------------------
 # Main
@@ -451,12 +448,14 @@ async def main() -> None:
 
     final_report = None
     total = len(MODEL_CHAIN)
+
     for idx, model_config in enumerate(MODEL_CHAIN):
         print("")
         print("#" * 60)
         print("# Essai %d/%d : [%s] %s" % (
             idx + 1, total, model_config["provider"], model_config["model"]))
         print("#" * 60)
+
         report = await run_attempt(model_config, task)
         if report is not None:
             final_report = report
@@ -484,7 +483,6 @@ async def main() -> None:
     print("output.json ecrit dans " + output_path)
     print("=== output.json ===")
     print(json.dumps(final_report, indent=2, ensure_ascii=False))
-
 
 if __name__ == "__main__":
     asyncio.run(main())
