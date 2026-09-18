@@ -1,7 +1,9 @@
 """
 OpenBrowser-AI — Monitoring fonctionnel via OpenRouter.
 
-Détection dynamique des modèles gratuits fiables + screenshots + timelapse.
+- Filtre les modèles qui supportent l'input image (OpenBrowser-AI envoie des screenshots)
+- Passe au modèle suivant si 0 action réussie
+- Screenshots + timelapse MP4
 """
 import asyncio
 import json
@@ -27,16 +29,9 @@ print("Recordings dir : " + RECORDINGS_DIR)
 print("Shots dir : " + SHOTS_DIR)
 
 # ---------------------------------------------------------------------------
-# Détection des modèles gratuits fiables
+# Détection des modèles : gratuit + tool calling + input image
 # ---------------------------------------------------------------------------
-TRUSTED_PROVIDERS = (
-    "google/", "meta-llama/", "mistralai/", "qwen/", "deepseek/",
-    "microsoft/", "nousresearch/", "cohere/", "amazon/", "ai21/",
-)
-
-
 def get_working_free_models() -> list:
-    """Récupère les modèles gratuits avec tool calling, chez des providers fiables."""
     try:
         req = urllib.request.Request(
             "https://openrouter.ai/api/v1/models",
@@ -46,36 +41,51 @@ def get_working_free_models() -> list:
             data = json.loads(resp.read())
 
         candidates = []
+        skipped_no_image = []
+        skipped_no_tools = []
+
         for m in data.get("data", []):
             mid = m.get("id", "")
             if not mid.endswith(":free"):
                 continue
-            if not any(mid.startswith(p) for p in TRUSTED_PROVIDERS):
-                continue
+
             pricing = m.get("pricing", {})
             if str(pricing.get("prompt")) not in ("0", "0.0", "0.0000"):
                 continue
             if str(pricing.get("completion")) not in ("0", "0.0", "0.0000"):
                 continue
+
             supported = m.get("supported_parameters", [])
             if "tools" not in supported:
+                skipped_no_tools.append(mid)
                 continue
+
+            arch = m.get("architecture", {})
+            input_mods = arch.get("input_modalities", [])
+            if "image" not in input_mods:
+                skipped_no_image.append(mid)
+                continue
+
             candidates.append(mid)
+
+        print(f"Candidats valides : {len(candidates)}")
+        if skipped_no_image:
+            print(f"Exclus (pas d'input image) : {skipped_no_image[:8]}")
+        if skipped_no_tools:
+            print(f"Exclus (pas de tool calling) : {skipped_no_tools[:5]}")
 
         def score(mid):
             if "gemini" in mid: return 0
-            if "llama-3.3" in mid: return 1
-            if "llama-3.1" in mid: return 2
-            if "mistral" in mid: return 3
-            if "qwen-2.5-72b" in mid: return 4
-            if "qwen-2.5" in mid: return 5
-            if "deepseek-chat" in mid: return 6
-            if "deepseek" in mid: return 7
-            if "hermes" in mid: return 8
-            return 20
+            if "gemma" in mid: return 1
+            if "qwen-2.5-vl" in mid: return 2
+            if "qwen-2.5" in mid: return 3
+            if "qwen" in mid: return 4
+            if "mistral" in mid: return 5
+            if "llama" in mid: return 6
+            return 10
 
         candidates.sort(key=score)
-        print("Modeles gratuits fiables : " + ", ".join(candidates[:8]))
+        print("Modeles retenus : " + ", ".join(candidates[:8]))
         return candidates[:5]
 
     except Exception as e:
@@ -85,13 +95,12 @@ def get_working_free_models() -> list:
 
 MODEL_CHAIN = get_working_free_models()
 
-# Fallback si la détection échoue
 if not MODEL_CHAIN:
     MODEL_CHAIN = [
         "google/gemini-2.0-flash-exp:free",
-        "google/gemini-flash-1.5-8b:free",
+        "google/gemma-2-9b-it:free",
+        "qwen/qwen-2.5-vl-7b-instruct:free",
         "mistralai/mistral-small-24b-instruct-2501:free",
-        "qwen/qwen-2.5-72b-instruct:free",
     ]
     print("Fallback chain : " + str(MODEL_CHAIN))
 
@@ -126,7 +135,7 @@ SYSTEM_PROMPT_TEMPLATE = (
     "\n"
     "STRICT STOP CONDITION:\n"
     "- After 6 tool calls max, call done() no matter what.\n"
-    "- Partial results are OK. Better DOWN with 2 anomalies than infinite loops.\n"
+    "- Partial results are OK.\n"
     "\n"
     "ANOMALIES (functional failures):\n"
     "- Text containing Erreur, Error, Failed, undefined, null, 0 produit, Aucun produit.\n"
@@ -240,14 +249,11 @@ def normalize_report(report: dict, model_name: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Récupération de la page Playwright depuis la session OpenBrowser-AI
+# Récupération de la page Playwright
 # ---------------------------------------------------------------------------
 async def get_playwright_page(session):
-    """Essaie plusieurs méthodes pour récupérer la page Playwright."""
     if session is None:
         return None
-
-    # 1. Méthode officielle
     for method_name in ("must_get_current_page", "get_current_page"):
         if hasattr(session, method_name):
             try:
@@ -258,8 +264,6 @@ async def get_playwright_page(session):
                     return r
             except Exception:
                 pass
-
-    # 2. Attributs directs
     for attr in ("current_page", "page", "_page"):
         try:
             p = getattr(session, attr, None)
@@ -267,8 +271,6 @@ async def get_playwright_page(session):
                 return p
         except Exception:
             pass
-
-    # 3. Via get_pages()
     if hasattr(session, "get_pages"):
         try:
             r = session.get_pages()
@@ -278,7 +280,6 @@ async def get_playwright_page(session):
                 return r[0]
         except Exception:
             pass
-
     return None
 
 
@@ -286,7 +287,6 @@ async def get_playwright_page(session):
 # Screenshot recorder
 # ---------------------------------------------------------------------------
 async def screenshot_recorder(agent, interval=2.0):
-    """Prend un screenshot toutes les N secondes."""
     idx = 0
     misses = 0
     while True:
@@ -296,7 +296,6 @@ async def screenshot_recorder(agent, interval=2.0):
             if session is None:
                 misses += 1
                 continue
-
             page = await get_playwright_page(session)
             if page is None:
                 misses += 1
@@ -304,7 +303,6 @@ async def screenshot_recorder(agent, interval=2.0):
                     print("Screenshot recorder : abandon apres %d echecs" % misses)
                     break
                 continue
-
             path = os.path.join(SHOTS_DIR, "shot_%04d.png" % idx)
             try:
                 r = page.screenshot(path=path, full_page=False)
@@ -314,7 +312,6 @@ async def screenshot_recorder(agent, interval=2.0):
                 misses = 0
             except Exception:
                 misses += 1
-
         except asyncio.CancelledError:
             print("Screenshot recorder arrete (%d shots)" % idx)
             break
@@ -323,23 +320,19 @@ async def screenshot_recorder(agent, interval=2.0):
 
 
 # ---------------------------------------------------------------------------
-# Fermeture de session (sans debug verbeux cette fois)
+# Fermeture
 # ---------------------------------------------------------------------------
 async def close_agent_session(agent) -> None:
     if agent is None:
         return
-
     session = None
     for attr_name in ("browser_session", "browser", "session"):
         session = getattr(agent, attr_name, None)
         if session is not None:
             print("Session trouvee via agent." + attr_name)
             break
-
     if session is None:
-        print("Aucune session trouvee")
         return
-
     for method_name in ("close", "stop", "kill", "shutdown", "cleanup"):
         if not hasattr(session, method_name):
             continue
@@ -350,10 +343,8 @@ async def close_agent_session(agent) -> None:
             print("Session fermee via " + method_name + "()")
             break
         except Exception as e:
-            print("Echec session." + method_name + "() : " + str(e))
-
+            print("Echec " + method_name + "() : " + str(e))
     await asyncio.sleep(3)
-
     try:
         shots = os.listdir(SHOTS_DIR) if os.path.isdir(SHOTS_DIR) else []
         print("Screenshots captures : " + str(len(shots)))
@@ -401,6 +392,22 @@ async def run_attempt(model_name: str, task: str):
             print("Timeout global pour " + model_name)
             return None
 
+        # 🔑 Compter les actions réussies
+        cells = getattr(result, "cells", None) or getattr(result, "history", None) or []
+        successful_cells = 0
+        for cell in cells:
+            status = getattr(cell, "status", None)
+            if status is not None and "success" in str(status).lower():
+                successful_cells += 1
+            elif getattr(cell, "output", ""):
+                successful_cells += 1
+
+        print("Cellules totales : %d, reussies : %d" % (len(cells), successful_cells))
+
+        if successful_cells == 0:
+            print("ATTENTION : %s n'a effectue AUCUNE action, passage au suivant" % model_name)
+            return None
+
         final_text = extract_final_result(result)
         print("Resultat extrait (" + model_name + ") :")
         print(final_text[:800])
@@ -409,7 +416,6 @@ async def run_attempt(model_name: str, task: str):
         if report:
             return normalize_report(report, model_name)
 
-        # Fallback
         text_lower = final_text.lower()
         has_anomaly = any(
             kw in text_lower
@@ -469,11 +475,19 @@ async def main() -> None:
     )
 
     final_report = None
-    for model_name in MODEL_CHAIN:
+    total = len(MODEL_CHAIN)
+    for idx, model_name in enumerate(MODEL_CHAIN):
+        print("")
+        print("#" * 60)
+        print("# Essai %d/%d : %s" % (idx + 1, total, model_name))
+        print("#" * 60)
         report = await run_attempt(model_name, task)
         if report is not None:
             final_report = report
+            print("Modele retenu : " + model_name)
             break
+        else:
+            print("Modele ecarte : " + model_name + ", on passe au suivant")
 
     if final_report is None:
         final_report = {
@@ -482,7 +496,7 @@ async def main() -> None:
             "actions_completed": False,
             "model_used": None,
             "pages": [],
-            "error": "Tous les modeles ont echoue.",
+            "error": "Tous les modeles ont echoue ou n'ont effectue aucune action.",
         }
 
     output_path = os.path.join(os.getcwd(), "output.json")
