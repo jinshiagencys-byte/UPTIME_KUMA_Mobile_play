@@ -1,13 +1,13 @@
 """
-OpenBrowser-AI — Monitoring fonctionnel avec CodeAgent.
-Chaîne de fallback Groq + assertions Python + enregistrement vidéo.
+OpenBrowser-AI — Monitoring fonctionnel via OpenRouter.
+Chaîne de fallback OpenRouter + assertions Python + enregistrement vidéo.
 """
 import asyncio
 import json
 import os
-import sys
 
-from openbrowser import CodeAgent, ChatGroq
+from openbrowser import CodeAgent
+from openbrowser.llm import ChatOpenAI  # OpenRouter passe par ChatOpenAI
 from openbrowser.browser import BrowserProfile
 
 # ---------------------------------------------------------------------------
@@ -17,16 +17,18 @@ SITE_URL = os.environ["SITE_URL"]
 SITE_ID = os.environ["SITE_ID"]
 SITE_TYPE = os.environ.get("SITE_TYPE", "generic")
 REQUIREMENTS = os.environ["REQUIREMENTS"]
+OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 
 # ---------------------------------------------------------------------------
-# Chaîne de fallback Groq — du plus capable au plus léger.
-# On évite gpt-oss-120b à cause du bug de tool calling multi-tour.
+# Chaîne de fallback OpenRouter
+# On commence par le modèle gratuit thinkingmachines/inkling:free.
+# Les suivants servent de secours si le premier échoue ou rate-limite.
 # ---------------------------------------------------------------------------
 MODEL_CHAIN = [
-    "openai/gpt-oss-20b",
-    "meta-llama/llama-4-scout-17b-16e-instruct",
-    "meta-llama/llama-4-maverick-17b-128e-instruct",
-    "llama-3.3-70b-versatile",
+    "thinkingmachines/inkling:free",
+    "openrouter/owl-alpha",                # agentique, tool calling natif
+    "arcee-ai/trinity-large-thinking",     # conçu pour le tool calling
+    "qwen/qwen3-coder:free",               # alternative gratuite si dispo
 ]
 
 # ---------------------------------------------------------------------------
@@ -67,15 +69,16 @@ After completing the test, write a JSON report to output.json with:
 
 
 async def run_attempt(model_name: str, task: str) -> dict | None:
-    """Tente une exécution avec un modèle donné. Retourne le rapport ou None."""
+    """Tente une exécution avec un modèle OpenRouter donné."""
     print("=" * 60)
     print(f"🤖 TENTATIVE — MODÈLE : {model_name}")
     print("=" * 60)
 
     try:
-        llm = ChatGroq(
+        llm = ChatOpenAI(
             model=model_name,
-            api_key=os.environ["GROQ_API_KEY"],
+            base_url="https://openrouter.ai/api/v1",
+            api_key=OPENROUTER_API_KEY,
             temperature=0.0,
         )
 
@@ -101,7 +104,6 @@ async def run_attempt(model_name: str, task: str) -> dict | None:
 
         await agent.run()
 
-        # Lire le rapport généré par l'agent
         if os.path.exists("output.json"):
             with open("output.json", "r", encoding="utf-8") as f:
                 report = json.load(f)
@@ -133,17 +135,15 @@ async def main() -> None:
             break
 
     if final_report is None:
-        # Aucun modèle n'a fonctionné → rapport d'erreur
         final_report = {
             "overall_status": "ERROR",
             "site_type": SITE_TYPE,
             "actions_completed": False,
             "model_used": None,
             "pages": [],
-            "error": "Tous les modèles Groq ont échoué.",
+            "error": "Tous les modèles OpenRouter ont échoué.",
         }
 
-    # Écrire le rapport final à la racine (pour l'upload artifact)
     with open("../output.json", "w", encoding="utf-8") as f:
         json.dump(final_report, f, indent=2, ensure_ascii=False)
 
