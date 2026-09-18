@@ -14,6 +14,9 @@ permissions:
   contents: read
 
 jobs:
+  # ============================================================
+  # 1. RÉCUPÉRER LES SITES ACTIFS
+  # ============================================================
   fetch-sites:
     runs-on: ubuntu-latest
     outputs:
@@ -31,6 +34,7 @@ jobs:
           SITE_ID="${SITE_ID_INPUT:-}"
 
           if [ -n "$SITE_ID" ]; then
+            echo "Test cible sur $SITE_ID"
             DETAIL=$(curl -fsS --retry 3 -H "x-relay-secret: $RELAY_SECRET" "$RELAY_URL/monitors/$SITE_ID")
             MONITOR=$(echo "$DETAIL" | jq -c '.monitor | if .type == "http" then {id: .parent, url: .url, name: .parentName} else {id: .id, url: .url, name: .name} end')
             if [ -z "$MONITOR" ] || [ "$MONITOR" = "null" ]; then
@@ -62,6 +66,9 @@ jobs:
           echo "Sites a monitorer :"
           echo "$SITES" | jq .
 
+  # ============================================================
+  # 2. AGENT OPENBROWSER-AI + GEMINI + OPENROUTER
+  # ============================================================
   autospec-test:
     needs: fetch-sites
     if: needs.fetch-sites.outputs.sites != '[]'
@@ -85,13 +92,15 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Installer OpenBrowser-AI + ffmpeg
+      - name: Installer OpenBrowser-AI + Gemini + ffmpeg
         run: |
           set -euo pipefail
           pip install --quiet "openbrowser-ai[agent,video]"
           pip install --quiet openai
+          pip install --quiet langchain-google-genai
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg
+          echo "ffmpeg : $(which ffmpeg)"
           ffmpeg -version | head -1
 
       - name: Détecter le type de site
@@ -153,14 +162,15 @@ jobs:
           SITE_ID: ${{ matrix.site.id }}
           SITE_TYPE: ${{ steps.detect.outputs.TYPE }}
           REQUIREMENTS: ${{ steps.prompt.outputs.REQUIREMENTS }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
           set +e
           python run_monitor.py
           echo ""
           echo "=== Screenshots captures ==="
-          ls recordings/shots/ 2>/dev/null | head -20
-          echo "Total : $(find recordings/shots -name '*.png' 2>/dev/null | wc -l)"
+          count=$(find recordings/shots -name '*.png' 2>/dev/null | wc -l)
+          echo "Total : $count"
 
       - name: Convertir les screenshots en timelapse MP4
         if: always()
@@ -175,7 +185,7 @@ jobs:
               -vf "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2" \
               recordings-mp4/timelapse.mp4 >/dev/null 2>&1
             if [ -f "recordings-mp4/timelapse.mp4" ]; then
-              echo "Timelapse : $(ls -la recordings-mp4/timelapse.mp4 | awk '{print $5}') octets"
+              echo "Timelapse genere : $(ls -la recordings-mp4/timelapse.mp4 | awk '{print $5}') octets"
             fi
           else
             echo "Aucun screenshot a convertir"
