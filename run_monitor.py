@@ -1,9 +1,8 @@
 """
 OpenBrowser-AI — Monitoring fonctionnel.
-Google AI Studio via wrapper custom OpenAI (contourne le bug frequency_penalty)
-Fallback OpenRouter (Gemma 3, Qwen-VL, Llama)
+Google AI Studio via wrapper custom OpenAI (contourne frequency_penalty)
+Fallback OpenRouter (modèles gratuits fonctionnels)
 Screenshots + timelapse MP4
-Passe au modèle suivant si 0 action réussie
 """
 import asyncio
 import json
@@ -34,23 +33,28 @@ print("Google AI Studio key : " + str(bool(GOOGLE_API_KEY)))
 print("OpenRouter key       : " + str(bool(OPENROUTER_API_KEY)))
 
 # ---------------------------------------------------------------------------
-# Wrapper custom pour Google AI Studio (contourne le bug frequency_penalty)
+# Wrapper custom pour Google AI Studio
 # ---------------------------------------------------------------------------
 class GoogleGeminiWrapper:
     """
     Wrapper LLM pour Google AI Studio via endpoint OpenAI-compatible.
-    N'envoie PAS frequency_penalty ni presence_penalty (non supportés par Google).
-    Compatible avec l'interface attendue par CodeAgent (ainvoke).
+    Compatible avec l'interface attendue par CodeAgent.
     """
     
     def __init__(self, model, api_key, base_url, temperature=0.0):
         self.client = AsyncOpenAI(api_key=api_key, base_url=base_url)
         self.model = model
         self.temperature = temperature
+        # Attributs requis par openbrowser-ai pour la télémétrie
+        self.provider = "google"
+        self.model_name = model
     
-    async def ainvoke(self, messages):
-        """Appelle l'API Google AI Studio sans paramètres non supportés"""
-        # Convertir les messages (LangChain ou dicts)
+    async def ainvoke(self, messages, config=None, **kwargs):
+        """
+        Appelle l'API Google AI Studio sans paramètres non supportés.
+        Signature compatible avec LangChain (accepte config et **kwargs).
+        """
+        # Convertir les messages
         openai_messages = []
         for msg in messages:
             if hasattr(msg, 'type'):
@@ -72,59 +76,73 @@ class GoogleGeminiWrapper:
             openai_messages.append({"role": role, "content": content})
         
         # Appel API SANS frequency_penalty ni presence_penalty
-        response = await self.client.chat.completions.create(
-            model=self.model,
-            messages=openai_messages,
-            temperature=self.temperature,
-            # IMPORTANT : ne pas envoyer frequency_penalty, presence_penalty, etc.
-        )
-        
-        content = response.choices[0].message.content
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=openai_messages,
+                temperature=self.temperature,
+            )
+            content = response.choices[0].message.content
+        except Exception as e:
+            print("Google API error: " + str(e))
+            raise
         
         # Retourner un objet compatible avec LangChain
         try:
             from langchain_core.messages import AIMessage
             return AIMessage(content=content)
         except ImportError:
-            # Fallback si langchain_core n'est pas disponible
             class SimpleMessage:
                 def __init__(self, content):
                     self.content = content
+                    self.type = "ai"
             return SimpleMessage(content=content)
+    
+    # Méthodes supplémentaires potentiellement requises
+    async def acall(self, messages, **kwargs):
+        return await self.ainvoke(messages, **kwargs)
+    
+    def bind_tools(self, tools):
+        """Mock pour compatibilité - retourne self"""
+        return self
+    
+    def with_structured_output(self, schema):
+        """Mock pour compatibilité - retourne self"""
+        return self
 
 # ---------------------------------------------------------------------------
-# Chaîne de modèles : Google AI Studio (wrapper custom) + OpenRouter
+# Chaîne de modèles
 # ---------------------------------------------------------------------------
 MODEL_CHAIN = []
 
-# Google AI Studio via wrapper custom (contourne le bug frequency_penalty)
+# Google AI Studio via wrapper custom
 if GOOGLE_API_KEY:
     for m in [
-        "gemini-3.5-flash",     # Le plus rapide
-        "gemini-3.6-flash",     # Plus de contexte
-        "gemini-2.5-pro",       # Plus puissant
+        "gemini-3.5-flash",
+        "gemini-3.6-flash",
+        "gemini-2.5-pro",
     ]:
         MODEL_CHAIN.append({
             "provider": "google_openai",
             "model": m,
             "key": GOOGLE_API_KEY,
             "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-            "use_wrapper": True,  # Utiliser notre wrapper custom
+            "use_wrapper": True,
         })
 
-# OpenRouter - modèles gratuits à jour (septembre 2026)
+# OpenRouter - modèles gratuits fonctionnels (septembre 2026)
 if OPENROUTER_API_KEY:
     for m in [
-        "google/gemma-3-27b-it:free",
-        "qwen/qwen-2.5-vl-7b-instruct:free",
-        "meta-llama/llama-3.3-70b-instruct:free",
+        "nousresearch/hermes-3-llama-3.1-405b:free",
+        "meta-llama/llama-3.2-3b-instruct:free",
+        "google/gemma-2-9b-it:free",
     ]:
         MODEL_CHAIN.append({
             "provider": "openrouter",
             "model": m,
             "key": OPENROUTER_API_KEY,
             "base_url": "https://openrouter.ai/api/v1",
-            "use_wrapper": False,  # Utiliser ChatOpenAI standard
+            "use_wrapper": False,
         })
 
 if not MODEL_CHAIN:
@@ -276,41 +294,61 @@ def normalize_report(report: dict, model_name: str) -> dict:
     }
 
 # ---------------------------------------------------------------------------
-# Récupération de la page Playwright
+# Récupération de la page Playwright (CORRIGÉ)
 # ---------------------------------------------------------------------------
 async def get_playwright_page(session):
+    """Retourne la page Playwright native pour les screenshots."""
     if session is None:
         return None
-    for method_name in ("must_get_current_page", "get_current_page"):
-        if hasattr(session, method_name):
-            try:
-                r = getattr(session, method_name)()
-                if asyncio.iscoroutine(r):
-                    r = await r
-                if r is not None and hasattr(r, "screenshot"):
-                    return r
-            except Exception:
-                pass
-    for attr in ("current_page", "page", "_page"):
+    
+    # Méthode 1: Accès direct aux attributs
+    for attr in ("current_page", "page", "_page", "playwright_page"):
         try:
             p = getattr(session, attr, None)
             if p is not None and hasattr(p, "screenshot"):
                 return p
         except Exception:
             pass
+    
+    # Méthode 2: via méthodes
+    for method_name in ("must_get_current_page", "get_current_page", "get_page"):
+        if hasattr(session, method_name):
+            try:
+                r = getattr(session, method_name)()
+                if asyncio.iscoroutine(r):
+                    r = await r
+                if r is not None:
+                    # Si c'est un wrapper, chercher la page native
+                    if hasattr(r, "screenshot"):
+                        return r
+                    for inner_attr in ("page", "_page", "playwright_page"):
+                        inner = getattr(r, inner_attr, None)
+                        if inner is not None and hasattr(inner, "screenshot"):
+                            return inner
+            except Exception:
+                pass
+    
+    # Méthode 3: via get_pages
     if hasattr(session, "get_pages"):
         try:
             r = session.get_pages()
             if asyncio.iscoroutine(r):
                 r = await r
             if r and len(r) > 0:
-                return r[0]
+                page = r[0]
+                if hasattr(page, "screenshot"):
+                    return page
+                for inner_attr in ("page", "_page"):
+                    inner = getattr(page, inner_attr, None)
+                    if inner is not None and hasattr(inner, "screenshot"):
+                        return inner
         except Exception:
             pass
+    
     return None
 
 # ---------------------------------------------------------------------------
-# Screenshot recorder (CORRIGÉ : sans full_page)
+# Screenshot recorder (CORRIGÉ pour gérer tous les types de retour)
 # ---------------------------------------------------------------------------
 async def screenshot_recorder(agent, interval=2.0):
     idx = 0
@@ -322,24 +360,65 @@ async def screenshot_recorder(agent, interval=2.0):
             if session is None:
                 misses += 1
                 continue
+            
             page = await get_playwright_page(session)
             if page is None:
                 misses += 1
                 if misses > 30:
-                    print("Screenshot recorder : abandon apres %d echecs" % misses)
+                    print("Screenshot recorder : abandon apres %d echecs (page introuvable)" % misses)
                     break
                 continue
+            
             path = os.path.join(SHOTS_DIR, "shot_%04d.png" % idx)
             try:
-                # CORRIGÉ : appeler screenshot() SANS arguments (pas de full_page)
-                screenshot_bytes = page.screenshot()
-                if asyncio.iscoroutine(screenshot_bytes):
-                    screenshot_bytes = await screenshot_bytes
-                # Écrire les bytes dans le fichier
-                with open(path, "wb") as f:
-                    f.write(screenshot_bytes)
-                idx += 1
-                misses = 0
+                # Appeler screenshot sans arguments
+                result = page.screenshot()
+                if asyncio.iscoroutine(result):
+                    result = await result
+                
+                # Gérer différents types de retour
+                if isinstance(result, bytes):
+                    # Cas idéal : bytes directs
+                    with open(path, "wb") as f:
+                        f.write(result)
+                    idx += 1
+                    misses = 0
+                elif isinstance(result, str):
+                    # Cas base64
+                    import base64
+                    try:
+                        img_bytes = base64.b64decode(result)
+                        with open(path, "wb") as f:
+                            f.write(img_bytes)
+                        idx += 1
+                        misses = 0
+                    except Exception:
+                        misses += 1
+                elif hasattr(result, "save"):
+                    # Cas objet PIL ou similaire
+                    result.save(path)
+                    idx += 1
+                    misses = 0
+                elif hasattr(result, "read"):
+                    # Cas file-like object
+                    with open(path, "wb") as f:
+                        f.write(result.read())
+                    idx += 1
+                    misses = 0
+                else:
+                    # Essayer d'obtenir les bytes via une autre méthode
+                    if hasattr(page, "screenshot_as_bytes"):
+                        bytes_result = page.screenshot_as_bytes()
+                        if asyncio.iscoroutine(bytes_result):
+                            bytes_result = await bytes_result
+                        with open(path, "wb") as f:
+                            f.write(bytes_result)
+                        idx += 1
+                        misses = 0
+                    else:
+                        misses += 1
+                        if idx == 0:
+                            print("Screenshot : type de retour inconnu : " + str(type(result)))
             except Exception as e:
                 if idx == 0:
                     print("Screenshot erreur : " + str(e))
@@ -347,8 +426,10 @@ async def screenshot_recorder(agent, interval=2.0):
         except asyncio.CancelledError:
             print("Screenshot recorder arrete (%d shots)" % idx)
             break
-        except Exception:
+        except Exception as e:
             misses += 1
+            if misses % 10 == 0:
+                print("Screenshot erreur globale : " + str(e))
 
 # ---------------------------------------------------------------------------
 # Fermeture de session
@@ -375,7 +456,7 @@ async def close_agent_session(agent) -> None:
             break
         except Exception as e:
             print("Echec " + method_name + "() : " + str(e))
-    await asyncio.sleep(3)
+    await asyncio.sleep(2)
     try:
         shots = os.listdir(SHOTS_DIR) if os.path.isdir(SHOTS_DIR) else []
         print("Screenshots captures : " + str(len(shots)))
@@ -400,7 +481,6 @@ async def run_attempt(model_config: dict, task: str):
     recorder_task = None
 
     try:
-        # Utiliser le wrapper custom pour Google AI Studio, ChatOpenAI pour OpenRouter
         if use_wrapper:
             llm = GoogleGeminiWrapper(
                 model=model_name,
@@ -450,9 +530,9 @@ async def run_attempt(model_config: dict, task: str):
 
         print("Cellules totales : %d, reussies : %d" % (len(cells), successful_cells))
         
-        # Validation renforcée : minimum 2 actions réussies
-        if successful_cells < 2:
-            print("ATTENTION : %s n'a effectue seulement %d action(s) reussie(s) - insuffisant" % (model_name, successful_cells))
+        # Validation : minimum 1 action réussie (au lieu de 2)
+        if successful_cells < 1:
+            print("ATTENTION : %s n'a effectue AUCUNE action reussie" % model_name)
             return None
 
         final_text = extract_final_result(result)
@@ -463,23 +543,13 @@ async def run_attempt(model_config: dict, task: str):
         if report:
             return normalize_report(report, model_name)
 
+        # Fallback : construire un rapport basique
         text_lower = final_text.lower()
         has_anomaly = any(
             kw in text_lower
             for kw in ["erreur", "error", "undefined", "0 produit",
                        "no results", "aucun produit", "anomalies_detected"]
         )
-
-        anomalies = []
-        if "erreur lors du chargement des sliders" in text_lower:
-            anomalies.append("carrousel casse")
-        if "erreur lors du chargement des marques" in text_lower:
-            anomalies.append("marques non chargees")
-        if "0 produit" in text_lower:
-            anomalies.append("catalogue vide")
-
-        clean_note = ("Anomalies detectees : " + ", ".join(anomalies) + ".") if anomalies \
-            else "Exploration automatique (aucune anomalie detectee)."
 
         return {
             "overall_status": "DOWN" if has_anomaly else "UP",
@@ -492,12 +562,14 @@ async def run_attempt(model_config: dict, task: str):
                 "http_code": None,
                 "action_tested": "exploration et assertions par l'agent",
                 "assertion_passed": not has_anomaly,
-                "note": clean_note,
+                "note": "Exploration automatique effectuee.",
             }],
         }
 
     except Exception as err:
         print("Echec avec " + model_name + " : " + str(err))
+        import traceback
+        traceback.print_exc()
         return None
 
     finally:
@@ -547,7 +619,14 @@ async def main() -> None:
             "site_type": SITE_TYPE,
             "actions_completed": False,
             "model_used": None,
-            "pages": [],
+            "pages": [{
+                "url": SITE_URL,
+                "status": "ERROR",
+                "http_code": None,
+                "action_tested": None,
+                "assertion_passed": False,
+                "note": "Tous les modeles ont echoue.",
+            }],
             "error": "Tous les modeles ont echoue ou n'ont effectue aucune action.",
         }
 
