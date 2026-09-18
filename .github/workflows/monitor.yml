@@ -1,4 +1,4 @@
-name: AutoSpec Agent - Monitoring Autonome Multi-Sites (OpenBrowser-AI)
+name: AutoSpec Agent - Monitoring Autonome Multi-Sites (OpenBrowser-AI + OpenRouter)
 
 on:
   workflow_dispatch:
@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   # ============================================================
-  # 1. RÉCUPÉRER LES SITES (inchangé)
+  # 1. RÉCUPÉRER LES SITES ACTIFS ET LEURS PAGES
   # ============================================================
   fetch-sites:
     runs-on: ubuntu-latest
@@ -50,6 +50,9 @@ jobs:
           else
             echo "📡 Récupération de tous les sites actifs..."
             RAW=$(curl -fsS --retry 3 --retry-delay 2 -H "x-relay-secret: $RELAY_SECRET" "$RELAY_URL/active-sites")
+            echo "🔍 Réponse brute du relais (premiers 1000 caractères) :"
+            echo "$RAW" | head -c 1000
+            echo ""
             SITES_RAW=$(echo "$RAW" | jq -c '[.sites[]? | {id: .id, url: .site_url}]' 2>/dev/null || echo "[]")
             [ -z "$SITES_RAW" ] || [ "$SITES_RAW" = "null" ] && SITES_RAW="[]"
 
@@ -71,7 +74,7 @@ jobs:
           echo "$SITES" | jq .
 
   # ============================================================
-  # 2. AGENT OPENBROWSER-AI
+  # 2. AGENT OPENBROWSER-AI + OPENROUTER
   # ============================================================
   autospec-test:
     needs: fetch-sites
@@ -96,10 +99,11 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Installer OpenBrowser-AI + ffmpeg
+      - name: Installer OpenBrowser-AI + SDK OpenAI + ffmpeg
         run: |
           set -euo pipefail
-          pip install --quiet "openbrowser-ai[agent,video,groq]"
+          pip install --quiet "openbrowser-ai[agent,video]"
+          pip install --quiet openai
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg
 
@@ -159,7 +163,7 @@ jobs:
           SITE_ID: ${{ matrix.site.id }}
           SITE_TYPE: ${{ steps.detect.outputs.TYPE }}
           REQUIREMENTS: ${{ steps.prompt.outputs.REQUIREMENTS }}
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: python run_monitor.py
 
       - name: Afficher le résultat
