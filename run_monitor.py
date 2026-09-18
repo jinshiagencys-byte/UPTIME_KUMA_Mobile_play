@@ -1,11 +1,3 @@
-
----
-
-## 📄 `monitor.yml` — version complète avec debug vidéo
-
-Voici le workflow complet, avec les steps de debug pour la vidéo et la conversion MP4 robuste.
-
-```yaml
 name: AutoSpec Agent - Monitoring Autonome Multi-Sites (OpenBrowser-AI + OpenRouter)
 
 on:
