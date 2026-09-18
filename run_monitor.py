@@ -1,7 +1,7 @@
 """
 OpenBrowser-AI — Monitoring fonctionnel via OpenRouter.
-On capture le résultat retourné par agent.run() et on écrit le JSON nous-mêmes,
-car l'agent écrit dans un namespace Python sandboxé, pas sur le disque réel.
+Utilise le Free Models Router (openrouter/free) qui filtre automatiquement
+les modèles gratuits supportant le tool calling.
 """
 import asyncio
 import json
@@ -23,14 +23,18 @@ OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 
 # ---------------------------------------------------------------------------
 # Chaîne de fallback OpenRouter
-# - thinkingmachines/inkling:free : modèle principal, gratuit, tool calling OK
-# - arcee-ai/trinity-large-thinking : confirmé fonctionnel dans tes logs
-# - meta-llama/llama-3.3-70b-instruct : bon fallback généraliste
+# - openrouter/free : routeur auto qui sélectionne un modèle gratuit avec tool calling
+# - qwen/qwen3.6-plus:free : 1M contexte, tool calling vérifié
+# - qwen/qwen3-coder:free : 1M contexte, orienté code
+# - meta-llama/llama-3.3-70b-instruct:free : fallback généraliste
+# - arcee-ai/trinity-large-preview:free : confirmé fonctionnel dans tes logs
 # ---------------------------------------------------------------------------
 MODEL_CHAIN = [
-    "thinkingmachines/inkling:free",
-    "arcee-ai/trinity-large-thinking",
-    "meta-llama/llama-3.3-70b-instruct",
+    "openrouter/free",
+    "qwen/qwen3.6-plus:free",
+    "qwen/qwen3-coder:free",
+    "meta-llama/llama-3.3-70b-instruct:free",
+    "arcee-ai/trinity-large-preview:free",
 ]
 
 # ---------------------------------------------------------------------------
@@ -80,7 +84,6 @@ def extract_json_from_text(text: str) -> dict | None:
     """Extrait un objet JSON valide depuis un texte libre."""
     if not text:
         return None
-    # Cherche le premier { et le dernier } équilibrés
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if not match:
         return None
@@ -88,7 +91,6 @@ def extract_json_from_text(text: str) -> dict | None:
     try:
         return json.loads(candidate)
     except json.JSONDecodeError:
-        # Tentative de nettoyage basique (retire les retours à la ligne dans les chaînes)
         try:
             cleaned = re.sub(r"(?<!\\)\n", " ", candidate)
             return json.loads(cleaned)
@@ -146,7 +148,6 @@ async def run_attempt(model_name: str, task: str) -> dict | None:
         print(f"📝 Résultat brut de l'agent ({model_name}) :")
         print(final_text[:1000])
 
-        # Tentative d'extraction JSON
         report = extract_json_from_text(final_text)
 
         if report and "overall_status" in report:
@@ -154,7 +155,6 @@ async def run_attempt(model_name: str, task: str) -> dict | None:
             print(f"✅ JSON valide extrait pour {model_name}")
             return report
 
-        # Si pas de JSON valide, on construit un rapport minimal à partir du texte
         print(f"⚠️ Pas de JSON valide dans la sortie de {model_name}, rapport reconstruit.")
         return {
             "overall_status": "UP" if "success" in final_text.lower() else "DOWN",
@@ -204,7 +204,6 @@ async def main() -> None:
             "error": "Tous les modèles OpenRouter ont échoué.",
         }
 
-    # Écriture du rapport final sur le VRAI disque
     output_path = os.path.join(os.getcwd(), "output.json")
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(final_report, f, indent=2, ensure_ascii=False)
