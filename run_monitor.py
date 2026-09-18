@@ -1,9 +1,9 @@
 """
-OpenBrowser-AI — Monitoring fonctionnel via OpenRouter.
-
-- Filtre les modèles qui supportent l'input image (OpenBrowser-AI envoie des screenshots)
+OpenBrowser-AI — Monitoring fonctionnel.
+- Priorité : Google AI Studio (Gemini, gratuit, vision + tool calling)
+- Fallback : OpenRouter (Gemini free, Gemma, Qwen-VL)
+- Screenshots + timelapse MP4 pour preuve visuelle
 - Passe au modèle suivant si 0 action réussie
-- Screenshots + timelapse MP4
 """
 import asyncio
 import json
@@ -15,96 +15,60 @@ from openbrowser import CodeAgent
 from openbrowser.llm import ChatOpenAI
 from openbrowser.browser import BrowserProfile
 
+try:
+    from langchain_google_genai import ChatGoogleGenerativeAI
+    HAS_GOOGLE = True
+except ImportError:
+    HAS_GOOGLE = False
+
+# ---------------------------------------------------------------------------
+# Env
 # ---------------------------------------------------------------------------
 SITE_URL = os.environ["SITE_URL"]
 SITE_ID = os.environ["SITE_ID"]
 SITE_TYPE = os.environ.get("SITE_TYPE", "generic")
 REQUIREMENTS = os.environ["REQUIREMENTS"]
-OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
 
 RECORDINGS_DIR = os.path.abspath("./recordings")
 SHOTS_DIR = os.path.join(RECORDINGS_DIR, "shots")
 os.makedirs(SHOTS_DIR, exist_ok=True)
+
 print("Recordings dir : " + RECORDINGS_DIR)
-print("Shots dir : " + SHOTS_DIR)
+print("Shots dir      : " + SHOTS_DIR)
+print("Google AI Studio key : " + str(bool(GOOGLE_API_KEY) and HAS_GOOGLE))
+print("OpenRouter key       : " + str(bool(OPENROUTER_API_KEY)))
 
 # ---------------------------------------------------------------------------
-# Détection des modèles : gratuit + tool calling + input image
+# Chaîne de modèles : Gemini AI Studio d'abord, puis OpenRouter
 # ---------------------------------------------------------------------------
-def get_working_free_models() -> list:
-    try:
-        req = urllib.request.Request(
-            "https://openrouter.ai/api/v1/models",
-            headers={"Authorization": "Bearer " + OPENROUTER_API_KEY},
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read())
+MODEL_CHAIN = []
 
-        candidates = []
-        skipped_no_image = []
-        skipped_no_tools = []
+if GOOGLE_API_KEY and HAS_GOOGLE:
+    for m in [
+        "gemini-2.0-flash-exp",
+        "gemini-1.5-flash",
+        "gemini-1.5-flash-8b",
+    ]:
+        MODEL_CHAIN.append({"provider": "google", "model": m, "key": GOOGLE_API_KEY})
 
-        for m in data.get("data", []):
-            mid = m.get("id", "")
-            if not mid.endswith(":free"):
-                continue
-
-            pricing = m.get("pricing", {})
-            if str(pricing.get("prompt")) not in ("0", "0.0", "0.0000"):
-                continue
-            if str(pricing.get("completion")) not in ("0", "0.0", "0.0000"):
-                continue
-
-            supported = m.get("supported_parameters", [])
-            if "tools" not in supported:
-                skipped_no_tools.append(mid)
-                continue
-
-            arch = m.get("architecture", {})
-            input_mods = arch.get("input_modalities", [])
-            if "image" not in input_mods:
-                skipped_no_image.append(mid)
-                continue
-
-            candidates.append(mid)
-
-        print(f"Candidats valides : {len(candidates)}")
-        if skipped_no_image:
-            print(f"Exclus (pas d'input image) : {skipped_no_image[:8]}")
-        if skipped_no_tools:
-            print(f"Exclus (pas de tool calling) : {skipped_no_tools[:5]}")
-
-        def score(mid):
-            if "gemini" in mid: return 0
-            if "gemma" in mid: return 1
-            if "qwen-2.5-vl" in mid: return 2
-            if "qwen-2.5" in mid: return 3
-            if "qwen" in mid: return 4
-            if "mistral" in mid: return 5
-            if "llama" in mid: return 6
-            return 10
-
-        candidates.sort(key=score)
-        print("Modeles retenus : " + ", ".join(candidates[:8]))
-        return candidates[:5]
-
-    except Exception as e:
-        print("Erreur listing modeles : " + str(e))
-        return []
-
-
-MODEL_CHAIN = get_working_free_models()
-
-if not MODEL_CHAIN:
-    MODEL_CHAIN = [
+if OPENROUTER_API_KEY:
+    for m in [
         "google/gemini-2.0-flash-exp:free",
         "google/gemma-2-9b-it:free",
         "qwen/qwen-2.5-vl-7b-instruct:free",
-        "mistralai/mistral-small-24b-instruct-2501:free",
-    ]
-    print("Fallback chain : " + str(MODEL_CHAIN))
+    ]:
+        MODEL_CHAIN.append({"provider": "openrouter", "model": m, "key": OPENROUTER_API_KEY})
 
-print("Chaine finale : " + str(MODEL_CHAIN))
+if not MODEL_CHAIN:
+    print("ERREUR : aucune cle API disponible. Abandon.")
+    import sys
+    sys.exit(1)
+
+print("Chaine finale :")
+for i, entry in enumerate(MODEL_CHAIN):
+    print("  %d. [%s] %s" % (i + 1, entry["provider"], entry["model"]))
 
 GLOBAL_TIMEOUT_SECONDS = 300
 MAX_STEPS = 12
@@ -320,7 +284,7 @@ async def screenshot_recorder(agent, interval=2.0):
 
 
 # ---------------------------------------------------------------------------
-# Fermeture
+# Fermeture de session
 # ---------------------------------------------------------------------------
 async def close_agent_session(agent) -> None:
     if agent is None:
@@ -355,20 +319,31 @@ async def close_agent_session(agent) -> None:
 # ---------------------------------------------------------------------------
 # Tentative
 # ---------------------------------------------------------------------------
-async def run_attempt(model_name: str, task: str):
+async def run_attempt(model_config: dict, task: str):
+    provider = model_config["provider"]
+    model_name = model_config["model"]
+    api_key = model_config["key"]
+
     print("=" * 60)
-    print("TENTATIVE - MODELE : " + model_name)
+    print("TENTATIVE - PROVIDER : %s | MODELE : %s" % (provider, model_name))
     print("=" * 60)
 
     agent = None
     recorder_task = None
     try:
-        llm = ChatOpenAI(
-            model=model_name,
-            base_url="https://openrouter.ai/api/v1",
-            api_key=OPENROUTER_API_KEY,
-            temperature=0.0,
-        )
+        if provider == "google":
+            llm = ChatGoogleGenerativeAI(
+                model=model_name,
+                google_api_key=api_key,
+                temperature=0.0,
+            )
+        else:
+            llm = ChatOpenAI(
+                model=model_name,
+                base_url="https://openrouter.ai/api/v1",
+                api_key=api_key,
+                temperature=0.0,
+            )
 
         profile = BrowserProfile(
             headless=True,
@@ -392,7 +367,7 @@ async def run_attempt(model_name: str, task: str):
             print("Timeout global pour " + model_name)
             return None
 
-        # 🔑 Compter les actions réussies
+        # Compter les cellules réussies
         cells = getattr(result, "cells", None) or getattr(result, "history", None) or []
         successful_cells = 0
         for cell in cells:
@@ -405,7 +380,7 @@ async def run_attempt(model_name: str, task: str):
         print("Cellules totales : %d, reussies : %d" % (len(cells), successful_cells))
 
         if successful_cells == 0:
-            print("ATTENTION : %s n'a effectue AUCUNE action, passage au suivant" % model_name)
+            print("ATTENTION : %s n'a effectue AUCUNE action reussie" % model_name)
             return None
 
         final_text = extract_final_result(result)
@@ -476,18 +451,20 @@ async def main() -> None:
 
     final_report = None
     total = len(MODEL_CHAIN)
-    for idx, model_name in enumerate(MODEL_CHAIN):
+    for idx, model_config in enumerate(MODEL_CHAIN):
         print("")
         print("#" * 60)
-        print("# Essai %d/%d : %s" % (idx + 1, total, model_name))
+        print("# Essai %d/%d : [%s] %s" % (
+            idx + 1, total, model_config["provider"], model_config["model"]))
         print("#" * 60)
-        report = await run_attempt(model_name, task)
+        report = await run_attempt(model_config, task)
         if report is not None:
             final_report = report
-            print("Modele retenu : " + model_name)
+            print("Modele retenu : %s (%s)" % (
+                model_config["model"], model_config["provider"]))
             break
         else:
-            print("Modele ecarte : " + model_name + ", on passe au suivant")
+            print("Modele ecarte : %s, on passe au suivant" % model_config["model"])
 
     if final_report is None:
         final_report = {
