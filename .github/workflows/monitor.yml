@@ -99,7 +99,7 @@ jobs:
       - name: Installer OpenBrowser-AI + ffmpeg
         run: |
           set -euo pipefail
-          pip install --quiet "openbrowser-ai[agent,video]"
+          pip install --quiet "openbrowser-ai[agent,video,groq]"
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg
 
