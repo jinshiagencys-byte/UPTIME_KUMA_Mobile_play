@@ -1,7 +1,7 @@
 """
 OpenBrowser-AI — Monitoring fonctionnel.
-Google AI Studio via endpoint OpenAI-compatible (contourne le bug ainvoke)
-Fallback OpenRouter (modèles gratuits à jour)
+Google AI Studio via wrapper custom OpenAI (contourne le bug frequency_penalty)
+Fallback OpenRouter (Gemma 3, Qwen-VL, Llama)
 Screenshots + timelapse MP4
 Passe au modèle suivant si 0 action réussie
 """
@@ -9,6 +9,7 @@ import asyncio
 import json
 import os
 import re
+from openai import AsyncOpenAI
 from openbrowser import CodeAgent
 from openbrowser.llm import ChatOpenAI
 from openbrowser.browser import BrowserProfile
@@ -33,12 +34,70 @@ print("Google AI Studio key : " + str(bool(GOOGLE_API_KEY)))
 print("OpenRouter key       : " + str(bool(OPENROUTER_API_KEY)))
 
 # ---------------------------------------------------------------------------
-# Chaîne de modèles : Google AI Studio (endpoint OpenAI) + OpenRouter
+# Wrapper custom pour Google AI Studio (contourne le bug frequency_penalty)
+# ---------------------------------------------------------------------------
+class GoogleGeminiWrapper:
+    """
+    Wrapper LLM pour Google AI Studio via endpoint OpenAI-compatible.
+    N'envoie PAS frequency_penalty ni presence_penalty (non supportés par Google).
+    Compatible avec l'interface attendue par CodeAgent (ainvoke).
+    """
+    
+    def __init__(self, model, api_key, base_url, temperature=0.0):
+        self.client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        self.model = model
+        self.temperature = temperature
+    
+    async def ainvoke(self, messages):
+        """Appelle l'API Google AI Studio sans paramètres non supportés"""
+        # Convertir les messages (LangChain ou dicts)
+        openai_messages = []
+        for msg in messages:
+            if hasattr(msg, 'type'):
+                # LangChain message
+                role = "user"
+                if msg.type == "human":
+                    role = "user"
+                elif msg.type == "ai":
+                    role = "assistant"
+                elif msg.type == "system":
+                    role = "system"
+                content = msg.content
+            elif isinstance(msg, dict):
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+            else:
+                role = "user"
+                content = str(msg)
+            openai_messages.append({"role": role, "content": content})
+        
+        # Appel API SANS frequency_penalty ni presence_penalty
+        response = await self.client.chat.completions.create(
+            model=self.model,
+            messages=openai_messages,
+            temperature=self.temperature,
+            # IMPORTANT : ne pas envoyer frequency_penalty, presence_penalty, etc.
+        )
+        
+        content = response.choices[0].message.content
+        
+        # Retourner un objet compatible avec LangChain
+        try:
+            from langchain_core.messages import AIMessage
+            return AIMessage(content=content)
+        except ImportError:
+            # Fallback si langchain_core n'est pas disponible
+            class SimpleMessage:
+                def __init__(self, content):
+                    self.content = content
+            return SimpleMessage(content=content)
+
+# ---------------------------------------------------------------------------
+# Chaîne de modèles : Google AI Studio (wrapper custom) + OpenRouter
 # ---------------------------------------------------------------------------
 MODEL_CHAIN = []
 
-# Google AI Studio via endpoint OpenAI-compatible
-# https://ai.google.dev/gemini-api/docs/openai
+# Google AI Studio via wrapper custom (contourne le bug frequency_penalty)
 if GOOGLE_API_KEY:
     for m in [
         "gemini-3.5-flash",     # Le plus rapide
@@ -49,7 +108,8 @@ if GOOGLE_API_KEY:
             "provider": "google_openai",
             "model": m,
             "key": GOOGLE_API_KEY,
-            "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/"
+            "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+            "use_wrapper": True,  # Utiliser notre wrapper custom
         })
 
 # OpenRouter - modèles gratuits à jour (septembre 2026)
@@ -63,7 +123,8 @@ if OPENROUTER_API_KEY:
             "provider": "openrouter",
             "model": m,
             "key": OPENROUTER_API_KEY,
-            "base_url": "https://openrouter.ai/api/v1"
+            "base_url": "https://openrouter.ai/api/v1",
+            "use_wrapper": False,  # Utiliser ChatOpenAI standard
         })
 
 if not MODEL_CHAIN:
@@ -215,7 +276,7 @@ def normalize_report(report: dict, model_name: str) -> dict:
     }
 
 # ---------------------------------------------------------------------------
-# Récupération de la page Playwright (CORRIGÉ pour nouvelle API)
+# Récupération de la page Playwright
 # ---------------------------------------------------------------------------
 async def get_playwright_page(session):
     if session is None:
@@ -249,7 +310,7 @@ async def get_playwright_page(session):
     return None
 
 # ---------------------------------------------------------------------------
-# Screenshot recorder (CORRIGÉ pour nouvelle API Playwright)
+# Screenshot recorder (CORRIGÉ : sans full_page)
 # ---------------------------------------------------------------------------
 async def screenshot_recorder(agent, interval=2.0):
     idx = 0
@@ -270,8 +331,8 @@ async def screenshot_recorder(agent, interval=2.0):
                 continue
             path = os.path.join(SHOTS_DIR, "shot_%04d.png" % idx)
             try:
-                # CORRIGÉ : utiliser bytes() au lieu de path=
-                screenshot_bytes = page.screenshot(full_page=False)
+                # CORRIGÉ : appeler screenshot() SANS arguments (pas de full_page)
+                screenshot_bytes = page.screenshot()
                 if asyncio.iscoroutine(screenshot_bytes):
                     screenshot_bytes = await screenshot_bytes
                 # Écrire les bytes dans le fichier
@@ -329,6 +390,7 @@ async def run_attempt(model_config: dict, task: str):
     model_name = model_config["model"]
     api_key = model_config["key"]
     base_url = model_config["base_url"]
+    use_wrapper = model_config.get("use_wrapper", False)
 
     print("=" * 60)
     print("TENTATIVE - PROVIDER : %s | MODELE : %s" % (provider, model_name))
@@ -338,13 +400,21 @@ async def run_attempt(model_config: dict, task: str):
     recorder_task = None
 
     try:
-        # Utiliser ChatOpenAI pour TOUS les providers (Google et OpenRouter)
-        llm = ChatOpenAI(
-            model=model_name,
-            base_url=base_url,
-            api_key=api_key,
-            temperature=0.0,
-        )
+        # Utiliser le wrapper custom pour Google AI Studio, ChatOpenAI pour OpenRouter
+        if use_wrapper:
+            llm = GoogleGeminiWrapper(
+                model=model_name,
+                api_key=api_key,
+                base_url=base_url,
+                temperature=0.0,
+            )
+        else:
+            llm = ChatOpenAI(
+                model=model_name,
+                base_url=base_url,
+                api_key=api_key,
+                temperature=0.0,
+            )
 
         profile = BrowserProfile(
             headless=True,
@@ -380,7 +450,7 @@ async def run_attempt(model_config: dict, task: str):
 
         print("Cellules totales : %d, reussies : %d" % (len(cells), successful_cells))
         
-        # VALIDATION RENFORCÉE : rejeter si moins de 2 actions réussies
+        # Validation renforcée : minimum 2 actions réussies
         if successful_cells < 2:
             print("ATTENTION : %s n'a effectue seulement %d action(s) reussie(s) - insuffisant" % (model_name, successful_cells))
             return None
