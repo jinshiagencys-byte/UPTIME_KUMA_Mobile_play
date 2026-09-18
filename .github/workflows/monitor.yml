@@ -67,7 +67,7 @@ jobs:
           echo "$SITES" | jq .
 
   # ============================================================
-  # 2. AGENT OPENBROWSER-AI + GEMINI + OPENROUTER
+  # 2. AGENT OPENBROWSER-AI
   # ============================================================
   autospec-test:
     needs: fetch-sites
