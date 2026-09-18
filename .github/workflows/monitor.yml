@@ -74,7 +74,7 @@ jobs:
           echo "$SITES" | jq .
 
   # ============================================================
-  # 2. AGENT OPENBROWSER-AI + OPENROUTER
+  # 2. AGENT OPENBROWSER-AI + OPENROUTER + VIDÉO
   # ============================================================
   autospec-test:
     needs: fetch-sites
@@ -166,6 +166,25 @@ jobs:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: python run_monitor.py
 
+      - name: Lister les vidéos enregistrées
+        if: always()
+        run: |
+          echo "📹 Contenu du dossier recordings :"
+          ls -la recordings/ 2>/dev/null || echo "Aucune vidéo trouvée"
+
+      - name: Convertir les vidéos WebM en MP4
+        if: always()
+        run: |
+          set +e
+          mkdir -p recordings-mp4
+          for f in recordings/*.webm; do
+            [ -f "$f" ] || continue
+            name=$(basename "$f" .webm)
+            echo "🎬 Conversion de $f → recordings-mp4/$name.mp4"
+            ffmpeg -y -i "$f" -c:v libx264 -preset fast -crf 23 "recordings-mp4/$name.mp4" >/dev/null 2>&1
+          done
+          ls -la recordings-mp4/ 2>/dev/null || echo "Aucun MP4 généré"
+
       - name: Afficher le résultat
         if: always()
         run: |
@@ -210,6 +229,7 @@ jobs:
           name: openbrowser-monitoring-${{ matrix.site.id }}
           path: |
             recordings/
+            recordings-mp4/
             output.json
           if-no-files-found: ignore
           retention-days: 7
