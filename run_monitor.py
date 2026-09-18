@@ -1,23 +1,23 @@
 """
 OpenBrowser-AI — Monitoring fonctionnel via OpenRouter.
 
-Optimisations :
-- Modèles rapides et explicites
-- max_steps=15, timeout global 6 min
-- Fermeture explicite de la session browser (flush la vidéo)
-- Prompt directif, sans backticks ni .format()
+Correctifs :
+- Détection dynamique des modèles gratuits (OpenRouter change souvent)
+- Fermeture agressive du playwright context pour flush la vidéo
+- Chemin absolu pour recordings/
 """
 import asyncio
 import json
 import os
 import re
+import urllib.request
 
 from openbrowser import CodeAgent
 from openbrowser.llm import ChatOpenAI
 from openbrowser.browser import BrowserProfile
 
 # ---------------------------------------------------------------------------
-# Variables d'environnement
+# Env
 # ---------------------------------------------------------------------------
 SITE_URL = os.environ["SITE_URL"]
 SITE_ID = os.environ["SITE_ID"]
@@ -25,14 +25,74 @@ SITE_TYPE = os.environ.get("SITE_TYPE", "generic")
 REQUIREMENTS = os.environ["REQUIREMENTS"]
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 
+RECORDINGS_DIR = os.path.abspath("./recordings")
+os.makedirs(RECORDINGS_DIR, exist_ok=True)
+print("Recordings dir : " + RECORDINGS_DIR)
+
 # ---------------------------------------------------------------------------
-# Chaîne de fallback — modèles EXPLICITES et RAPIDES
+# Détection dynamique des modèles gratuits avec tool calling
 # ---------------------------------------------------------------------------
-MODEL_CHAIN = [
-    "qwen/qwen3-8b:free",
+def get_free_models_with_tools() -> list:
+    try:
+        req = urllib.request.Request(
+            "https://openrouter.ai/api/v1/models",
+            headers={"Authorization": "Bearer " + OPENROUTER_API_KEY},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+
+        PREFERRED = [
+            "meta-llama/llama-3.3-70b-instruct:free",
+            "meta-llama/llama-3.1-8b-instruct:free",
+            "google/gemini-2.0-flash-exp:free",
+            "qwen/qwen-2.5-72b-instruct:free",
+            "qwen/qwen-2.5-7b-instruct:free",
+            "deepseek/deepseek-chat:free",
+            "microsoft/phi-3-medium-128k-instruct:free",
+            "mistralai/mistral-7b-instruct:free",
+        ]
+
+        available = []
+        for m in data.get("data", []):
+            mid = m.get("id", "")
+            if not mid.endswith(":free"):
+                continue
+            pricing = m.get("pricing", {})
+            if str(pricing.get("prompt")) not in ("0", "0.0"):
+                continue
+            if str(pricing.get("completion")) not in ("0", "0.0"):
+                continue
+            supported = m.get("supported_parameters", [])
+            if "tools" in supported or "tool_choice" in supported:
+                available.append(mid)
+
+        ordered = [m for m in PREFERRED if m in available]
+        ordered += [m for m in available if m not in PREFERRED]
+
+        if ordered:
+            print("Modeles gratuits disponibles : " + ", ".join(ordered[:8]))
+        else:
+            print("Aucun modele gratuit avec tool calling detecte")
+        return ordered
+
+    except Exception as e:
+        print("Erreur listing modeles : " + str(e))
+        return []
+
+
+STATIC_FALLBACK = [
+    "meta-llama/llama-3.3-70b-instruct:free",
     "meta-llama/llama-3.1-8b-instruct:free",
     "google/gemini-2.0-flash-exp:free",
 ]
+
+_dynamic = get_free_models_with_tools()
+MODEL_CHAIN = (_dynamic if _dynamic else []) + [m for m in STATIC_FALLBACK if m not in _dynamic]
+MODEL_CHAIN = MODEL_CHAIN[:5]
+if not MODEL_CHAIN:
+    MODEL_CHAIN = STATIC_FALLBACK
+
+print("Chaine finale : " + str(MODEL_CHAIN))
 
 # ---------------------------------------------------------------------------
 # Timeouts
@@ -41,56 +101,49 @@ GLOBAL_TIMEOUT_SECONDS = 360
 MAX_STEPS = 15
 
 # ---------------------------------------------------------------------------
-# Prompt système — construit par concaténation, sans .format() ni backticks
+# Prompt système
 # ---------------------------------------------------------------------------
 SYSTEM_PROMPT_TEMPLATE = (
-    "You are a functional QA engineer. Your job is to TEST the web application, "
-    "not just observe it.\n"
+    "You are a functional QA engineer. TEST the web app, do not just observe.\n"
     "\n"
-    "CRITICAL RULES:\n"
-    "1. You MUST perform at least ONE real user interaction and verify its outcome with an assertion.\n"
-    "2. The page loaded is NOT a test. The button exists is NOT a test.\n"
-    "3. A valid test = (a) perform an action, (b) observe the result, (c) assert on the result.\n"
-    "4. Use Python assert statements inside your code. If an assertion fails, the test fails.\n"
-    "5. If you cannot find anything to interact with, that IS a failure - report it.\n"
-    "6. Never conclude looks good without an assertion.\n"
+    "RULES:\n"
+    "1. Perform at least ONE real user interaction and verify with an assertion.\n"
+    "2. Page loaded is NOT a test. Button exists is NOT a test.\n"
+    "3. Valid test = action + observation + assertion.\n"
+    "4. Use Python assert. If assert fails, test fails.\n"
+    "5. If nothing to interact with, that IS a failure.\n"
     "\n"
-    "STRICT STOP CONDITION (VERY IMPORTANT):\n"
-    "- After EXACTLY 8 tool calls maximum, you MUST call done() regardless of what you found.\n"
+    "STRICT STOP CONDITION:\n"
+    "- After 8 tool calls max, call done() no matter what.\n"
     "- Do NOT explore more than 3 pages.\n"
-    "- Do NOT retry the same action twice. If it fails, move on.\n"
-    "- Do NOT scroll repeatedly. Do NOT re-click the same element.\n"
-    "- Partial results are acceptable. It is better to report DOWN with 2 anomalies "
-    "than to keep exploring forever.\n"
-    "- If you have collected 2-3 pieces of evidence, call done() IMMEDIATELY.\n"
+    "- Do NOT retry the same action twice.\n"
+    "- Partial results are OK. Better DOWN with 2 anomalies than infinite exploration.\n"
     "\n"
-    "ANOMALY DETECTION (VERY IMPORTANT):\n"
-    "- Any visible text containing Erreur, Error, Failed, undefined, null, "
-    "0 produit, No results, Aucun produit is a FUNCTIONAL FAILURE.\n"
-    "- A link pointing to /undefined or with undefined in the URL is a FUNCTIONAL FAILURE.\n"
-    "- An empty product listing on a page that should show products is a FUNCTIONAL FAILURE.\n"
-    "- If you find ANY of these, set overall_status to DOWN and describe the anomaly.\n"
+    "ANOMALIES (functional failures):\n"
+    "- Text containing Erreur, Error, Failed, undefined, null, "
+    "0 produit, No results, Aucun produit.\n"
+    "- Link with /undefined in URL.\n"
+    "- Empty product listing on a catalog page.\n"
+    "- If found: overall_status=DOWN and describe in note.\n"
     "\n"
     "REQUIRED INTERACTIONS:\n"
     "__REQUIREMENTS__\n"
     "\n"
-    "FINAL OUTPUT FORMAT (VERY IMPORTANT):\n"
-    "When you are done, you MUST call the done tool with a text parameter containing "
-    "ONLY a valid JSON object, without any markdown around it. The JSON must have:\n"
+    "FINAL OUTPUT:\n"
+    "Call done(text=...) with ONLY a valid JSON object in text:\n"
     "  overall_status: UP or DOWN\n"
     "  site_type: __SITE_TYPE__\n"
-    "  actions_completed: true or false\n"
+    "  actions_completed: true/false\n"
     "  model_used: __MODEL_NAME__\n"
-    "  pages: list of objects with keys url, status (UP/DOWN), http_code, "
-    "action_tested, assertion_passed, note\n"
+    "  pages: [{url, status, http_code, action_tested, assertion_passed, note}]\n"
     "\n"
-    "Your done call must look like this (inside a python code block):\n"
+    "Example done call (inside a python code block):\n"
     "  import json\n"
     "  result = {\"overall_status\": \"DOWN\", \"site_type\": \"__SITE_TYPE__\", "
     "\"actions_completed\": True, \"model_used\": \"__MODEL_NAME__\", "
-    "\"pages\": [{\"url\": \"__SITE_URL__\", \"status\": \"DOWN\", \"http_code\": 200, "
-    "\"action_tested\": \"searched products\", \"assertion_passed\": False, "
-    "\"note\": \"0 produit trouve\"}]}\n"
+    "\"pages\": [{\"url\": \"__SITE_URL__\", \"status\": \"DOWN\", "
+    "\"http_code\": 200, \"action_tested\": \"search\", "
+    "\"assertion_passed\": False, \"note\": \"0 produit trouve\"}]}\n"
     "  await done(text=json.dumps(result, ensure_ascii=False), success=True)\n"
 )
 
@@ -106,9 +159,9 @@ def build_system_prompt(model_name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Extraction JSON
+# JSON helpers
 # ---------------------------------------------------------------------------
-def extract_json_from_text(text: str) -> dict | None:
+def extract_json_from_text(text: str):
     if not text:
         return None
     match = re.search(r"\{.*\}", text, re.DOTALL)
@@ -127,20 +180,16 @@ def extract_json_from_text(text: str) -> dict | None:
 
 def extract_final_result(result) -> str:
     cells = getattr(result, "cells", None) or getattr(result, "history", None) or []
-
-    # 1. Dernier done() exploitable
     for cell in reversed(list(cells)):
         source = getattr(cell, "source", "") or ""
         if "done(" not in source:
             continue
-
         match = re.search(
             r"done\s*\(\s*text\s*=\s*['\"](.+?)['\"]\s*,\s*success",
             source, re.DOTALL,
         )
         if match:
             return match.group(1)
-
         match = re.search(
             r"done\s*\(\s*text\s*=\s*json\.dumps\(\s*([a-zA-Z_][a-zA-Z0-9_]*)",
             source, re.DOTALL,
@@ -150,15 +199,11 @@ def extract_final_result(result) -> str:
             if output.strip():
                 return output
             return source
-
-    # 2. Dernier output qui ressemble à du JSON exploitable
     for cell in reversed(list(cells)):
         output = getattr(cell, "output", "") or ""
         if ('"url"' in output or '"overall_status"' in output
-                or '"anomalies"' in output or '"countText"' in output
-                or '"emptyText"' in output):
+                or '"anomalies"' in output or '"countText"' in output):
             return output
-
     return str(result)
 
 
@@ -166,26 +211,21 @@ def normalize_report(report: dict, model_name: str) -> dict:
     if "overall_status" in report and "pages" in report:
         report["model_used"] = model_name
         return report
-
     text_blob = json.dumps(report, ensure_ascii=False).lower()
     has_anomaly = any(
         kw in text_blob
-        for kw in ["erreur", "error", "undefined", "0 produit", "aucun produit",
-                   "no results", "aucun résultat", "anomalies_detected"]
+        for kw in ["erreur", "error", "undefined", "0 produit",
+                   "aucun produit", "no results", "anomalies_detected"]
     )
     status = "DOWN" if has_anomaly else "UP"
-
-    pages = [
-        {
-            "url": report.get("url", SITE_URL),
-            "status": status,
-            "http_code": None,
-            "action_tested": "exploration et assertions par l'agent",
-            "assertion_passed": not has_anomaly,
-            "note": report.get("done_summary") or report.get("message") or "Vérification effectuée",
-        }
-    ]
-
+    pages = [{
+        "url": report.get("url", SITE_URL),
+        "status": status,
+        "http_code": None,
+        "action_tested": "exploration",
+        "assertion_passed": not has_anomaly,
+        "note": report.get("done_summary") or report.get("message") or "Verification effectuee",
+    }]
     return {
         "overall_status": status,
         "site_type": report.get("site_type", SITE_TYPE),
@@ -196,39 +236,75 @@ def normalize_report(report: dict, model_name: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Fermeture explicite de la session browser — flush la vidéo sur disque
+# Fermeture agressive de la session browser
 # ---------------------------------------------------------------------------
 async def close_agent_session(agent) -> None:
     if agent is None:
+        print("Agent None, rien a fermer")
         return
 
-    for attr_name in ("browser_session", "browser", "session", "browser_context"):
-        try:
-            session = getattr(agent, attr_name, None)
-            if session is None:
+    session = None
+    for attr_name in ("browser_session", "browser", "session"):
+        session = getattr(agent, attr_name, None)
+        if session is not None:
+            print("Session trouvee via agent." + attr_name)
+            break
+
+    if session is None:
+        print("Aucune session trouvee")
+        return
+
+    # 1. Fermer le playwright context en priorite (c'est lui qui flush la video)
+    for ctx_attr in ("browser_context", "context", "_browser_context",
+                     "_context", "playwright_context",
+                     "playwright_browser_context"):
+        ctx = getattr(session, ctx_attr, None)
+        if ctx is None:
+            continue
+        for close_method in ("close", "shutdown"):
+            if not hasattr(ctx, close_method):
                 continue
-            if hasattr(session, "close"):
-                result = session.close()
-                if asyncio.iscoroutine(result):
-                    await result
-                print("Session fermee via agent." + attr_name)
-                return
-            if hasattr(session, "stop"):
-                result = session.stop()
-                if asyncio.iscoroutine(result):
-                    await result
-                print("Session arretee via agent." + attr_name + ".stop()")
-                return
+            try:
+                r = getattr(ctx, close_method)()
+                if asyncio.iscoroutine(r):
+                    await r
+                print("Context ferme via session." + ctx_attr + "." + close_method + "()")
+                break
+            except Exception as e:
+                print("Echec " + ctx_attr + "." + close_method + " : " + str(e))
+
+    # 2. Fermer la session elle-meme
+    for method_name in ("close", "stop", "kill", "shutdown", "cleanup"):
+        if not hasattr(session, method_name):
+            continue
+        try:
+            r = getattr(session, method_name)()
+            if asyncio.iscoroutine(r):
+                await r
+            print("Session fermee via " + method_name + "()")
+            break
         except Exception as e:
-            print("Echec fermeture via " + attr_name + " : " + str(e))
+            print("Echec session." + method_name + "() : " + str(e))
 
-    print("Aucun attribut de session trouve pour fermeture explicite")
+    # 3. Attendre le flush ffmpeg
+    print("Attente flush video (3s)...")
+    await asyncio.sleep(3)
+
+    # 4. Verifier ce qui a ete ecrit
+    try:
+        files = os.listdir(RECORDINGS_DIR)
+        if files:
+            print("Videos dans recordings/ : " + str(files))
+        else:
+            print("Aucune video dans recordings/ apres fermeture")
+    except Exception as e:
+        print("Impossible de lister recordings/ : " + str(e))
 
 
 # ---------------------------------------------------------------------------
-# Tentative d'exécution
+# Tentative
 # ---------------------------------------------------------------------------
-async def run_attempt(model_name: str, task: str) -> dict | None:
+async def run_attempt(model_name: str, task: str):
     print("=" * 60)
     print("TENTATIVE - MODELE : " + model_name)
     print("=" * 60)
@@ -246,7 +322,7 @@ async def run_attempt(model_name: str, task: str) -> dict | None:
             headless=True,
             viewport_width=1280,
             viewport_height=720,
-            record_video_dir="./recordings",
+            record_video_dir=RECORDINGS_DIR,
             record_video_size={"width": 1280, "height": 720},
         )
 
@@ -258,70 +334,60 @@ async def run_attempt(model_name: str, task: str) -> dict | None:
             extend_system_message=build_system_prompt(model_name),
         )
 
-        # Timeout global
         try:
             result = await asyncio.wait_for(agent.run(), timeout=GLOBAL_TIMEOUT_SECONDS)
         except asyncio.TimeoutError:
-            print("Timeout global (" + str(GLOBAL_TIMEOUT_SECONDS) + "s) pour " + model_name)
+            print("Timeout global pour " + model_name)
             return None
 
         final_text = extract_final_result(result)
-        print("Resultat final extrait (" + model_name + ") :")
+        print("Resultat extrait (" + model_name + ") :")
         print(final_text[:1000])
 
         report = extract_json_from_text(final_text)
         if report:
-            normalized = normalize_report(report, model_name)
-            print("JSON valide extrait pour " + model_name)
-            return normalized
+            return normalize_report(report, model_name)
 
-        # Fallback propre
-        print("Pas de JSON valide, rapport reconstruit pour " + model_name)
+        # Fallback
         text_lower = final_text.lower()
         has_anomaly = any(
             kw in text_lower
-            for kw in ["erreur", "error", "undefined", "0 produit", "no results",
-                       "aucun résultat", "aucun produit", "anomalies_detected"]
+            for kw in ["erreur", "error", "undefined", "0 produit",
+                       "no results", "aucun produit", "anomalies_detected"]
         )
-
         anomalies = []
         if "erreur lors du chargement des sliders" in text_lower:
             anomalies.append("carrousel casse")
         if "erreur lors du chargement des marques" in text_lower:
             anomalies.append("marques non chargees")
         if '"alt": "undefined"' in text_lower or "alt='undefined'" in text_lower:
-            anomalies.append("image avec alt=undefined")
+            anomalies.append("image alt=undefined")
         if "/detail-produit/undefined" in text_lower:
             anomalies.append("lien produit casse")
         if "0 produit trouvé" in text_lower or "0 produits" in text_lower:
-            anomalies.append("catalogue produits vide")
+            anomalies.append("catalogue vide")
 
-        if anomalies:
-            clean_note = "Anomalies detectees : " + ", ".join(anomalies) + "."
-        else:
-            clean_note = "Exploration automatique par l'agent."
+        clean_note = ("Anomalies detectees : " + ", ".join(anomalies) + ".") if anomalies \
+            else "Exploration automatique par l'agent."
 
         return {
             "overall_status": "DOWN" if has_anomaly else "UP",
             "site_type": SITE_TYPE,
             "actions_completed": True,
             "model_used": model_name,
-            "pages": [
-                {
-                    "url": SITE_URL,
-                    "status": "DOWN" if has_anomaly else "UP",
-                    "http_code": None,
-                    "action_tested": "exploration et assertions par l'agent",
-                    "assertion_passed": not has_anomaly,
-                    "note": clean_note,
-                }
-            ],
+            "pages": [{
+                "url": SITE_URL,
+                "status": "DOWN" if has_anomaly else "UP",
+                "http_code": None,
+                "action_tested": "exploration et assertions par l'agent",
+                "assertion_passed": not has_anomaly,
+                "note": clean_note,
+            }],
         }
 
     except Exception as err:
         print("Echec avec " + model_name + " : " + str(err))
         return None
-
     finally:
         await close_agent_session(agent)
 
@@ -332,12 +398,11 @@ async def run_attempt(model_name: str, task: str) -> dict | None:
 async def main() -> None:
     task = (
         "Navigate to " + SITE_URL + ". "
-        "Execute the required interactions described in the system message. "
+        "Execute the required interactions. "
         "Use Python assertions to verify outcomes. "
-        "Detect any anomalies (errors, undefined, empty listings). "
-        "HARD LIMIT: 8 tool calls maximum, then call done() immediately. "
-        "If you haven't found anything after 5 tool calls, report the status based on what you have. "
-        "When done, call the done tool with a text parameter containing ONLY a valid JSON object."
+        "Detect anomalies (errors, undefined, empty listings). "
+        "HARD LIMIT: 8 tool calls max, then call done() immediately. "
+        "When done, call done with a text parameter containing ONLY valid JSON."
     )
 
     final_report = None
@@ -354,7 +419,7 @@ async def main() -> None:
             "actions_completed": False,
             "model_used": None,
             "pages": [],
-            "error": "Tous les modeles OpenRouter ont echoue ou timeout.",
+            "error": "Tous les modeles ont echoue ou timeout.",
         }
 
     output_path = os.path.join(os.getcwd(), "output.json")
