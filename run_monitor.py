@@ -1,6 +1,6 @@
 """
 OpenBrowser-AI — Monitoring fonctionnel.
-Priorité : Google AI Studio (Gemini 3.x, gratuit, vision + tool calling)
+Priorité : Google AI Studio (Gemini 3.x via endpoint OpenAI-compatible)
 Fallback : OpenRouter (Gemma 3, Qwen-VL, Llama)
 Screenshots + timelapse MP4 pour preuve visuelle
 Passe au modèle suivant si 0 action réussie
@@ -14,12 +14,6 @@ import urllib.request
 from openbrowser import CodeAgent
 from openbrowser.llm import ChatOpenAI
 from openbrowser.browser import BrowserProfile
-
-try:
-    from langchain_google_genai import ChatGoogleGenerativeAI
-    HAS_GOOGLE = True
-except ImportError:
-    HAS_GOOGLE = False
 
 # ---------------------------------------------------------------------------
 # Env
@@ -37,22 +31,28 @@ os.makedirs(SHOTS_DIR, exist_ok=True)
 
 print("Recordings dir : " + RECORDINGS_DIR)
 print("Shots dir      : " + SHOTS_DIR)
-print("Google AI Studio key : " + str(bool(GOOGLE_API_KEY) and HAS_GOOGLE))
+print("Google AI Studio key : " + str(bool(GOOGLE_API_KEY)))
 print("OpenRouter key       : " + str(bool(OPENROUTER_API_KEY)))
 
 # ---------------------------------------------------------------------------
-# Chaîne de modèles : Gemini AI Studio d'abord, puis OpenRouter
+# Chaîne de modèles : Gemini AI Studio d'abord (via endpoint OpenAI), puis OpenRouter
 # ---------------------------------------------------------------------------
 MODEL_CHAIN = []
 
-if GOOGLE_API_KEY and HAS_GOOGLE:
-    # Modèles Google AI Studio gratuits et à jour (Septembre 2026)
+# Google AI Studio via OpenAI-compatible endpoint
+# https://ai.google.dev/gemini-api/docs/openai
+if GOOGLE_API_KEY:
     for m in [
         "gemini-3.5-flash",     # Le plus rapide, idéal pour le tool-calling
         "gemini-3.6-flash",     # Fallback avec plus de contexte
         "gemini-2.5-pro",       # Pour les sites complexes nécessitant plus de raisonnement
     ]:
-        MODEL_CHAIN.append({"provider": "google", "model": m, "key": GOOGLE_API_KEY})
+        MODEL_CHAIN.append({
+            "provider": "google_openai",
+            "model": m,
+            "key": GOOGLE_API_KEY,
+            "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/"
+        })
 
 if OPENROUTER_API_KEY:
     # Modèles open-source gratuits sur OpenRouter
@@ -61,7 +61,12 @@ if OPENROUTER_API_KEY:
         "qwen/qwen-2.5-vl-7b-instruct:free",
         "meta-llama/llama-3.3-70b-instruct:free",
     ]:
-        MODEL_CHAIN.append({"provider": "openrouter", "model": m, "key": OPENROUTER_API_KEY})
+        MODEL_CHAIN.append({
+            "provider": "openrouter",
+            "model": m,
+            "key": OPENROUTER_API_KEY,
+            "base_url": "https://openrouter.ai/api/v1"
+        })
 
 if not MODEL_CHAIN:
     print("ERREUR : aucune cle API disponible. Abandon.")
@@ -319,6 +324,7 @@ async def run_attempt(model_config: dict, task: str):
     provider = model_config["provider"]
     model_name = model_config["model"]
     api_key = model_config["key"]
+    base_url = model_config["base_url"]
 
     print("=" * 60)
     print("TENTATIVE - PROVIDER : %s | MODELE : %s" % (provider, model_name))
@@ -328,19 +334,14 @@ async def run_attempt(model_config: dict, task: str):
     recorder_task = None
 
     try:
-        if provider == "google":
-            llm = ChatGoogleGenerativeAI(
-                model=model_name,
-                google_api_key=api_key,
-                temperature=0.0,
-            )
-        else:
-            llm = ChatOpenAI(
-                model=model_name,
-                base_url="https://openrouter.ai/api/v1",
-                api_key=api_key,
-                temperature=0.0,
-            )
+        # Utiliser ChatOpenAI pour TOUS les providers (Google et OpenRouter)
+        # Google AI Studio expose un endpoint compatible OpenAI
+        llm = ChatOpenAI(
+            model=model_name,
+            base_url=base_url,
+            api_key=api_key,
+            temperature=0.0,
+        )
 
         profile = BrowserProfile(
             headless=True,
