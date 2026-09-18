@@ -1,4 +1,4 @@
-name: AutoSpec Agent - Monitoring Autonome Multi-Sites
+name: AutoSpec Agent - Monitoring Autonome Multi-Sites (OpenBrowser-AI)
 
 on:
   workflow_dispatch:
@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   # ============================================================
-  # 1. RÉCUPÉRER LES SITES (identique aux workflows précédents)
+  # 1. RÉCUPÉRER LES SITES (inchangé)
   # ============================================================
   fetch-sites:
     runs-on: ubuntu-latest
@@ -71,13 +71,13 @@ jobs:
           echo "$SITES" | jq .
 
   # ============================================================
-  # 2. AGENT AUTOSPEC
+  # 2. AGENT OPENBROWSER-AI
   # ============================================================
   autospec-test:
     needs: fetch-sites
     if: needs.fetch-sites.outputs.sites != '[]'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     concurrency:
       group: autospec-check-${{ matrix.site.id }}
       cancel-in-progress: false
@@ -91,208 +91,76 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # autospecai requires Node >= 22
-      - name: Installer Node.js 22
-        uses: actions/setup-node@v4
+      - name: Installer Python 3.11
+        uses: actions/setup-python@v5
         with:
-          node-version: "22"
+          python-version: "3.11"
 
-      - name: Installer autospecai + Playwright Chromium
+      - name: Installer OpenBrowser-AI + ffmpeg
         run: |
           set -euo pipefail
-          mkdir -p autospec-runner && cd autospec-runner
-          npm init -y --silent > /dev/null
-          npm install autospecai --silent
-          npx playwright install --with-deps chromium
+          pip install --quiet "openbrowser-ai[agent,video]"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
 
-      # Le wrapper gère : specs par page connue, chaîne de fallback modèle
-      # (coût croissant), récupération HTTP code, et traduction vers le
-      # schéma JSON attendu par le relay SentinelSite.
-      - name: Générer le wrapper run-autospec.mjs
-        working-directory: autospec-runner
+      - name: Détecter le type de site (zéro token)
+        id: detect
+        shell: bash
         run: |
-          cat > run-autospec.mjs <<'NODEJS'
-          // (voir /home/claude/run-autospec.mjs pour la version commentée en détail)
-          import { main as runAutospec } from "autospecai";
-          import fs from "fs";
+          set -euo pipefail
+          URL="${{ matrix.site.url }}"
+          HTML=$(curl -fsSL --max-time 15 "$URL" 2>/dev/null || echo "")
 
-          const SITE_URL = process.env.SITE_URL;
-          const SITE_ID = process.env.SITE_ID;
+          if echo "$HTML" | grep -qiE '(marketplace|vendeur|seller|multi-vendor|boutique)'; then
+            TYPE="marketplace"
+          elif echo "$HTML" | grep -qiE '(panier|cart|checkout|prix|price|produit|product|acheter|buy)'; then
+            TYPE="ecommerce"
+          elif echo "$HTML" | grep -qiE '(login|connexion|dashboard|subscription|abonnement|pricing|tarif|sign.up|inscription)'; then
+            TYPE="saas"
+          elif echo "$HTML" | grep -qiE '(blog|article|post|actualite|news)'; then
+            TYPE="blog"
+          else
+            TYPE="generic"
+          fi
 
-          if (!SITE_URL || !SITE_ID) {
-            console.error("SITE_URL and SITE_ID are required.");
-            process.exit(1);
-          }
+          echo "TYPE=$TYPE" >> "$GITHUB_OUTPUT"
+          echo "🔎 Type détecté : $TYPE"
 
-          let pages = [];
-          try { pages = JSON.parse(process.env.PAGES_JSON || "[]"); } catch { pages = []; }
+      - name: Générer le prompt adaptatif (zéro token)
+        id: prompt
+        shell: bash
+        run: |
+          TYPE="${{ steps.detect.outputs.TYPE }}"
+          case "$TYPE" in
+            marketplace)
+              REQUIREMENTS="1. Type a product name in the search bar and click Search. Assert that result items appear. 2. Apply a filter (price or category). Assert that results change. 3. Click the first product. Assert that a product detail page loads."
+              ;;
+            ecommerce)
+              REQUIREMENTS="1. Find a product listing. Assert that price and availability are visible. 2. Click 'Add to Cart'. Assert that the cart icon/count updates. 3. Open the cart. Assert the product is there."
+              ;;
+            saas)
+              REQUIREMENTS="1. Locate the login form. Fill it with fake credentials (test+ci-${GITHUB_RUN_ID}@example.com). Submit. Assert that either a dashboard loads or a clear error message appears (not a blank page). 2. Find a contact form. Fill with 'TEST AUTOMATISÉ'. Submit. Assert a success message."
+              ;;
+            blog)
+              REQUIREMENTS="1. Assert that at least 3 articles are listed with titles and dates. 2. Click the first article. Assert that the full content loads (more than 500 characters) and a publication date is visible."
+              ;;
+            *)
+              REQUIREMENTS="1. Assert the page title is not empty and not a default placeholder ('It works!', 'Index of /', etc.). 2. Find a clickable link, click it, and assert that the URL changes or the content updates."
+              ;;
+          esac
 
-          const knownUrls = pages.map((p) => p.url).filter(Boolean);
-          if (!knownUrls.includes(SITE_URL)) {
-            pages = [{ url: SITE_URL, name: "Accueil" }, ...pages];
-          }
+          echo "REQUIREMENTS<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$REQUIREMENTS" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
 
-          const MODEL_CHAIN = [
-            { model: "gemini-2.5-flash", apiKey: process.env.GOOGLE_API_KEY },
-            { model: "claude-opus-4-6", apiKey: process.env.ANTHROPIC_API_KEY },
-            { model: "gpt-5.4", apiKey: process.env.OPENAI_API_KEY },
-          ];
-
-          function isTemporaryError(err) {
-            const s = String(err).toLowerCase();
-            return /503|rate limit|429|too many requests|timeout|overloaded|internal server error|500|502|504/.test(s);
-          }
-
-          function buildSpec(pageUrl) {
-            return `Navigate to ${pageUrl}. ` +
-              `Check that the content genuinely matches the expected site, and is NOT ` +
-              `a hosting/registrar placeholder page, a domain parking page, a default ` +
-              `"It works!" page, or a DNS/SSL error page. ` +
-              `If the page has sections that should be filled with backend data ` +
-              `(product listings, search results, a user profile, prices, a cart, ` +
-              `etc.), verify that data actually appears — if those sections stay ` +
-              `empty, stuck loading, or show "undefined"/"null" placeholders, treat ` +
-              `this as a functional failure even if the page itself loaded. ` +
-              `If there is an obviously testable interactive element on this specific ` +
-              `page (add to cart, submit a contact form using "TEST AUTOMATISÉ" as the ` +
-              `message, run a search, or a signup/login using fake data such as ` +
-              `test+ci-${Date.now()}@example.com — never a real account), perform that ` +
-              `one action and verify its real result before concluding. ` +
-              `A button merely existing is not proof a feature works — you must click ` +
-              `it and observe the outcome. ` +
-              `Call mark_complete with your verdict once you've actually checked.`;
-          }
-
-          async function getHttpCode(url) {
-            try {
-              const res = await fetch(url, { method: "GET", redirect: "follow", signal: AbortSignal.timeout(15000) });
-              return res.status;
-            } catch { return null; }
-          }
-
-          async function runAttempt({ model, apiKey }, specFilePath) {
-            console.log("======================================");
-            console.log(`🤖 TENTATIVE — MODÈLE : ${model}`);
-            console.log("======================================");
-            if (!apiKey) {
-              console.log(`⚠️ Pas de clé API pour ${model}, modèle sauté.`);
-              return { ok: false, temporary: false };
-            }
-            try {
-              const { testResults } = await runAutospec({
-                testUrl: SITE_URL,
-                modelName: model,
-                apiKey,
-                specFile: specFilePath,
-                trajectoriesPath: "./trajectories",
-                recordVideo: true,
-              });
-              if (!testResults || testResults.length === 0) {
-                console.log(`⚠️ ${model} n'a produit aucun résultat exploitable.`);
-                return { ok: false, temporary: false };
-              }
-              return { ok: true, testResults };
-            } catch (err) {
-              console.log(`❌ Échec avec ${model} : ${err}`);
-              return { ok: false, temporary: isTemporaryError(err) };
-            }
-          }
-
-          async function main() {
-            const specs = pages.map((p) => buildSpec(p.url));
-            const specFilePath = "./specs.json";
-            fs.writeFileSync(specFilePath, JSON.stringify(specs, null, 2), "utf-8");
-
-            console.log("Site :", SITE_URL);
-            console.log("Pages à vérifier :", pages.map((p) => p.url).join(", "));
-
-            let finalResults = null;
-            let winningModel = null;
-
-            for (const candidate of MODEL_CHAIN) {
-              const MAX_RETRIES = 2;
-              let attempt = { ok: false, temporary: false };
-              for (let i = 0; i <= MAX_RETRIES; i++) {
-                attempt = await runAttempt(candidate, specFilePath);
-                if (attempt.ok) break;
-                if (!attempt.temporary) break;
-                const delay = Math.min(30, 2 ** i * 2);
-                console.log(`⏳ Erreur temporaire, nouvel essai dans ${delay}s...`);
-                await new Promise((r) => setTimeout(r, delay * 1000));
-              }
-              if (attempt.ok) {
-                finalResults = attempt.testResults;
-                winningModel = candidate.model;
-                break;
-              }
-            }
-
-            const httpCodes = await Promise.all(pages.map((p) => getHttpCode(p.url)));
-
-            let pagesReport, overallStatus, actionsCompleted;
-
-            if (finalResults) {
-              pagesReport = pages.map((p, i) => {
-                const r = finalResults[i];
-                const status = r?.status === "passed" ? "UP" : "DOWN";
-                return {
-                  url: p.url,
-                  status,
-                  http_code: httpCodes[i],
-                  action_tested: r ? (r.actions?.map((a) => a.tool).join(" → ") || "navigation") : "non testé (résultat manquant)",
-                  note: r?.reason || (status === "UP" ? "OK" : "Voir vidéo/trace pour détail"),
-                };
-              });
-              overallStatus = pagesReport.some((p) => p.status === "DOWN") ? "DOWN" : "UP";
-              actionsCompleted = true;
-            } else {
-              pagesReport = pages.map((p, i) => ({
-                url: p.url,
-                status: httpCodes[i] && httpCodes[i] < 400 ? "UP" : "DOWN",
-                http_code: httpCodes[i],
-                action_tested: null,
-                note: "⚠️ Tous les modèles IA ont échoué — statut basé sur un simple code HTTP, aucune vérification fonctionnelle réelle.",
-              }));
-              overallStatus = pagesReport.some((p) => p.status === "DOWN") ? "DOWN" : "UP";
-              actionsCompleted = false;
-            }
-
-            const output = {
-              overall_status: overallStatus,
-              site_type: "non_detecte",
-              actions_completed: actionsCompleted,
-              model_used: winningModel,
-              pages: pagesReport,
-            };
-
-            fs.writeFileSync("../output.json", JSON.stringify(output, null, 2), "utf-8");
-            console.log("\n=== output.json ===");
-            console.log(JSON.stringify(output, null, 2));
-          }
-
-          main().catch((err) => {
-            console.error("Erreur fatale :", err);
-            fs.writeFileSync("../output.json", JSON.stringify({
-              overall_status: "ERROR",
-              site_type: "non_detecte",
-              actions_completed: false,
-              pages: [],
-              error: String(err),
-            }, null, 2), "utf-8");
-            process.exit(0);
-          });
-          NODEJS
-
-      - name: Exécuter AutoSpec
-        working-directory: autospec-runner
+      - name: Exécuter le monitoring fonctionnel
         env:
-          SITE_ID: ${{ matrix.site.id }}
           SITE_URL: ${{ matrix.site.url }}
-          PAGES_JSON: ${{ toJson(matrix.site.pages) }}
-          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        run: node run-autospec.mjs
+          SITE_ID: ${{ matrix.site.id }}
+          SITE_TYPE: ${{ steps.detect.outputs.TYPE }}
+          REQUIREMENTS: ${{ steps.prompt.outputs.REQUIREMENTS }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: python run_monitor.py
 
       - name: Afficher le résultat
         if: always()
@@ -322,7 +190,7 @@ jobs:
           RELAY_URL: ${{ secrets.RELAY_URL }}
         run: |
           set +e
-          STATUS="ERROR"; MESSAGE="AutoSpec execution error"
+          STATUS="ERROR"; MESSAGE="OpenBrowser-AI execution error"
           if [ -f output.json ]; then
             STATUS=$(jq -r '.overall_status // "ERROR"' output.json | tr '[:lower:]' '[:upper:]')
             MESSAGE=$(jq -c '{actions_completed, model_used, pages}' output.json)
@@ -331,14 +199,13 @@ jobs:
           curl -sS --retry 3 --retry-delay 2 -X POST "$RELAY_URL/sites/$SITE_ID/mark-crawled" \
             -H "x-relay-secret: $RELAY_SECRET" -H "Content-Type: application/json" -d @status_payload.json
 
-      - name: Uploader les artifacts (vidéos, traces, specs générées)
+      - name: Uploader les artifacts (vidéos, rapport)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: autospec-monitoring-${{ matrix.site.id }}
+          name: openbrowser-monitoring-${{ matrix.site.id }}
           path: |
-            autospec-runner/trajectories/
-            autospec-runner/output.json
-            autospec-runner/specs.json
+            recordings/
+            output.json
           if-no-files-found: ignore
           retention-days: 7
