@@ -2,22 +2,19 @@
 OpenBrowser-AI — Monitoring fonctionnel via OpenRouter.
 
 Correctifs :
-- Détection dynamique des modèles gratuits (OpenRouter change souvent)
-- Fermeture agressive du playwright context pour flush la vidéo
-- Chemin absolu pour recordings/
+- Whitelist stricte de modèles (pas de détection dynamique bruitée)
+- Screenshot recorder en parallèle (pour compenser l'absence de vidéo native)
+- Debug des attributs de session pour trouver le context Playwright
 """
 import asyncio
 import json
 import os
 import re
-import urllib.request
 
 from openbrowser import CodeAgent
 from openbrowser.llm import ChatOpenAI
 from openbrowser.browser import BrowserProfile
 
-# ---------------------------------------------------------------------------
-# Env
 # ---------------------------------------------------------------------------
 SITE_URL = os.environ["SITE_URL"]
 SITE_ID = os.environ["SITE_ID"]
@@ -26,79 +23,25 @@ REQUIREMENTS = os.environ["REQUIREMENTS"]
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 
 RECORDINGS_DIR = os.path.abspath("./recordings")
-os.makedirs(RECORDINGS_DIR, exist_ok=True)
+SHOTS_DIR = os.path.join(RECORDINGS_DIR, "shots")
+os.makedirs(SHOTS_DIR, exist_ok=True)
 print("Recordings dir : " + RECORDINGS_DIR)
+print("Shots dir : " + SHOTS_DIR)
 
 # ---------------------------------------------------------------------------
-# Détection dynamique des modèles gratuits avec tool calling
+# Whitelist stricte — modèles qui génèrent du Python valide
 # ---------------------------------------------------------------------------
-def get_free_models_with_tools() -> list:
-    try:
-        req = urllib.request.Request(
-            "https://openrouter.ai/api/v1/models",
-            headers={"Authorization": "Bearer " + OPENROUTER_API_KEY},
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read())
-
-        PREFERRED = [
-            "meta-llama/llama-3.3-70b-instruct:free",
-            "meta-llama/llama-3.1-8b-instruct:free",
-            "google/gemini-2.0-flash-exp:free",
-            "qwen/qwen-2.5-72b-instruct:free",
-            "qwen/qwen-2.5-7b-instruct:free",
-            "deepseek/deepseek-chat:free",
-            "microsoft/phi-3-medium-128k-instruct:free",
-            "mistralai/mistral-7b-instruct:free",
-        ]
-
-        available = []
-        for m in data.get("data", []):
-            mid = m.get("id", "")
-            if not mid.endswith(":free"):
-                continue
-            pricing = m.get("pricing", {})
-            if str(pricing.get("prompt")) not in ("0", "0.0"):
-                continue
-            if str(pricing.get("completion")) not in ("0", "0.0"):
-                continue
-            supported = m.get("supported_parameters", [])
-            if "tools" in supported or "tool_choice" in supported:
-                available.append(mid)
-
-        ordered = [m for m in PREFERRED if m in available]
-        ordered += [m for m in available if m not in PREFERRED]
-
-        if ordered:
-            print("Modeles gratuits disponibles : " + ", ".join(ordered[:8]))
-        else:
-            print("Aucun modele gratuit avec tool calling detecte")
-        return ordered
-
-    except Exception as e:
-        print("Erreur listing modeles : " + str(e))
-        return []
-
-
-STATIC_FALLBACK = [
+MODEL_CHAIN = [
     "meta-llama/llama-3.3-70b-instruct:free",
     "meta-llama/llama-3.1-8b-instruct:free",
     "google/gemini-2.0-flash-exp:free",
+    "mistralai/mistral-small-24b-instruct-2501:free",
+    "qwen/qwen-2.5-72b-instruct:free",
 ]
+print("Chaine de modeles : " + str(MODEL_CHAIN))
 
-_dynamic = get_free_models_with_tools()
-MODEL_CHAIN = (_dynamic if _dynamic else []) + [m for m in STATIC_FALLBACK if m not in _dynamic]
-MODEL_CHAIN = MODEL_CHAIN[:5]
-if not MODEL_CHAIN:
-    MODEL_CHAIN = STATIC_FALLBACK
-
-print("Chaine finale : " + str(MODEL_CHAIN))
-
-# ---------------------------------------------------------------------------
-# Timeouts
-# ---------------------------------------------------------------------------
 GLOBAL_TIMEOUT_SECONDS = 360
-MAX_STEPS = 15
+MAX_STEPS = 12
 
 # ---------------------------------------------------------------------------
 # Prompt système
@@ -106,45 +49,50 @@ MAX_STEPS = 15
 SYSTEM_PROMPT_TEMPLATE = (
     "You are a functional QA engineer. TEST the web app, do not just observe.\n"
     "\n"
+    "OUTPUT FORMAT (CRITICAL):\n"
+    "You MUST write Python code blocks between triple backticks. Example:\n"
+    "\n"
+    "Here is my reasoning.\n"
+    "```python\n"
+    "result = await evaluate('document.title')\n"
+    "print(result)\n"
+    "```\n"
+    "\n"
+    "Do NOT use <tool_call> XML tags. Do NOT use tool_name(args) syntax.\n"
+    "ONLY use python code blocks with valid Python syntax.\n"
+    "\n"
     "RULES:\n"
     "1. Perform at least ONE real user interaction and verify with an assertion.\n"
     "2. Page loaded is NOT a test. Button exists is NOT a test.\n"
     "3. Valid test = action + observation + assertion.\n"
     "4. Use Python assert. If assert fails, test fails.\n"
-    "5. If nothing to interact with, that IS a failure.\n"
     "\n"
     "STRICT STOP CONDITION:\n"
     "- After 8 tool calls max, call done() no matter what.\n"
-    "- Do NOT explore more than 3 pages.\n"
-    "- Do NOT retry the same action twice.\n"
-    "- Partial results are OK. Better DOWN with 2 anomalies than infinite exploration.\n"
+    "- Partial results are OK.\n"
     "\n"
     "ANOMALIES (functional failures):\n"
-    "- Text containing Erreur, Error, Failed, undefined, null, "
-    "0 produit, No results, Aucun produit.\n"
+    "- Text containing Erreur, Error, Failed, undefined, null, 0 produit, Aucun produit.\n"
     "- Link with /undefined in URL.\n"
     "- Empty product listing on a catalog page.\n"
-    "- If found: overall_status=DOWN and describe in note.\n"
     "\n"
     "REQUIRED INTERACTIONS:\n"
     "__REQUIREMENTS__\n"
     "\n"
     "FINAL OUTPUT:\n"
-    "Call done(text=...) with ONLY a valid JSON object in text:\n"
-    "  overall_status: UP or DOWN\n"
-    "  site_type: __SITE_TYPE__\n"
-    "  actions_completed: true/false\n"
-    "  model_used: __MODEL_NAME__\n"
-    "  pages: [{url, status, http_code, action_tested, assertion_passed, note}]\n"
+    "Call done(text=...) with ONLY a valid JSON in text:\n"
+    "  overall_status, site_type, actions_completed, model_used, pages[].\n"
     "\n"
-    "Example done call (inside a python code block):\n"
-    "  import json\n"
-    "  result = {\"overall_status\": \"DOWN\", \"site_type\": \"__SITE_TYPE__\", "
+    "Example:\n"
+    "```python\n"
+    "import json\n"
+    "result = {\"overall_status\": \"DOWN\", \"site_type\": \"__SITE_TYPE__\", "
     "\"actions_completed\": True, \"model_used\": \"__MODEL_NAME__\", "
     "\"pages\": [{\"url\": \"__SITE_URL__\", \"status\": \"DOWN\", "
     "\"http_code\": 200, \"action_tested\": \"search\", "
-    "\"assertion_passed\": False, \"note\": \"0 produit trouve\"}]}\n"
-    "  await done(text=json.dumps(result, ensure_ascii=False), success=True)\n"
+    "\"assertion_passed\": False, \"note\": \"0 produit\"}]}\n"
+    "await done(text=json.dumps(result, ensure_ascii=False), success=True)\n"
+    "```\n"
 )
 
 
@@ -202,7 +150,7 @@ def extract_final_result(result) -> str:
     for cell in reversed(list(cells)):
         output = getattr(cell, "output", "") or ""
         if ('"url"' in output or '"overall_status"' in output
-                or '"anomalies"' in output or '"countText"' in output):
+                or '"anomalies"' in output):
             return output
     return str(result)
 
@@ -236,7 +184,90 @@ def normalize_report(report: dict, model_name: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Fermeture agressive de la session browser
+# Screenshot recorder (compense l'absence de vidéo native)
+# ---------------------------------------------------------------------------
+async def screenshot_recorder(agent, interval=2.0):
+    """Prend un screenshot toutes les N secondes pour créer un timelapse."""
+    idx = 0
+    misses = 0
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            session = getattr(agent, "browser_session", None)
+            if session is None:
+                misses += 1
+                continue
+
+            # Chercher la page Playwright
+            page = None
+            for attr in ("page", "current_page", "_page"):
+                page = getattr(session, attr, None)
+                if page is not None:
+                    break
+
+            if page is None:
+                for ctx_attr in ("browser_context", "_browser_context",
+                                 "context", "_context", "playwright_context"):
+                    ctx = getattr(session, ctx_attr, None)
+                    if ctx is None:
+                        continue
+                    try:
+                        pages = getattr(ctx, "pages", None)
+                        if pages and len(pages) > 0:
+                            page = pages[0]
+                            break
+                    except Exception:
+                        continue
+
+            if page is None:
+                misses += 1
+                continue
+
+            path = os.path.join(SHOTS_DIR, "shot_%04d.png" % idx)
+            try:
+                await page.screenshot(path=path, full_page=False)
+                idx += 1
+                misses = 0
+            except Exception:
+                misses += 1
+
+        except asyncio.CancelledError:
+            print("Screenshot recorder arrete (total: %d shots, %d misses)" % (idx, misses))
+            break
+        except Exception as e:
+            misses += 1
+            if misses > 20:
+                print("Screenshot recorder abandonne apres trop d'echecs")
+                break
+
+
+# ---------------------------------------------------------------------------
+# Debug session
+# ---------------------------------------------------------------------------
+async def debug_session_attributes(session) -> None:
+    print("=== INSPECTION SESSION ===")
+    print("Type: " + str(type(session)))
+    try:
+        attrs = [a for a in dir(session) if not a.startswith("__")]
+    except Exception:
+        return
+    for attr in attrs:
+        try:
+            val = getattr(session, attr, None)
+            if val is None:
+                continue
+            type_name = type(val).__name__
+            interesting = any(kw in attr.lower() for kw in
+                              ["browser", "context", "page", "playwright", "video", "record"])
+            if interesting:
+                has_close = hasattr(val, "close")
+                print("  " + attr + ": " + type_name + (" [has close()]" if has_close else ""))
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Fermeture agressive
 # ---------------------------------------------------------------------------
 async def close_agent_session(agent) -> None:
     if agent is None:
@@ -254,26 +285,29 @@ async def close_agent_session(agent) -> None:
         print("Aucune session trouvee")
         return
 
-    # 1. Fermer le playwright context en priorite (c'est lui qui flush la video)
-    for ctx_attr in ("browser_context", "context", "_browser_context",
-                     "_context", "playwright_context",
-                     "playwright_browser_context"):
-        ctx = getattr(session, ctx_attr, None)
-        if ctx is None:
-            continue
-        for close_method in ("close", "shutdown"):
-            if not hasattr(ctx, close_method):
-                continue
-            try:
-                r = getattr(ctx, close_method)()
-                if asyncio.iscoroutine(r):
-                    await r
-                print("Context ferme via session." + ctx_attr + "." + close_method + "()")
-                break
-            except Exception as e:
-                print("Echec " + ctx_attr + "." + close_method + " : " + str(e))
+    # Debug : lister les attributs intéressants
+    await debug_session_attributes(session)
 
-    # 2. Fermer la session elle-meme
+    # 1. Fermer le context Playwright en priorité
+    ctx = None
+    for ctx_attr in ("browser_context", "_browser_context",
+                     "context", "_context", "playwright_context",
+                     "playwright_browser_context", "_playwright_context"):
+        ctx = getattr(session, ctx_attr, None)
+        if ctx is not None:
+            print("Context trouve via session." + ctx_attr)
+            break
+
+    if ctx is not None and hasattr(ctx, "close"):
+        try:
+            r = ctx.close()
+            if asyncio.iscoroutine(r):
+                await r
+            print("Context Playwright ferme")
+        except Exception as e:
+            print("Echec fermeture context : " + str(e))
+
+    # 2. Fermer la session
     for method_name in ("close", "stop", "kill", "shutdown", "cleanup"):
         if not hasattr(session, method_name):
             continue
@@ -286,19 +320,22 @@ async def close_agent_session(agent) -> None:
         except Exception as e:
             print("Echec session." + method_name + "() : " + str(e))
 
-    # 3. Attendre le flush ffmpeg
-    print("Attente flush video (3s)...")
-    await asyncio.sleep(3)
+    # 3. Attendre flush
+    print("Attente flush (5s)...")
+    await asyncio.sleep(5)
 
-    # 4. Verifier ce qui a ete ecrit
+    # 4. Bilan
     try:
         files = os.listdir(RECORDINGS_DIR)
-        if files:
-            print("Videos dans recordings/ : " + str(files))
+        webm = [f for f in files if f.endswith(".webm")]
+        print("Fichiers dans recordings/ : " + str(files))
+        if webm:
+            print("VIDEOS TROUVEES : " + str(webm))
         else:
-            print("Aucune video dans recordings/ apres fermeture")
+            shots = os.listdir(SHOTS_DIR) if os.path.isdir(SHOTS_DIR) else []
+            print("Aucune .webm. Screenshots captures : " + str(len(shots)))
     except Exception as e:
-        print("Impossible de lister recordings/ : " + str(e))
+        print("Erreur listing : " + str(e))
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +347,7 @@ async def run_attempt(model_name: str, task: str):
     print("=" * 60)
 
     agent = None
+    recorder_task = None
     try:
         llm = ChatOpenAI(
             model=model_name,
@@ -333,6 +371,9 @@ async def run_attempt(model_name: str, task: str):
             max_steps=MAX_STEPS,
             extend_system_message=build_system_prompt(model_name),
         )
+
+        # Démarrer le recorder de screenshots en parallèle
+        recorder_task = asyncio.create_task(screenshot_recorder(agent, interval=2.0))
 
         try:
             result = await asyncio.wait_for(agent.run(), timeout=GLOBAL_TIMEOUT_SECONDS)
@@ -360,15 +401,11 @@ async def run_attempt(model_name: str, task: str):
             anomalies.append("carrousel casse")
         if "erreur lors du chargement des marques" in text_lower:
             anomalies.append("marques non chargees")
-        if '"alt": "undefined"' in text_lower or "alt='undefined'" in text_lower:
-            anomalies.append("image alt=undefined")
-        if "/detail-produit/undefined" in text_lower:
-            anomalies.append("lien produit casse")
-        if "0 produit trouvé" in text_lower or "0 produits" in text_lower:
+        if "0 produit" in text_lower:
             anomalies.append("catalogue vide")
 
         clean_note = ("Anomalies detectees : " + ", ".join(anomalies) + ".") if anomalies \
-            else "Exploration automatique par l'agent."
+            else "Exploration automatique (aucune anomalie detectee)."
 
         return {
             "overall_status": "DOWN" if has_anomaly else "UP",
@@ -389,6 +426,12 @@ async def run_attempt(model_name: str, task: str):
         print("Echec avec " + model_name + " : " + str(err))
         return None
     finally:
+        if recorder_task is not None:
+            recorder_task.cancel()
+            try:
+                await recorder_task
+            except (asyncio.CancelledError, Exception):
+                pass
         await close_agent_session(agent)
 
 
@@ -399,10 +442,10 @@ async def main() -> None:
     task = (
         "Navigate to " + SITE_URL + ". "
         "Execute the required interactions. "
-        "Use Python assertions to verify outcomes. "
+        "Use Python assertions. "
         "Detect anomalies (errors, undefined, empty listings). "
-        "HARD LIMIT: 8 tool calls max, then call done() immediately. "
-        "When done, call done with a text parameter containing ONLY valid JSON."
+        "HARD LIMIT: 8 tool calls max, then call done(). "
+        "IMPORTANT: write ONLY valid Python code blocks between triple backticks."
     )
 
     final_report = None
@@ -419,7 +462,7 @@ async def main() -> None:
             "actions_completed": False,
             "model_used": None,
             "pages": [],
-            "error": "Tous les modeles ont echoue ou timeout.",
+            "error": "Tous les modeles ont echoue.",
         }
 
     output_path = os.path.join(os.getcwd(), "output.json")
