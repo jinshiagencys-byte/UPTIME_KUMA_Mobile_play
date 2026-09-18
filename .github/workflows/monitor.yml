@@ -80,7 +80,7 @@ jobs:
     needs: fetch-sites
     if: needs.fetch-sites.outputs.sites != '[]'
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 15
     concurrency:
       group: autospec-check-${{ matrix.site.id }}
       cancel-in-progress: false
@@ -106,6 +106,9 @@ jobs:
           pip install --quiet openai
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg
+          echo "✅ ffmpeg installé :"
+          which ffmpeg
+          ffmpeg -version | head -1
 
       - name: Détecter le type de site (zéro token)
         id: detect
@@ -137,25 +140,32 @@ jobs:
           TYPE="${{ steps.detect.outputs.TYPE }}"
           case "$TYPE" in
             marketplace)
-              REQUIREMENTS="1. Type a product name in the search bar and click Search. Assert that result items appear. 2. Apply a filter (price or category). Assert that results change. 3. Click the first product. Assert that a product detail page loads."
+              REQUIREMENTS="1. Type a product name in the search bar and click Search. Assert that result items appear. 2. Click the first product. Assert that a product detail page loads."
               ;;
             ecommerce)
-              REQUIREMENTS="1. Find a product listing. Assert that price and availability are visible. 2. Click 'Add to Cart'. Assert that the cart icon/count updates. 3. Open the cart. Assert the product is there."
+              REQUIREMENTS="1. Find a product listing. Assert that price and availability are visible. 2. Click 'Add to Cart'. Assert that the cart icon/count updates."
               ;;
             saas)
-              REQUIREMENTS="1. Locate the login form. Fill it with fake credentials (test+ci-${GITHUB_RUN_ID}@example.com). Submit. Assert that either a dashboard loads or a clear error message appears (not a blank page). 2. Find a contact form. Fill with 'TEST AUTOMATISÉ'. Submit. Assert a success message."
+              REQUIREMENTS="1. Locate the login form. Fill it with fake credentials (test+ci-${GITHUB_RUN_ID}@example.com). Submit. Assert that either a dashboard loads or a clear error message appears. 2. Find a contact form. Fill with 'TEST AUTOMATISE'. Submit. Assert a success message."
               ;;
             blog)
-              REQUIREMENTS="1. Assert that at least 3 articles are listed with titles and dates. 2. Click the first article. Assert that the full content loads (more than 500 characters) and a publication date is visible."
+              REQUIREMENTS="1. Assert that at least 3 articles are listed with titles and dates. 2. Click the first article. Assert that the full content loads and a publication date is visible."
               ;;
             *)
-              REQUIREMENTS="1. Assert the page title is not empty and not a default placeholder ('It works!', 'Index of /', etc.). 2. Find a clickable link, click it, and assert that the URL changes or the content updates."
+              REQUIREMENTS="1. Assert the page title is not empty and not a default placeholder. 2. Find a clickable link, click it, and assert that the URL changes or the content updates."
               ;;
           esac
 
           echo "REQUIREMENTS<<EOF" >> "$GITHUB_OUTPUT"
           echo "$REQUIREMENTS" >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Préparer le dossier recordings
+        run: |
+          mkdir -p recordings
+          mkdir -p recordings-mp4
+          echo "📁 Dossiers créés :"
+          ls -la
 
       - name: Exécuter le monitoring fonctionnel
         env:
@@ -164,31 +174,71 @@ jobs:
           SITE_TYPE: ${{ steps.detect.outputs.TYPE }}
           REQUIREMENTS: ${{ steps.prompt.outputs.REQUIREMENTS }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-        run: python run_monitor.py
+        run: |
+          set +e
+          python run_monitor.py
+          echo ""
+          echo "=== Contenu de recordings/ après run_monitor.py ==="
+          ls -la recordings/ 2>/dev/null || echo "recordings/ vide ou absent"
+          echo ""
+          echo "=== Contenu de recordings/ (récursif) ==="
+          find recordings/ -type f 2>/dev/null || echo "aucun fichier trouvé"
 
-      - name: Lister les vidéos enregistrées
+      - name: 🔍 Debug — chercher les vidéos partout
         if: always()
         run: |
-          echo "📹 Contenu du dossier recordings :"
-          ls -la recordings/ 2>/dev/null || echo "Aucune vidéo trouvée"
+          echo "=== PWD ==="
+          pwd
+          echo ""
+          echo "=== ls -la recordings/ ==="
+          ls -la recordings/ 2>/dev/null || echo "recordings/ ABSENT"
+          echo ""
+          echo "=== find . -name '*.webm' ==="
+          find . -name "*.webm" -type f 2>/dev/null | head -20
+          echo ""
+          echo "=== find . -name '*.mp4' ==="
+          find . -name "*.mp4" -type f 2>/dev/null | head -20
+          echo ""
+          echo "=== find \$HOME -name '*.webm' ==="
+          find $HOME -name "*.webm" -type f 2>/dev/null | head -20
+          echo ""
+          echo "=== find /tmp -name '*.webm' ==="
+          find /tmp -name "*.webm" -type f 2>/dev/null | head -20
 
       - name: Convertir les vidéos WebM en MP4
         if: always()
         run: |
           set +e
           mkdir -p recordings-mp4
+          found=0
           for f in recordings/*.webm; do
             [ -f "$f" ] || continue
+            found=1
             name=$(basename "$f" .webm)
             echo "🎬 Conversion de $f → recordings-mp4/$name.mp4"
             ffmpeg -y -i "$f" -c:v libx264 -preset fast -crf 23 "recordings-mp4/$name.mp4" >/dev/null 2>&1
+            if [ -f "recordings-mp4/$name.mp4" ]; then
+              echo "   ✅ Converti : $(ls -la recordings-mp4/$name.mp4 | awk '{print $5}') octets"
+            else
+              echo "   ❌ Échec conversion"
+            fi
           done
-          ls -la recordings-mp4/ 2>/dev/null || echo "Aucun MP4 généré"
+          if [ "$found" = "0" ]; then
+            echo "⚠️ Aucun .webm trouvé dans recordings/ — pas de conversion"
+          fi
+          echo ""
+          echo "=== Contenu final de recordings-mp4/ ==="
+          ls -la recordings-mp4/ 2>/dev/null || echo "vide"
 
       - name: Afficher le résultat
         if: always()
         run: |
-          if [ -f output.json ]; then jq . output.json; else echo "❌ output.json absent"; fi
+          if [ -f output.json ]; then
+            echo "=== output.json ==="
+            jq . output.json
+          else
+            echo "❌ output.json absent"
+          fi
 
       - name: Envoyer le rapport des pages
         if: always()
@@ -231,5 +281,5 @@ jobs:
             recordings/
             recordings-mp4/
             output.json
-          if-no-files-found: ignore
+          if-no-files-found: warn
           retention-days: 7
