@@ -1,4 +1,4 @@
-name: AutoSpec Agent - Monitoring Autonome Multi-Sites (OpenBrowser-AI + OpenRouter)
+name: AutoSpec Agent - Monitoring Autonome Multi-Sites
 
 on:
   workflow_dispatch:
@@ -14,15 +14,12 @@ permissions:
   contents: read
 
 jobs:
-  # ============================================================
-  # 1. RÉCUPÉRER LES SITES ACTIFS ET LEURS PAGES
-  # ============================================================
   fetch-sites:
     runs-on: ubuntu-latest
     outputs:
       sites: ${{ steps.get-sites.outputs.sites }}
     steps:
-      - name: Récupérer les sites actifs et leurs pages
+      - name: Récupérer les sites actifs
         id: get-sites
         env:
           SITE_ID_INPUT: ${{ github.event.inputs.site_id }}
@@ -34,25 +31,17 @@ jobs:
           SITE_ID="${SITE_ID_INPUT:-}"
 
           if [ -n "$SITE_ID" ]; then
-            echo "🔍 Test ciblé sur le site $SITE_ID"
-            DETAIL=$(curl -fsS --retry 3 --retry-delay 2 -H "x-relay-secret: $RELAY_SECRET" "$RELAY_URL/monitors/$SITE_ID")
+            DETAIL=$(curl -fsS --retry 3 -H "x-relay-secret: $RELAY_SECRET" "$RELAY_URL/monitors/$SITE_ID")
             MONITOR=$(echo "$DETAIL" | jq -c '.monitor | if .type == "http" then {id: .parent, url: .url, name: .parentName} else {id: .id, url: .url, name: .name} end')
-
             if [ -z "$MONITOR" ] || [ "$MONITOR" = "null" ]; then
-              echo "❌ Site $SITE_ID introuvable ou erreur relay"
               echo "sites=[]" >> "$GITHUB_OUTPUT"
               exit 0
             fi
-
-            ALL_MONITORS=$(curl -fsS --retry 3 --retry-delay 2 -H "x-relay-secret: $RELAY_SECRET" "$RELAY_URL/monitors")
+            ALL_MONITORS=$(curl -fsS --retry 3 -H "x-relay-secret: $RELAY_SECRET" "$RELAY_URL/monitors")
             PAGES=$(echo "$ALL_MONITORS" | jq -c --arg sid "$(echo "$MONITOR" | jq -r '.id')" '[.monitors[]? | select(.type == "http" and (.parent | tostring) == $sid) | {url: .url, name: .name}]')
             SITES=$(jq -cn --argjson mon "$MONITOR" --argjson pages "$PAGES" '[{id: $mon.id, url: $mon.url, name: $mon.name, pages: $pages}]')
           else
-            echo "📡 Récupération de tous les sites actifs..."
-            RAW=$(curl -fsS --retry 3 --retry-delay 2 -H "x-relay-secret: $RELAY_SECRET" "$RELAY_URL/active-sites")
-            echo "🔍 Réponse brute du relais (premiers 1000 caractères) :"
-            echo "$RAW" | head -c 1000
-            echo ""
+            RAW=$(curl -fsS --retry 3 -H "x-relay-secret: $RELAY_SECRET" "$RELAY_URL/active-sites")
             SITES_RAW=$(echo "$RAW" | jq -c '[.sites[]? | {id: .id, url: .site_url}]' 2>/dev/null || echo "[]")
             [ -z "$SITES_RAW" ] || [ "$SITES_RAW" = "null" ] && SITES_RAW="[]"
 
@@ -60,7 +49,7 @@ jobs:
             while IFS= read -r site; do
               [ -z "$site" ] && continue
               SID=$(echo "$site" | jq -r '.id')
-              ALL_MONITORS=$(curl -fsS --retry 3 --retry-delay 2 -H "x-relay-secret: $RELAY_SECRET" "$RELAY_URL/monitors")
+              ALL_MONITORS=$(curl -fsS --retry 3 -H "x-relay-secret: $RELAY_SECRET" "$RELAY_URL/monitors")
               PAGES=$(echo "$ALL_MONITORS" | jq -c --arg sid "$SID" '[.monitors[]? | select(.type == "http" and (.parent | tostring) == $sid) | {url: .url, name: .name}]')
               SITE_WITH_PAGES=$(echo "$site" | jq -c --argjson pages "$PAGES" '. + {pages: $pages}')
               SITES_ARRAY=$(echo "$SITES_ARRAY" | jq -c --argjson site "$SITE_WITH_PAGES" '. + [$site]')
@@ -70,12 +59,9 @@ jobs:
 
           SITES=$(echo "$SITES" | jq -c .)
           echo "sites=$SITES" >> "$GITHUB_OUTPUT"
-          echo "📡 Sites à monitorer :"
+          echo "Sites a monitorer :"
           echo "$SITES" | jq .
 
-  # ============================================================
-  # 2. AGENT OPENBROWSER-AI + OPENROUTER + VIDÉO
-  # ============================================================
   autospec-test:
     needs: fetch-sites
     if: needs.fetch-sites.outputs.sites != '[]'
@@ -99,18 +85,16 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Installer OpenBrowser-AI + SDK OpenAI + ffmpeg
+      - name: Installer OpenBrowser-AI + ffmpeg
         run: |
           set -euo pipefail
           pip install --quiet "openbrowser-ai[agent,video]"
           pip install --quiet openai
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg
-          echo "✅ ffmpeg installé :"
-          which ffmpeg
           ffmpeg -version | head -1
 
-      - name: Détecter le type de site (zéro token)
+      - name: Détecter le type de site
         id: detect
         shell: bash
         run: |
@@ -120,54 +104,50 @@ jobs:
 
           if echo "$HTML" | grep -qiE '(marketplace|vendeur|seller|multi-vendor|boutique)'; then
             TYPE="marketplace"
-          elif echo "$HTML" | grep -qiE '(panier|cart|checkout|prix|price|produit|product|acheter|buy)'; then
+          elif echo "$HTML" | grep -qiE '(panier|cart|checkout|prix|price|produit|acheter)'; then
             TYPE="ecommerce"
-          elif echo "$HTML" | grep -qiE '(login|connexion|dashboard|subscription|abonnement|pricing|tarif|sign.up|inscription)'; then
+          elif echo "$HTML" | grep -qiE '(login|connexion|dashboard|subscription|pricing)'; then
             TYPE="saas"
-          elif echo "$HTML" | grep -qiE '(blog|article|post|actualite|news)'; then
+          elif echo "$HTML" | grep -qiE '(blog|article|post|news)'; then
             TYPE="blog"
           else
             TYPE="generic"
           fi
 
           echo "TYPE=$TYPE" >> "$GITHUB_OUTPUT"
-          echo "🔎 Type détecté : $TYPE"
+          echo "Type detecte : $TYPE"
 
-      - name: Générer le prompt adaptatif (zéro token)
+      - name: Générer le prompt adaptatif
         id: prompt
         shell: bash
         run: |
           TYPE="${{ steps.detect.outputs.TYPE }}"
           case "$TYPE" in
             marketplace)
-              REQUIREMENTS="1. Type a product name in the search bar and click Search. Assert that result items appear. 2. Click the first product. Assert that a product detail page loads."
+              REQ="1. Type a product name in the search bar, click Search, assert results appear. 2. Click the first product, assert the detail page loads."
               ;;
             ecommerce)
-              REQUIREMENTS="1. Find a product listing. Assert that price and availability are visible. 2. Click 'Add to Cart'. Assert that the cart icon/count updates."
+              REQ="1. Find a product listing, assert price visible. 2. Click Add to Cart, assert cart count updates."
               ;;
             saas)
-              REQUIREMENTS="1. Locate the login form. Fill it with fake credentials (test+ci-${GITHUB_RUN_ID}@example.com). Submit. Assert that either a dashboard loads or a clear error message appears. 2. Find a contact form. Fill with 'TEST AUTOMATISE'. Submit. Assert a success message."
+              REQ="1. Locate login form, fill with fake creds, submit, assert dashboard or clear error."
               ;;
             blog)
-              REQUIREMENTS="1. Assert that at least 3 articles are listed with titles and dates. 2. Click the first article. Assert that the full content loads and a publication date is visible."
+              REQ="1. Assert 3+ articles listed. 2. Click first article, assert full content loads."
               ;;
             *)
-              REQUIREMENTS="1. Assert the page title is not empty and not a default placeholder. 2. Find a clickable link, click it, and assert that the URL changes or the content updates."
+              REQ="1. Assert page title is not a placeholder. 2. Click a link, assert URL changes."
               ;;
           esac
-
           echo "REQUIREMENTS<<EOF" >> "$GITHUB_OUTPUT"
-          echo "$REQUIREMENTS" >> "$GITHUB_OUTPUT"
+          echo "$REQ" >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
 
-      - name: Préparer le dossier recordings
+      - name: Préparer les dossiers
         run: |
-          mkdir -p recordings
-          mkdir -p recordings-mp4
-          echo "📁 Dossiers créés :"
-          ls -la
+          mkdir -p recordings/shots recordings-mp4
 
-      - name: Exécuter le monitoring fonctionnel
+      - name: Exécuter le monitoring
         env:
           SITE_URL: ${{ matrix.site.url }}
           SITE_ID: ${{ matrix.site.id }}
@@ -178,67 +158,34 @@ jobs:
           set +e
           python run_monitor.py
           echo ""
-          echo "=== Contenu de recordings/ après run_monitor.py ==="
-          ls -la recordings/ 2>/dev/null || echo "recordings/ vide ou absent"
-          echo ""
-          echo "=== Contenu de recordings/ (récursif) ==="
-          find recordings/ -type f 2>/dev/null || echo "aucun fichier trouvé"
+          echo "=== Screenshots captures ==="
+          ls recordings/shots/ 2>/dev/null | head -20
+          echo "Total : $(find recordings/shots -name '*.png' 2>/dev/null | wc -l)"
 
-      - name: 🔍 Debug — chercher les vidéos partout
-        if: always()
-        run: |
-          echo "=== PWD ==="
-          pwd
-          echo ""
-          echo "=== ls -la recordings/ ==="
-          ls -la recordings/ 2>/dev/null || echo "recordings/ ABSENT"
-          echo ""
-          echo "=== find . -name '*.webm' ==="
-          find . -name "*.webm" -type f 2>/dev/null | head -20
-          echo ""
-          echo "=== find . -name '*.mp4' ==="
-          find . -name "*.mp4" -type f 2>/dev/null | head -20
-          echo ""
-          echo "=== find \$HOME -name '*.webm' ==="
-          find $HOME -name "*.webm" -type f 2>/dev/null | head -20
-          echo ""
-          echo "=== find /tmp -name '*.webm' ==="
-          find /tmp -name "*.webm" -type f 2>/dev/null | head -20
-
-      - name: Convertir les vidéos WebM en MP4
+      - name: Convertir les screenshots en timelapse MP4
         if: always()
         run: |
           set +e
           mkdir -p recordings-mp4
-          found=0
-          for f in recordings/*.webm; do
-            [ -f "$f" ] || continue
-            found=1
-            name=$(basename "$f" .webm)
-            echo "🎬 Conversion de $f → recordings-mp4/$name.mp4"
-            ffmpeg -y -i "$f" -c:v libx264 -preset fast -crf 23 "recordings-mp4/$name.mp4" >/dev/null 2>&1
-            if [ -f "recordings-mp4/$name.mp4" ]; then
-              echo "   ✅ Converti : $(ls -la recordings-mp4/$name.mp4 | awk '{print $5}') octets"
-            else
-              echo "   ❌ Échec conversion"
+          count=$(find recordings/shots -name "*.png" 2>/dev/null | wc -l)
+          echo "Screenshots disponibles : $count"
+          if [ "$count" -gt 0 ]; then
+            ffmpeg -y -framerate 1 -pattern_type glob -i 'recordings/shots/shot_*.png' \
+              -c:v libx264 -pix_fmt yuv420p \
+              -vf "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2" \
+              recordings-mp4/timelapse.mp4 >/dev/null 2>&1
+            if [ -f "recordings-mp4/timelapse.mp4" ]; then
+              echo "Timelapse : $(ls -la recordings-mp4/timelapse.mp4 | awk '{print $5}') octets"
             fi
-          done
-          if [ "$found" = "0" ]; then
-            echo "⚠️ Aucun .webm trouvé dans recordings/ — pas de conversion"
+          else
+            echo "Aucun screenshot a convertir"
           fi
-          echo ""
-          echo "=== Contenu final de recordings-mp4/ ==="
-          ls -la recordings-mp4/ 2>/dev/null || echo "vide"
+          ls -la recordings-mp4/
 
       - name: Afficher le résultat
         if: always()
         run: |
-          if [ -f output.json ]; then
-            echo "=== output.json ==="
-            jq . output.json
-          else
-            echo "❌ output.json absent"
-          fi
+          if [ -f output.json ]; then jq . output.json; else echo "output.json absent"; fi
 
       - name: Envoyer le rapport des pages
         if: always()
@@ -251,7 +198,7 @@ jobs:
           [ ! -f output.json ] && exit 0
           if jq -e '.pages' output.json >/dev/null 2>&1; then
             jq -c '{pages: .pages}' output.json > pages_payload.json
-            curl -sS --retry 3 --retry-delay 2 -X POST "$RELAY_URL/sites/$SITE_ID/pages-report" \
+            curl -sS --retry 3 -X POST "$RELAY_URL/sites/$SITE_ID/pages-report" \
               -H "x-relay-secret: $RELAY_SECRET" -H "Content-Type: application/json" -d @pages_payload.json
           fi
 
@@ -263,16 +210,17 @@ jobs:
           RELAY_URL: ${{ secrets.RELAY_URL }}
         run: |
           set +e
-          STATUS="ERROR"; MESSAGE="OpenBrowser-AI execution error"
+          STATUS="ERROR"; MESSAGE="OpenBrowser-AI error"
           if [ -f output.json ]; then
             STATUS=$(jq -r '.overall_status // "ERROR"' output.json | tr '[:lower:]' '[:upper:]')
             MESSAGE=$(jq -c '{actions_completed, model_used, pages}' output.json)
           fi
-          jq -nc --arg status "$STATUS" --arg message "$MESSAGE" '{status: $status, message: $message}' > status_payload.json
-          curl -sS --retry 3 --retry-delay 2 -X POST "$RELAY_URL/sites/$SITE_ID/mark-crawled" \
+          jq -nc --arg status "$STATUS" --arg message "$MESSAGE" \
+            '{status: $status, message: $message}' > status_payload.json
+          curl -sS --retry 3 -X POST "$RELAY_URL/sites/$SITE_ID/mark-crawled" \
             -H "x-relay-secret: $RELAY_SECRET" -H "Content-Type: application/json" -d @status_payload.json
 
-      - name: Uploader les artifacts (vidéos, rapport)
+      - name: Uploader les artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
