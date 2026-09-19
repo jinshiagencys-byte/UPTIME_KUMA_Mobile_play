@@ -158,6 +158,7 @@ jobs:
           SITE_ID: ${{ matrix.site.id }}
           SITE_TYPE: ${{ steps.detect.outputs.TYPE }}
           REQUIREMENTS: ${{ steps.prompt.outputs.REQUIREMENTS }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
@@ -173,21 +174,29 @@ jobs:
         run: |
           set +e
           mkdir -p recordings-mp4
-          count=$(find recordings/shots -name "shot_*.png" 2>/dev/null | wc -l)
-          echo "Screenshots disponibles : $count"
-
-          if [ "$count" -gt 0 ]; then
-            echo "🎬 Encodage du timelapse avec ffmpeg..."
-            # Utilisation du pattern standard %04d (beaucoup plus fiable que glob)
-            ffmpeg -y -framerate 2 -i 'recordings/shots/shot_%04d.png' \
-              -c:v libx264 -pix_fmt yuv420p -movflags +faststart \
-              recordings-mp4/timelapse.mp4
-
-            if [ -f "recordings-mp4/timelapse.mp4" ] && [ -s "recordings-mp4/timelapse.mp4" ]; then
-              echo "✅ Timelapse genere avec succes : $(ls -lh recordings-mp4/timelapse.mp4 | awk '{print $5}')"
-            else
-              echo "❌ Erreur : Le fichier timelapse.mp4 est vide ou absent"
-            fi
+          JPG_COUNT=$(find recordings/shots -name "shot_*.jpg" 2>/dev/null | wc -l)
+          PNG_COUNT=$(find recordings/shots -name "shot_*.png" 2>/dev/null | wc -l)
+          echo "Screenshots : $JPG_COUNT JPG, $PNG_COUNT PNG"
+       
+          if [ "$JPG_COUNT" -gt "$PNG_COUNT" ] && [ "$JPG_COUNT" -gt 0 ]; then
+            EXT="jpg"
+          elif [ "$PNG_COUNT" -gt 0 ]; then
+            EXT="png"
+          else
+            echo "Aucun screenshot"
+            exit 0
+          fi
+       
+          echo "🎬 Encodage avec shot_%04d.$EXT"
+          ffmpeg -y -framerate 2 -i "recordings/shots/shot_%04d.$EXT" \
+            -c:v libx264 -pix_fmt yuv420p -movflags +faststart \
+            recordings-mp4/timelapse.mp4 2>&1 | tail -10
+       
+          if [ -f "recordings-mp4/timelapse.mp4" ] && [ -s "recordings-mp4/timelapse.mp4" ]; then
+            echo "✅ Timelapse : $(ls -lh recordings-mp4/timelapse.mp4 | awk '{print $5}')"
+          else
+            echo "❌ Timelapse vide"
+          fi
           else
             echo "Aucun screenshot a convertir"
           fi
