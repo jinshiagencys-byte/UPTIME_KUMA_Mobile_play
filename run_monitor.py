@@ -1,13 +1,14 @@
 """
 OpenBrowser-AI — Monitoring fonctionnel.
-STRATÉGIE 100% GRATUITE :
-  1. Groq (openai/gpt-oss-120b, llama-3.3-70b-versatile)
-  2. NVIDIA NIM (moonshotai/kimi-k2.6)
-  3. Google AI Studio (gemini-3.5-flash / 3.6-flash)
-  4. OpenRouter (openrouter/free)
-Preflight + screenshots auto JPEG/PNG + timelapse MP4
+STRATÉGIE 100% GRATUITE + VIDÉO NATIVE :
+  1. Groq (llama-3.3-70b-specdec, qwen-3.5-32b)
+  2. Google AI Studio (gemini-3.5-flash / 3.6-flash)
+  3. OpenRouter (openrouter/free)
+Enregistrement vidéo natif via record_video_dir (plus de screenshots+ffmpeg).
+Preflight + détection erreurs fatales + quotas.
 """
 import asyncio
+import glob
 import json
 import os
 import re
@@ -27,24 +28,20 @@ SITE_ID = os.environ.get("SITE_ID", "")
 SITE_TYPE = os.environ.get("SITE_TYPE", "generic")
 REQUIREMENTS = os.environ.get("REQUIREMENTS", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "")
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 
 RECORDINGS_DIR = os.path.abspath("./recordings")
-SHOTS_DIR = os.path.join(RECORDINGS_DIR, "shots")
-os.makedirs(SHOTS_DIR, exist_ok=True)
+os.makedirs(RECORDINGS_DIR, exist_ok=True)
 
 print("Recordings dir : " + RECORDINGS_DIR)
-print("Shots dir      : " + SHOTS_DIR)
-print("Groq key           : " + str(bool(GROQ_API_KEY)))
-print("NVIDIA key         : " + str(bool(NVIDIA_API_KEY)))
-print("Google AI Std key  : " + str(bool(GOOGLE_API_KEY)))
-print("OpenRouter key     : " + str(bool(OPENROUTER_API_KEY)))
+print("Groq key          : " + str(bool(GROQ_API_KEY)))
+print("Google AI Std key : " + str(bool(GOOGLE_API_KEY)))
+print("OpenRouter key    : " + str(bool(OPENROUTER_API_KEY)))
 
 
 # ---------------------------------------------------------------------------
-# Wrapper Google AI Studio
+# Wrapper Google AI Studio — TOUS les champs requis par TokenUsageEntry
 # ---------------------------------------------------------------------------
 class GoogleGeminiWrapper:
     def __init__(self, model, api_key, base_url, temperature=0.0):
@@ -66,12 +63,114 @@ class GoogleGeminiWrapper:
                 elif msg.type == "system":
                     role = "system"
                 content = msg.content
+                # Normaliser content en string (sinon Groq/Google rejettent)
+                if not isinstance(content, str):
+                    content = str(content)
+            elif isinstance(msg, dict):
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+                if not isinstance(content, str):
+                    content = str(content)
+            else:
+                role = "user"
+                content = str(msg)
+            openai_messages.append({"role": role, "content": content})
+
+        response = await self.client.chat.completions.create(
+            model=self.model,
+            messages=openai_messages,
+            temperature=self.temperature,
+        )
+        content = response.choices[0].message.content
+
+        try:
+            input_tokens = response.usage.prompt_tokens
+            output_tokens = response.usage.completion_tokens
+        except Exception:
+            input_tokens = 100
+            output_tokens = max(1, len(content) // 4)
+
+        # ⚠️ TOUS les 5 champs exigés par TokenUsageEntry de openbrowser-ai
+        usage_dict = {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+            "prompt_tokens": input_tokens,
+            "completion_tokens": output_tokens,
+            "prompt_cached_tokens": 0,
+            "prompt_cache_creation_tokens": 0,
+            "prompt_image_tokens": 0,
+        }
+
+        try:
+            from langchain_core.messages import AIMessage
+            msg = AIMessage(content=content)
+            msg.usage_metadata = usage_dict
+            msg.usage = usage_dict
+            msg.response_metadata = {
+                "model_name": self.model,
+                "finish_reason": "stop",
+                "token_usage": usage_dict,
+            }
+            return msg
+        except ImportError:
+            class SimpleMessage:
+                def __init__(self, content, model, usage):
+                    self.content = content
+                    self.type = "ai"
+                    self.usage = usage
+                    self.usage_metadata = usage
+                    self.response_metadata = {
+                        "model_name": model,
+                        "finish_reason": "stop",
+                        "token_usage": usage,
+                    }
+            return SimpleMessage(content, self.model, usage_dict)
+
+    async def acall(self, messages, **kwargs):
+        return await self.ainvoke(messages, **kwargs)
+
+    def bind_tools(self, tools):
+        return self
+
+    def with_structured_output(self, schema):
+        return self
+
+
+# ---------------------------------------------------------------------------
+# Wrapper Groq — normalise le content en string (corrige l'erreur multimodal)
+# ---------------------------------------------------------------------------
+class GroqWrapper:
+    def __init__(self, model, api_key, base_url, temperature=0.0):
+        self.client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        self.model = model
+        self.temperature = temperature
+        self.provider = "groq"
+        self.model_name = model
+
+    async def ainvoke(self, messages, config=None, **kwargs):
+        openai_messages = []
+        for msg in messages:
+            if hasattr(msg, "type"):
+                role = "user"
+                if msg.type == "human":
+                    role = "user"
+                elif msg.type == "ai":
+                    role = "assistant"
+                elif msg.type == "system":
+                    role = "system"
+                content = msg.content
             elif isinstance(msg, dict):
                 role = msg.get("role", "user")
                 content = msg.get("content", "")
             else:
                 role = "user"
                 content = str(msg)
+
+            # ⚠️ Groq exige du string pur — pas de listes multimodales
+            if not isinstance(content, str):
+                content = str(content)
+
             openai_messages.append({"role": role, "content": content})
 
         response = await self.client.chat.completions.create(
@@ -92,6 +191,11 @@ class GoogleGeminiWrapper:
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "total_tokens": input_tokens + output_tokens,
+            "prompt_tokens": input_tokens,
+            "completion_tokens": output_tokens,
+            "prompt_cached_tokens": 0,
+            "prompt_cache_creation_tokens": 0,
+            "prompt_image_tokens": 0,
         }
 
         try:
@@ -134,28 +238,18 @@ class GoogleGeminiWrapper:
 # ---------------------------------------------------------------------------
 MODEL_CHAIN = []
 
-# 🥇 GROQ : gratuit, rapide, slugs stables
+# 🥇 GROQ : modèles à jour sept. 2026
 if GROQ_API_KEY:
-    for m in ["openai/gpt-oss-120b", "llama-3.3-70b-versatile"]:
+    for m in ["llama-3.3-70b-specdec", "qwen/qwen-3.5-32b"]:
         MODEL_CHAIN.append({
             "provider": "groq",
             "model": m,
             "key": GROQ_API_KEY,
             "base_url": "https://api.groq.com/openai/v1",
-            "use_wrapper": False,
+            "use_wrapper": "groq_wrapper",
         })
 
-# 🥈 NVIDIA NIM : quota gratuit séparé
-if NVIDIA_API_KEY:
-    MODEL_CHAIN.append({
-        "provider": "nvidia",
-        "model": "moonshotai/kimi-k2.6",
-        "key": NVIDIA_API_KEY,
-        "base_url": "https://integrate.api.nvidia.com/v1",
-        "use_wrapper": False,
-    })
-
-# 🥉 GOOGLE AI STUDIO : en secours
+# 🥈 GOOGLE AI STUDIO : en secours (quotas limités)
 if GOOGLE_API_KEY:
     for m in ["gemini-3.5-flash", "gemini-3.6-flash"]:
         MODEL_CHAIN.append({
@@ -163,10 +257,10 @@ if GOOGLE_API_KEY:
             "model": m,
             "key": GOOGLE_API_KEY,
             "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-            "use_wrapper": True,
+            "use_wrapper": "google_wrapper",
         })
 
-# 4️⃣ OPENROUTER : routeur gratuit
+# 🥉 OPENROUTER : routeur gratuit en dernier recours
 if OPENROUTER_API_KEY:
     MODEL_CHAIN.append({
         "provider": "openrouter",
@@ -188,7 +282,6 @@ for i, entry in enumerate(MODEL_CHAIN):
 GLOBAL_TIMEOUT_SECONDS = 240
 MAX_STEPS = 8
 DELAY_BETWEEN_ATTEMPTS = 3
-SCREENSHOT_INTERVAL = 3.0
 
 
 # ---------------------------------------------------------------------------
@@ -295,105 +388,6 @@ def normalize_report(report, model_name):
 
 
 # ---------------------------------------------------------------------------
-# Récupération page Playwright
-# ---------------------------------------------------------------------------
-async def get_playwright_page(session):
-    if session is None:
-        return None
-    for attr in ("current_page", "page", "_page", "playwright_page"):
-        try:
-            p = getattr(session, attr, None)
-            if p is not None and hasattr(p, "screenshot"):
-                return p
-        except Exception:
-            pass
-    for method_name in ("must_get_current_page", "get_current_page", "get_page"):
-        if hasattr(session, method_name):
-            try:
-                r = getattr(session, method_name)()
-                if asyncio.iscoroutine(r):
-                    r = await r
-                if r is not None and hasattr(r, "screenshot"):
-                    return r
-            except Exception:
-                pass
-    if hasattr(session, "get_pages"):
-        try:
-            r = session.get_pages()
-            if asyncio.iscoroutine(r):
-                r = await r
-            if r and len(r) > 0:
-                return r[0]
-        except Exception:
-            pass
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Screenshot recorder — auto-détection JPEG/PNG
-# ---------------------------------------------------------------------------
-def detect_image_format(data):
-    if data[:4] == b'\x89PNG':
-        return "png"
-    if data[:3] == b'\xff\xd8\xff':
-        return "jpg"
-    if data[:4] == b'GIF8':
-        return "gif"
-    if data[:4] == b'RIFF' and data[8:12] == b'WEBP':
-        return "webp"
-    return "png"
-
-
-async def screenshot_recorder(agent, interval=SCREENSHOT_INTERVAL):
-    idx = 0
-    misses = 0
-    while True:
-        try:
-            await asyncio.sleep(interval)
-            session = getattr(agent, "browser_session", None)
-            if session is None:
-                misses += 1
-                continue
-            page = await get_playwright_page(session)
-            if page is None:
-                misses += 1
-                if misses > 30:
-                    print("Screenshot recorder : abandon (page introuvable)")
-                    break
-                continue
-            try:
-                result = page.screenshot()
-                if asyncio.iscoroutine(result):
-                    result = await result
-                img_bytes = None
-                if isinstance(result, bytes):
-                    img_bytes = result
-                elif isinstance(result, str):
-                    import base64
-                    img_bytes = base64.b64decode(result)
-                elif hasattr(result, "read"):
-                    img_bytes = result.read()
-                if img_bytes and len(img_bytes) > 100:
-                    fmt = detect_image_format(img_bytes)
-                    path = os.path.join(SHOTS_DIR, "shot_%04d.%s" % (idx, fmt))
-                    with open(path, "wb") as f:
-                        f.write(img_bytes)
-                    idx += 1
-                    misses = 0
-                else:
-                    misses += 1
-            except Exception as e:
-                if idx == 0:
-                    print("Screenshot erreur : " + str(e))
-                misses += 1
-        except asyncio.CancelledError:
-            print("Screenshot recorder arrete (%d shots)" % idx)
-            break
-        except Exception:
-            misses += 1
-
-
-# ---------------------------------------------------------------------------
 # Fermeture session
 # ---------------------------------------------------------------------------
 async def close_agent_session(agent):
@@ -419,11 +413,12 @@ async def close_agent_session(agent):
             break
         except Exception as e:
             print("Echec " + method_name + "() : " + str(e))
-    try:
-        shots = os.listdir(SHOTS_DIR) if os.path.isdir(SHOTS_DIR) else []
-        print("Screenshots captures : " + str(len(shots)))
-    except Exception:
-        pass
+    # Lister les vidéos enregistrées nativement
+    videos = glob.glob(os.path.join(RECORDINGS_DIR, "*.webm")) + \
+             glob.glob(os.path.join(RECORDINGS_DIR, "*.mp4"))
+    print("Videos natives : " + str(len(videos)))
+    for v in videos:
+        print("  -> " + v + " (" + str(os.path.getsize(v)) + " octets)")
 
 
 # ---------------------------------------------------------------------------
@@ -443,6 +438,8 @@ def is_fatal_model_error(output_text):
         "unavailable for free",
         "authenticationerror",
         "invalid_api_key",
+        "does not exist",
+        "not found for account",
     ])
 
 
@@ -489,26 +486,30 @@ async def preflight_api_check(model_config):
 
 
 # ---------------------------------------------------------------------------
-# Tentative
+# Tentative — avec enregistrement vidéo NATIF
 # ---------------------------------------------------------------------------
 async def run_attempt(model_config, task):
     provider = model_config["provider"]
     model_name = model_config["model"]
     api_key = model_config["key"]
     base_url = model_config["base_url"]
-    use_wrapper = model_config.get("use_wrapper", False)
+    wrapper_type = model_config.get("use_wrapper", False)
 
     print("=" * 60)
     print("TENTATIVE - PROVIDER : %s | MODELE : %s" % (provider, model_name))
     print("=" * 60)
 
     agent = None
-    recorder_task = None
     start_time = time.time()
 
     try:
-        if use_wrapper:
+        if wrapper_type == "google_wrapper":
             llm = GoogleGeminiWrapper(
+                model=model_name, api_key=api_key,
+                base_url=base_url, temperature=0.0,
+            )
+        elif wrapper_type == "groq_wrapper":
+            llm = GroqWrapper(
                 model=model_name, api_key=api_key,
                 base_url=base_url, temperature=0.0,
             )
@@ -518,10 +519,12 @@ async def run_attempt(model_config, task):
                 api_key=api_key, temperature=0.0,
             )
 
+        # ⭐ ENREGISTREMENT VIDÉO NATIF — plus besoin de screenshots !
         profile = BrowserProfile(
             headless=True,
             viewport_width=1280,
             viewport_height=720,
+            record_video_dir=RECORDINGS_DIR,  # ← vidéo native .webm
         )
 
         agent = CodeAgent(
@@ -529,9 +532,6 @@ async def run_attempt(model_config, task):
             max_steps=MAX_STEPS,
             extend_system_message=build_system_prompt(model_name),
         )
-
-        recorder_task = asyncio.create_task(
-            screenshot_recorder(agent, interval=SCREENSHOT_INTERVAL))
 
         try:
             result = await asyncio.wait_for(
@@ -615,12 +615,6 @@ async def run_attempt(model_config, task):
         return None
 
     finally:
-        if recorder_task is not None:
-            recorder_task.cancel()
-            try:
-                await recorder_task
-            except (asyncio.CancelledError, Exception):
-                pass
         await close_agent_session(agent)
 
 
