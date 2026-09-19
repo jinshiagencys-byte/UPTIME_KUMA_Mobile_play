@@ -1,9 +1,10 @@
 """
 OpenBrowser-AI — Monitoring fonctionnel (version budget zero : OpenRouter gratuit).
 
-STRATEGIE : openrouter/free uniquement (seul modele confirme sur de vrais runs).
-Groq / Google restent dans le code mais sont DESACTIVES par defaut
-(ENABLE_FALLBACKS=1 pour les reactiver).
+STRATEGIE : openrouter/free (x2) puis Cohere command-a-03-2025 en secours.
+Test test_providers.py du 2026-09-19 : seuls OpenRouter et Cohere ont passe les 3 tests.
+Groq (limite 8000 tokens/min : prompt de l'agent refuse en 413), Google (quota), DeepSeek /
+HF (solde 0), NVIDIA (modele retire) restent DESACTIVES (ENABLE_FALLBACKS=1 pour Groq/Google).
 
 Changements de cette version :
   A. Plusieurs pages par run : le workflow doit passer PAGES_JSON (liste des pages
@@ -129,9 +130,12 @@ PAGES_JSON = os.environ.get("PAGES_JSON", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+COHERE_API_KEY = os.environ.get("COHERE_API_KEY", "")
 
 ENABLE_FALLBACKS = os.environ.get("ENABLE_FALLBACKS", "0") == "1"
 OPENROUTER_ATTEMPTS = int(os.environ.get("OPENROUTER_ATTEMPTS", "2"))
+COHERE_ATTEMPTS = int(os.environ.get("COHERE_ATTEMPTS", "1"))
+DEAD_PROVIDERS = set()  # fournisseurs abandonnes pour ce run (quota / erreur fatale)
 MAX_PAGES_PER_RUN = int(os.environ.get("MAX_PAGES_PER_RUN", "2"))
 
 LLM_CALL_TIMEOUT = float(os.environ.get("LLM_CALL_TIMEOUT_SECONDS", "100"))
@@ -151,6 +155,7 @@ print("Recordings dir : " + RECORDINGS_DIR)
 print("Groq key          : " + str(bool(GROQ_API_KEY)))
 print("Google AI Std key : " + str(bool(GOOGLE_API_KEY)))
 print("OpenRouter key    : " + str(bool(OPENROUTER_API_KEY)))
+print("Cohere key        : " + str(bool(COHERE_API_KEY)))
 print("Fallbacks payants/quota : " + ("ON" if ENABLE_FALLBACKS else "OFF"))
 print("Video freeze cap  : %.1fs" % FREEZE_CAP_SECONDS)
 print("Max steps / essai : %d | pages max / run : %d" % (MAX_STEPS, MAX_PAGES_PER_RUN))
@@ -186,6 +191,15 @@ if OPENROUTER_API_KEY:
             "model": os.environ.get("OPENROUTER_MODEL", "openrouter/free"),
             "key": OPENROUTER_API_KEY,
             "base_url": "https://openrouter.ai/api/v1",
+        })
+
+if COHERE_API_KEY:
+    for _ in range(max(COHERE_ATTEMPTS, 1)):
+        MODEL_CHAIN.append({
+            "provider": "cohere",
+            "model": os.environ.get("COHERE_MODEL", "command-a-03-2025"),
+            "key": COHERE_API_KEY,
+            "base_url": "https://api.cohere.ai/compatibility/v1",
         })
 
 if ENABLE_FALLBACKS:
@@ -563,7 +577,7 @@ async def preflight_api_check(model_config):
             client.chat.completions.create(
                 model=model_config["model"],
                 messages=[{"role": "user", "content": "ping"}],
-                max_tokens=1,
+                max_tokens=5,
             ),
             timeout=20,
         )
@@ -662,8 +676,9 @@ async def run_attempt(model_config, target_url, requirements):
 # ---------------------------------------------------------------------------
 async def test_page(target_url, requirements, deadline):
     best_partial = (None, 0)
-    stop = False
     for idx, model_config in enumerate(MODEL_CHAIN):
+        if model_config["provider"] in DEAD_PROVIDERS:
+            continue
         if time.monotonic() > deadline - MIN_ATTEMPT_SECONDS:
             print("Budget de temps epuise : plus d'essai pour %s" % target_url)
             break
@@ -683,12 +698,14 @@ async def test_page(target_url, requirements, deadline):
         if outcome["partial"][1] > best_partial[1]:
             best_partial = outcome["partial"]
         if outcome["stop"]:
-            stop = True
-            break
+            DEAD_PROVIDERS.add(model_config["provider"])
+            print("Fournisseur abandonne pour ce run : " + model_config["provider"])
+            continue
         if idx < len(MODEL_CHAIN) - 1:
             print("Attente %ds..." % DELAY_BETWEEN_ATTEMPTS)
             await asyncio.sleep(DELAY_BETWEEN_ATTEMPTS)
-    return None, best_partial, stop
+    all_dead = all(mc["provider"] in DEAD_PROVIDERS for mc in MODEL_CHAIN)
+    return None, best_partial, all_dead
 
 
 # ---------------------------------------------------------------------------
@@ -759,7 +776,7 @@ async def main():
             page_entries.append({
                 "url": url, "status": "UNKNOWN", "http_code": None,
                 "action_tested": None, "assertion_passed": False,
-                "note": "Non testee : quota ou erreur fatale du fournisseur sur un essai precedent.",
+                "note": "Non testee : quota ou erreur fatale sur tous les fournisseurs.",
             })
             continue
 
