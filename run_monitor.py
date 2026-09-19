@@ -1,8 +1,9 @@
 """
 OpenBrowser-AI — Monitoring fonctionnel.
-Google AI Studio via wrapper custom OpenAI (contourne frequency_penalty)
+Google AI Studio via wrapper OpenAI-compatible (contourne frequency_penalty + usage_metadata)
 Fallback OpenRouter (modèles gratuits fonctionnels)
 Screenshots + timelapse MP4
+Passe au modèle suivant si 0 action réussie
 """
 import asyncio
 import json
@@ -38,27 +39,23 @@ print("OpenRouter key       : " + str(bool(OPENROUTER_API_KEY)))
 class GoogleGeminiWrapper:
     """
     Wrapper LLM pour Google AI Studio via endpoint OpenAI-compatible.
-    Compatible avec l'interface attendue par CodeAgent.
+    N'envoie PAS frequency_penalty ni presence_penalty (non supportés par Google).
+    Fournit usage_metadata requis par openbrowser-ai pour la télémétrie.
     """
-    
+
     def __init__(self, model, api_key, base_url, temperature=0.0):
         self.client = AsyncOpenAI(api_key=api_key, base_url=base_url)
         self.model = model
         self.temperature = temperature
-        # Attributs requis par openbrowser-ai pour la télémétrie
+        # Attributs requis par openbrowser-ai
         self.provider = "google"
         self.model_name = model
-    
+
     async def ainvoke(self, messages, config=None, **kwargs):
-        """
-        Appelle l'API Google AI Studio sans paramètres non supportés.
-        Signature compatible avec LangChain (accepte config et **kwargs).
-        """
-        # Convertir les messages
+        """Appelle l'API Google AI Studio sans paramètres non supportés."""
         openai_messages = []
         for msg in messages:
             if hasattr(msg, 'type'):
-                # LangChain message
                 role = "user"
                 if msg.type == "human":
                     role = "user"
@@ -74,8 +71,7 @@ class GoogleGeminiWrapper:
                 role = "user"
                 content = str(msg)
             openai_messages.append({"role": role, "content": content})
-        
-        # Appel API SANS frequency_penalty ni presence_penalty
+
         try:
             response = await self.client.chat.completions.create(
                 model=self.model,
@@ -86,41 +82,54 @@ class GoogleGeminiWrapper:
         except Exception as e:
             print("Google API error: " + str(e))
             raise
-        
-        # Retourner un objet compatible avec LangChain
+
+        # Construire AIMessage avec usage_metadata (requis par openbrowser-ai)
         try:
             from langchain_core.messages import AIMessage
-            return AIMessage(content=content)
+            msg = AIMessage(content=content)
+            msg.usage_metadata = {
+                "input_tokens": 100,
+                "output_tokens": max(1, len(content) // 4),
+                "total_tokens": 100 + max(1, len(content) // 4),
+            }
+            msg.response_metadata = {
+                "model_name": self.model,
+                "finish_reason": "stop",
+            }
+            return msg
         except ImportError:
             class SimpleMessage:
-                def __init__(self, content):
+                def __init__(self, content, model):
                     self.content = content
                     self.type = "ai"
-            return SimpleMessage(content=content)
-    
-    # Méthodes supplémentaires potentiellement requises
+                    self.usage_metadata = {
+                        "input_tokens": 100,
+                        "output_tokens": max(1, len(content) // 4),
+                        "total_tokens": 100 + max(1, len(content) // 4),
+                    }
+                    self.response_metadata = {"model_name": model, "finish_reason": "stop"}
+            return SimpleMessage(content, self.model)
+
     async def acall(self, messages, **kwargs):
         return await self.ainvoke(messages, **kwargs)
-    
+
     def bind_tools(self, tools):
-        """Mock pour compatibilité - retourne self"""
         return self
-    
+
     def with_structured_output(self, schema):
-        """Mock pour compatibilité - retourne self"""
         return self
+
 
 # ---------------------------------------------------------------------------
 # Chaîne de modèles
 # ---------------------------------------------------------------------------
 MODEL_CHAIN = []
 
-# Google AI Studio via wrapper custom
 if GOOGLE_API_KEY:
     for m in [
-        "gemini-3.5-flash",
-        "gemini-3.6-flash",
-        "gemini-2.5-pro",
+        "gemini-3.5-flash",     # Le plus rapide
+        "gemini-3.6-flash",     # Plus de contexte
+        "gemini-2.5-pro",       # Plus puissant
     ]:
         MODEL_CHAIN.append({
             "provider": "google_openai",
@@ -130,7 +139,6 @@ if GOOGLE_API_KEY:
             "use_wrapper": True,
         })
 
-# OpenRouter - modèles gratuits fonctionnels (septembre 2026)
 if OPENROUTER_API_KEY:
     for m in [
         "nousresearch/hermes-3-llama-3.1-405b:free",
@@ -209,6 +217,7 @@ SYSTEM_PROMPT_TEMPLATE = (
     "```\n"
 )
 
+
 def build_system_prompt(model_name: str) -> str:
     return (
         SYSTEM_PROMPT_TEMPLATE
@@ -217,6 +226,7 @@ def build_system_prompt(model_name: str) -> str:
         .replace("__MODEL_NAME__", model_name)
         .replace("__SITE_URL__", SITE_URL)
     )
+
 
 # ---------------------------------------------------------------------------
 # JSON helpers
@@ -236,6 +246,7 @@ def extract_json_from_text(text: str):
             return json.loads(cleaned)
         except json.JSONDecodeError:
             return None
+
 
 def extract_final_result(result) -> str:
     cells = getattr(result, "cells", None) or getattr(result, "history", None) or []
@@ -265,6 +276,7 @@ def extract_final_result(result) -> str:
             return output
     return str(result)
 
+
 def normalize_report(report: dict, model_name: str) -> dict:
     if "overall_status" in report and "pages" in report:
         report["model_used"] = model_name
@@ -293,15 +305,14 @@ def normalize_report(report: dict, model_name: str) -> dict:
         "pages": pages,
     }
 
+
 # ---------------------------------------------------------------------------
-# Récupération de la page Playwright (CORRIGÉ)
+# Récupération de la page Playwright
 # ---------------------------------------------------------------------------
 async def get_playwright_page(session):
-    """Retourne la page Playwright native pour les screenshots."""
     if session is None:
         return None
-    
-    # Méthode 1: Accès direct aux attributs
+
     for attr in ("current_page", "page", "_page", "playwright_page"):
         try:
             p = getattr(session, attr, None)
@@ -309,8 +320,7 @@ async def get_playwright_page(session):
                 return p
         except Exception:
             pass
-    
-    # Méthode 2: via méthodes
+
     for method_name in ("must_get_current_page", "get_current_page", "get_page"):
         if hasattr(session, method_name):
             try:
@@ -318,7 +328,6 @@ async def get_playwright_page(session):
                 if asyncio.iscoroutine(r):
                     r = await r
                 if r is not None:
-                    # Si c'est un wrapper, chercher la page native
                     if hasattr(r, "screenshot"):
                         return r
                     for inner_attr in ("page", "_page", "playwright_page"):
@@ -327,8 +336,7 @@ async def get_playwright_page(session):
                             return inner
             except Exception:
                 pass
-    
-    # Méthode 3: via get_pages
+
     if hasattr(session, "get_pages"):
         try:
             r = session.get_pages()
@@ -344,11 +352,12 @@ async def get_playwright_page(session):
                         return inner
         except Exception:
             pass
-    
+
     return None
 
+
 # ---------------------------------------------------------------------------
-# Screenshot recorder (CORRIGÉ pour gérer tous les types de retour)
+# Screenshot recorder
 # ---------------------------------------------------------------------------
 async def screenshot_recorder(agent, interval=2.0):
     idx = 0
@@ -360,7 +369,7 @@ async def screenshot_recorder(agent, interval=2.0):
             if session is None:
                 misses += 1
                 continue
-            
+
             page = await get_playwright_page(session)
             if page is None:
                 misses += 1
@@ -368,23 +377,19 @@ async def screenshot_recorder(agent, interval=2.0):
                     print("Screenshot recorder : abandon apres %d echecs (page introuvable)" % misses)
                     break
                 continue
-            
+
             path = os.path.join(SHOTS_DIR, "shot_%04d.png" % idx)
             try:
-                # Appeler screenshot sans arguments
                 result = page.screenshot()
                 if asyncio.iscoroutine(result):
                     result = await result
-                
-                # Gérer différents types de retour
+
                 if isinstance(result, bytes):
-                    # Cas idéal : bytes directs
                     with open(path, "wb") as f:
                         f.write(result)
                     idx += 1
                     misses = 0
                 elif isinstance(result, str):
-                    # Cas base64
                     import base64
                     try:
                         img_bytes = base64.b64decode(result)
@@ -395,18 +400,15 @@ async def screenshot_recorder(agent, interval=2.0):
                     except Exception:
                         misses += 1
                 elif hasattr(result, "save"):
-                    # Cas objet PIL ou similaire
                     result.save(path)
                     idx += 1
                     misses = 0
                 elif hasattr(result, "read"):
-                    # Cas file-like object
                     with open(path, "wb") as f:
                         f.write(result.read())
                     idx += 1
                     misses = 0
                 else:
-                    # Essayer d'obtenir les bytes via une autre méthode
                     if hasattr(page, "screenshot_as_bytes"):
                         bytes_result = page.screenshot_as_bytes()
                         if asyncio.iscoroutine(bytes_result):
@@ -430,6 +432,7 @@ async def screenshot_recorder(agent, interval=2.0):
             misses += 1
             if misses % 10 == 0:
                 print("Screenshot erreur globale : " + str(e))
+
 
 # ---------------------------------------------------------------------------
 # Fermeture de session
@@ -462,6 +465,7 @@ async def close_agent_session(agent) -> None:
         print("Screenshots captures : " + str(len(shots)))
     except Exception:
         pass
+
 
 # ---------------------------------------------------------------------------
 # Tentative
@@ -518,7 +522,6 @@ async def run_attempt(model_config: dict, task: str):
             print("Timeout global pour " + model_name)
             return None
 
-        # Compter les cellules réussies
         cells = getattr(result, "cells", None) or getattr(result, "history", None) or []
         successful_cells = 0
         for cell in cells:
@@ -529,8 +532,7 @@ async def run_attempt(model_config: dict, task: str):
                 successful_cells += 1
 
         print("Cellules totales : %d, reussies : %d" % (len(cells), successful_cells))
-        
-        # Validation : minimum 1 action réussie (au lieu de 2)
+
         if successful_cells < 1:
             print("ATTENTION : %s n'a effectue AUCUNE action reussie" % model_name)
             return None
@@ -543,7 +545,6 @@ async def run_attempt(model_config: dict, task: str):
         if report:
             return normalize_report(report, model_name)
 
-        # Fallback : construire un rapport basique
         text_lower = final_text.lower()
         has_anomaly = any(
             kw in text_lower
@@ -580,6 +581,7 @@ async def run_attempt(model_config: dict, task: str):
             except (asyncio.CancelledError, Exception):
                 pass
         await close_agent_session(agent)
+
 
 # ---------------------------------------------------------------------------
 # Main
@@ -638,6 +640,7 @@ async def main() -> None:
     print("output.json ecrit dans " + output_path)
     print("=== output.json ===")
     print(json.dumps(final_report, indent=2, ensure_ascii=False))
+
 
 if __name__ == "__main__":
     asyncio.run(main())
