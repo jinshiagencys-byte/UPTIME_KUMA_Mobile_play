@@ -12,6 +12,10 @@ Corrections appliquées après lecture directe du code source openbrowser-ai :
      (browser_session is None) → puisqu'on passe une session déjà construite via
      `browser=`, il faut l'appeler nous-mêmes AVANT de la passer, sinon toute
      action browser plante (CDP jamais initialisé).
+  4. Vidéo trop courte (6 s pour un run de 205 s) : Page.startScreencast n'envoie
+     une frame QUE quand la page se repeint, donc aucune frame pendant les attentes
+     LLM, et le recorder écrit à 30 fps fixes → monkeypatch de VideoRecorderService
+     (voir section dédiée plus bas).
 """
 import asyncio
 import glob
@@ -19,6 +23,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 
 # ⭐ ACTIVATION LOGS INTERNES DU FRAMEWORK (avant tout import openbrowser)
@@ -35,6 +40,76 @@ from openai import AsyncOpenAI
 from openbrowser import CodeAgent
 from openbrowser.llm import ChatOpenAI
 from openbrowser.browser import BrowserProfile, BrowserSession
+from openbrowser.browser.video_recorder import VideoRecorderService
+
+
+# ---------------------------------------------------------------------------
+# ⭐ MONKEYPATCH VIDEO : combler les trous pendant les attentes LLM
+#
+# Problème confirmé sur un vrai run : 205 s réelles -> 199 frames -> 6,6 s de
+# vidéo. CDP Page.startScreencast n'émet une frame que sur repaint visuel, donc
+# pendant qu'un LLM lent réfléchit (page figée) il n'arrive aucune frame, et
+# VideoRecorderService écrit à 30 fps fixes sans tenir compte du temps réel.
+#
+# Solution : quand une nouvelle frame arrive après une pause > MIN_GAP_SECONDS,
+# on réécrit d'abord la dernière image (gel) pendant min(pause, cap) secondes.
+#
+# Pourquoi pas un simple "rappeler add_frame N fois" :
+#   - add_frame() est appelé depuis un thread pool (run_in_executor) → il faut
+#     un verrou, sinon état partagé corrompu + "generator already executing"
+#   - add_frame() lance un sous-processus ffmpeg PAR frame → on réutilise le
+#     tableau numpy déjà décodé et on l'écrit directement dans le writer.
+#
+# Réglage : VIDEO_FREEZE_CAP_SECONDS (env). 3 s ≈ vidéo compacte (~19 s pour
+# le run de 205 s), 10 s ≈ plus proche du temps réel (~40 s).
+# ---------------------------------------------------------------------------
+FREEZE_CAP_SECONDS = float(os.environ.get("VIDEO_FREEZE_CAP_SECONDS", "3.0"))
+MIN_GAP_SECONDS = 0.5  # en dessous : flux normal, on ne touche à rien
+
+_video_lock = threading.Lock()
+_orig_recorder_start = VideoRecorderService.start
+_orig_recorder_add_frame = VideoRecorderService.add_frame
+
+
+def _patched_recorder_start(self):
+    _orig_recorder_start(self)
+    self._last_array = None
+    self._last_wall = None
+    writer = self._writer
+    if writer is not None:
+        raw_append = writer.append_data
+
+        def append_and_remember(arr, *args, **kwargs):
+            self._last_array = arr
+            return raw_append(arr, *args, **kwargs)
+
+        writer.append_data = append_and_remember
+        self._raw_append = raw_append
+
+
+def _patched_recorder_add_frame(self, frame_data_b64):
+    now = time.monotonic()
+    with _video_lock:  # add_frame arrive depuis un thread pool : on sérialise
+        last = getattr(self, "_last_array", None)
+        last_t = getattr(self, "_last_wall", None)
+        if (
+            self._is_active
+            and self._writer is not None
+            and last is not None
+            and last_t is not None
+        ):
+            gap = now - last_t
+            if gap > MIN_GAP_SECONDS:
+                n_fill = int(min(gap, FREEZE_CAP_SECONDS) * self.framerate)
+                for _ in range(n_fill):
+                    # pas de ffmpeg : on réécrit l'image déjà décodée
+                    self._raw_append(last)
+        _orig_recorder_add_frame(self, frame_data_b64)
+        self._last_wall = now
+
+
+VideoRecorderService.start = _patched_recorder_start
+VideoRecorderService.add_frame = _patched_recorder_add_frame
 
 
 # ---------------------------------------------------------------------------
@@ -55,6 +130,7 @@ print("Recordings dir : " + RECORDINGS_DIR)
 print("Groq key          : " + str(bool(GROQ_API_KEY)))
 print("Google AI Std key : " + str(bool(GOOGLE_API_KEY)))
 print("OpenRouter key    : " + str(bool(OPENROUTER_API_KEY)))
+print("Video freeze cap  : %.1fs" % FREEZE_CAP_SECONDS)
 
 
 # ---------------------------------------------------------------------------
@@ -552,6 +628,8 @@ async def preflight_api_check(model_config):
 #   FIX #3 : consignes QA fusionnees dans task (pas de system prompt custom)
 #   FIX #4 : await browser_session.start() AVANT de la passer a CodeAgent
 #            (CodeAgent ne l'appelle que s'il cree lui-meme la session)
+#   FIX #5 : monkeypatch VideoRecorderService (gel des frames pendant les
+#            attentes LLM, voir section MONKEYPATCH VIDEO en haut du fichier)
 # ---------------------------------------------------------------------------
 async def run_attempt(model_config, task):
     provider = model_config["provider"]
