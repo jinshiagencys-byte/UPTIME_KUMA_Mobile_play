@@ -41,6 +41,7 @@ from openbrowser import CodeAgent
 from openbrowser.llm import ChatOpenAI
 from openbrowser.browser import BrowserProfile, BrowserSession
 from openbrowser.browser.video_recorder import VideoRecorderService
+from openbrowser.browser.watchdogs.recording_watchdog import RecordingWatchdog
 
 
 # ---------------------------------------------------------------------------
@@ -58,7 +59,11 @@ from openbrowser.browser.video_recorder import VideoRecorderService
 #   - add_frame() est appelé depuis un thread pool (run_in_executor) → il faut
 #     un verrou, sinon état partagé corrompu + "generator already executing"
 #   - add_frame() lance un sous-processus ffmpeg PAR frame → on réutilise le
-#     tableau numpy déjà décodé et on l'écrit directement dans le writer.
+#     tableau numpy déjà décodé et on l'écrit directement dans le writer
+#   - le traitement d'une frame (ffmpeg) est plus lent que leur cadence d'arrivée
+#     sur un runner CPU : il faut mesurer les pauses à l'instant de RÉCEPTION de
+#     la frame (event loop, via on_screencastFrame), pas au moment où un thread
+#     la traite, sinon le retard de traitement serait pris pour un silence.
 #
 # Réglage : VIDEO_FREEZE_CAP_SECONDS (env). 3 s ≈ vidéo compacte (~19 s pour
 # le run de 205 s), 10 s ≈ plus proche du temps réel (~40 s).
@@ -87,8 +92,10 @@ def _patched_recorder_start(self):
         self._raw_append = raw_append
 
 
-def _patched_recorder_add_frame(self, frame_data_b64):
-    now = time.monotonic()
+def _patched_recorder_add_frame(self, frame_data_b64, received_at=None):
+    # received_at : instant de réception (fourni par on_screencastFrame patché).
+    # Absent pour la capture finale de BrowserStopEvent -> on prend "maintenant".
+    now = received_at if received_at is not None else time.monotonic()
     with _video_lock:  # add_frame arrive depuis un thread pool : on sérialise
         last = getattr(self, "_last_array", None)
         last_t = getattr(self, "_last_wall", None)
@@ -105,11 +112,25 @@ def _patched_recorder_add_frame(self, frame_data_b64):
                     # pas de ffmpeg : on réécrit l'image déjà décodée
                     self._raw_append(last)
         _orig_recorder_add_frame(self, frame_data_b64)
-        self._last_wall = now
+        # max() : les threads peuvent passer le verrou dans le désordre
+        self._last_wall = now if last_t is None else max(now, last_t)
+
+
+def _patched_on_screencast_frame(self, event, session_id):
+    """Copie de RecordingWatchdog.on_screencastFrame (openbrowser-ai 0.1.50)
+    + horodatage de réception transmis à add_frame."""
+    if not self._recorder:
+        return
+    loop = asyncio.get_running_loop()
+    loop.run_in_executor(
+        None, self._recorder.add_frame, event["data"], time.monotonic()
+    )
+    asyncio.create_task(self._ack_screencast_frame(event, session_id))
 
 
 VideoRecorderService.start = _patched_recorder_start
 VideoRecorderService.add_frame = _patched_recorder_add_frame
+RecordingWatchdog.on_screencastFrame = _patched_on_screencast_frame
 
 
 # ---------------------------------------------------------------------------
