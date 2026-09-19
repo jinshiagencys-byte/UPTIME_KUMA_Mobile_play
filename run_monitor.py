@@ -4,7 +4,7 @@ Priorité : thinkingmachines/inkling:free (OpenRouter)
 Fallback : Google AI Studio (Gemini 3.x) via wrapper custom
            puis autres modèles gratuits OpenRouter
 Screenshots + timelapse MP4
-Passe au modèle suivant si 0 action réussie
+Passe au modèle suivant si 0 action LLM réussie
 """
 import asyncio
 import json
@@ -38,12 +38,6 @@ print("OpenRouter key       : " + str(bool(OPENROUTER_API_KEY)))
 # Wrapper custom pour Google AI Studio
 # ---------------------------------------------------------------------------
 class GoogleGeminiWrapper:
-    """
-    Wrapper LLM pour Google AI Studio via endpoint OpenAI-compatible.
-    N'envoie PAS frequency_penalty ni presence_penalty (non supportés par Google).
-    Fournit usage_metadata requis par openbrowser-ai pour la télémétrie.
-    """
-
     def __init__(self, model, api_key, base_url, temperature=0.0):
         self.client = AsyncOpenAI(api_key=api_key, base_url=base_url)
         self.model = model
@@ -450,6 +444,10 @@ async def screenshot_recorder(agent, interval=2.0):
 async def close_agent_session(agent) -> None:
     if agent is None:
         return
+    
+    # ⚠️ IMPORTANT : Laisser le temps aux screenshots de se sauvegarder
+    await asyncio.sleep(3)
+    
     session = None
     for attr_name in ("browser_session", "browser", "session"):
         session = getattr(agent, attr_name, None)
@@ -478,6 +476,34 @@ async def close_agent_session(agent) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Détection d'erreurs spécifiques
+# ---------------------------------------------------------------------------
+def is_agentic_harness_error(error_text: str) -> bool:
+    """Détecte l'erreur spécifique OpenRouter 'agentic harness only'"""
+    lower = error_text.lower()
+    return (
+        "agentic harness" in lower or
+        "only available on agentic" in lower or
+        "try plugging it into a coding agent" in lower
+    )
+
+
+def is_fatal_model_error(output_text: str) -> bool:
+    """Détecte les erreurs qui justifient de passer immédiatement au modèle suivant"""
+    lower = output_text.lower()
+    fatal_patterns = [
+        "agentic harness",
+        "only available on agentic",
+        "8 consecutive llm failures",
+        "terminating: 8 consecutive",
+        "no endpoints found",
+        "this model is unavailable",
+        "model not found",
+    ]
+    return any(pattern in lower for pattern in fatal_patterns)
+
+
+# ---------------------------------------------------------------------------
 # Tentative
 # ---------------------------------------------------------------------------
 async def run_attempt(model_config: dict, task: str):
@@ -493,6 +519,7 @@ async def run_attempt(model_config: dict, task: str):
 
     agent = None
     recorder_task = None
+    raw_output_text = ""
 
     try:
         if use_wrapper:
@@ -532,26 +559,56 @@ async def run_attempt(model_config: dict, task: str):
             print("Timeout global pour " + model_name)
             return None
 
-        cells = getattr(result, "cells", None) or getattr(result, "history", None) or []
-        successful_cells = 0
-        for cell in cells:
-            status = getattr(cell, "status", None)
-            if status is not None and "success" in str(status).lower():
-                successful_cells += 1
-            elif getattr(cell, "output", ""):
-                successful_cells += 1
+        # Capturer le texte brut pour détecter les erreurs fatales
+        raw_output_text = str(result)
 
-        print("Cellules totales : %d, reussies : %d" % (len(cells), successful_cells))
-
-        if successful_cells < 1:
-            print("ATTENTION : %s n'a effectue AUCUNE action reussie" % model_name)
+        # ⚠️ DÉTECTION CRITIQUE : Erreur "agentic harness" ou échecs consécutifs
+        if is_fatal_model_error(raw_output_text):
+            print("❌ ERREUR FATALE DETECTEE : le modele %s ne peut pas etre utilise" % model_name)
+            print("   → Passage immediat au modele suivant")
             return None
 
+        cells = getattr(result, "cells", None) or getattr(result, "history", None) or []
+        successful_cells = 0
+        llm_actions = 0
+        
+        for cell in cells:
+            status = getattr(cell, "status", None)
+            source = getattr(cell, "source", "") or ""
+            
+            # Ne compter que les actions générées par le LLM (pas la navigation initiale)
+            is_llm_action = (
+                "await " in source and 
+                "navigate(" not in source and
+                len(source.strip()) > 20
+            )
+            
+            if status is not None and "success" in str(status).lower():
+                successful_cells += 1
+                if is_llm_action:
+                    llm_actions += 1
+            elif getattr(cell, "output", ""):
+                successful_cells += 1
+                if is_llm_action:
+                    llm_actions += 1
+
+        print("Cellules totales : %d, reussies : %d, actions LLM : %d" % (
+            len(cells), successful_cells, llm_actions))
+
+        # ⚠️ VALIDATION RENFORCÉE : Exiger au moins 1 action LLM OU un JSON valide
         final_text = extract_final_result(result)
+        report = extract_json_from_text(final_text)
+        
+        has_valid_json = report is not None and "overall_status" in report
+        
+        if llm_actions < 1 and not has_valid_json:
+            print("❌ REJETE : %s n'a effectue AUCUNE action LLM reelle" % model_name)
+            print("   (seule la navigation initiale a reussi)")
+            return None
+
         print("Resultat extrait (" + model_name + ") :")
         print(final_text[:800])
 
-        report = extract_json_from_text(final_text)
         if report:
             return normalize_report(report, model_name)
 
