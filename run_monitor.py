@@ -1,7 +1,8 @@
 """
 OpenBrowser-AI — Monitoring fonctionnel.
-Google AI Studio via wrapper OpenAI-compatible (contourne frequency_penalty + usage_metadata)
-Fallback OpenRouter (modèles gratuits fonctionnels)
+Priorité : thinkingmachines/inkling:free (OpenRouter)
+Fallback : Google AI Studio (Gemini 3.x) via wrapper custom
+           puis autres modèles gratuits OpenRouter
 Screenshots + timelapse MP4
 Passe au modèle suivant si 0 action réussie
 """
@@ -47,12 +48,10 @@ class GoogleGeminiWrapper:
         self.client = AsyncOpenAI(api_key=api_key, base_url=base_url)
         self.model = model
         self.temperature = temperature
-        # Attributs requis par openbrowser-ai
         self.provider = "google"
         self.model_name = model
 
     async def ainvoke(self, messages, config=None, **kwargs):
-        """Appelle l'API Google AI Studio sans paramètres non supportés."""
         openai_messages = []
         for msg in messages:
             if hasattr(msg, 'type'):
@@ -83,7 +82,6 @@ class GoogleGeminiWrapper:
             print("Google API error: " + str(e))
             raise
 
-        # Construire AIMessage avec usage_metadata (requis par openbrowser-ai)
         try:
             from langchain_core.messages import AIMessage
             msg = AIMessage(content=content)
@@ -125,11 +123,22 @@ class GoogleGeminiWrapper:
 # ---------------------------------------------------------------------------
 MODEL_CHAIN = []
 
+# 🥇 PRIORITÉ 1 : thinkingmachines/inkling:free (OpenRouter)
+if OPENROUTER_API_KEY:
+    MODEL_CHAIN.append({
+        "provider": "openrouter",
+        "model": "thinkingmachines/inkling:free",
+        "key": OPENROUTER_API_KEY,
+        "base_url": "https://openrouter.ai/api/v1",
+        "use_wrapper": False,
+    })
+
+# 🥈 PRIORITÉ 2 : Google AI Studio (Gemini 3.x)
 if GOOGLE_API_KEY:
     for m in [
-        "gemini-3.5-flash",     # Le plus rapide
-        "gemini-3.6-flash",     # Plus de contexte
-        "gemini-2.5-pro",       # Plus puissant
+        "gemini-3.5-flash",
+        "gemini-3.6-flash",
+        "gemini-2.5-pro",
     ]:
         MODEL_CHAIN.append({
             "provider": "google_openai",
@@ -139,6 +148,7 @@ if GOOGLE_API_KEY:
             "use_wrapper": True,
         })
 
+# 🥉 PRIORITÉ 3 : Fallbacks OpenRouter gratuits
 if OPENROUTER_API_KEY:
     for m in [
         "nousresearch/hermes-3-llama-3.1-405b:free",
