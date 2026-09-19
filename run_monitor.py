@@ -1,35 +1,29 @@
 """
-OpenBrowser-AI — Monitoring fonctionnel.
-STRATÉGIE : OpenRouter (confirmé) -> Groq -> Google (dernier recours)
-Vidéo native via CDP Page.startScreencast + imageio_ffmpeg (MP4 direct).
-Preflight + succès AVANT erreurs fatales.
-Logging DEBUG activé pour diagnostiquer le pipeline vidéo.
+OpenBrowser-AI — Monitoring fonctionnel (version budget zero : OpenRouter gratuit).
 
-Corrections appliquées après lecture directe du code source openbrowser-ai :
-  1. CodeAgent n'a PAS de paramètre `browser_profile` → passer via `browser=BrowserSession(...)`
-  2. CodeAgent n'a PAS de paramètre pour system prompt custom → fusionné dans `task`
-  3. CodeAgent n'appelle `browser_session.start()` QUE s'il crée lui-même la session
-     (browser_session is None) → puisqu'on passe une session déjà construite via
-     `browser=`, il faut l'appeler nous-mêmes AVANT de la passer, sinon toute
-     action browser plante (CDP jamais initialisé).
-  4. Vidéo trop courte (6 s pour un run de 205 s) : Page.startScreencast n'envoie
-     une frame QUE quand la page se repeint, donc aucune frame pendant les attentes
-     LLM, et le recorder écrit à 30 fps fixes → monkeypatch de VideoRecorderService
-     (voir section dédiée plus bas).
-  5. Run réel usinformatique.com -> ERROR : un appel à openrouter/free est resté
-     muet 232 s (ChatOpenAI par défaut = timeout 600 s + 5 retries) jusqu'au
-     timeout global. -> timeout par appel LLM (LLM_CALL_TIMEOUT_SECONDS).
-  6. Erreur 'AIMessage' object has no attribute 'completion' (Gemini) : nos
-     wrappers maison renvoyaient un AIMessage alors qu'openbrowser-ai attend un
-     ChatInvokeCompletion. -> tous les providers passent par ChatOpenAI
-     (endpoints compatibles OpenAI), wrappers supprimés.
-  7. IDs Groq morts (llama-3.3-70b-specdec, qwen/qwen-3.5-32b) remplacés par
-     ceux que Groq recommande sur sa page de dépréciation.
-  8. Verdict fabriqué : sans JSON exploitable, le script déduisait UP/DOWN en
-     cherchant "error" dans str(result) — or repr(CodeCell) contient toujours
-     "error=None" -> DOWN systématique, sans aucun test réel. Supprimé : le
-     rapport doit venir de done() (agent.namespace['_task_result']), et un UP
-     sans interaction réelle (click/input/scroll...) est rejeté.
+STRATEGIE : openrouter/free uniquement (seul modele confirme sur de vrais runs).
+Groq / Google restent dans le code mais sont DESACTIVES par defaut
+(ENABLE_FALLBACKS=1 pour les reactiver).
+
+Changements de cette version :
+  A. Plusieurs pages par run : le workflow doit passer PAGES_JSON (liste des pages
+     du relay). SITE_URL est toujours teste ; les autres pages tournent par
+     rotation (MAX_PAGES_PER_RUN). Les pages non testees sont rapportees en
+     UNKNOWN pour ne pas etre supprimees par pages-report.
+  B. Prompt plus strict : format ```python obligatoire (openrouter/free repond
+     parfois en <tool_call>...), une action par etape, jamais de done() avant
+     d'avoir vu le resultat, budget d'etapes explicite.
+  C. MAX_STEPS 8 -> 12 (les reponses hors format consomment des etapes).
+  D. Plusieurs essais du meme modele (OPENROUTER_ATTEMPTS) : openrouter/free
+     change de modele sous le capot, un 2e essai peut reussir.
+  E. Constat partiel conserve : si l'agent a interagi mais n'a pas appele done(),
+     on garde un rapport ERROR factuel (pas de verdict UP/DOWN invente) au lieu
+     de "Tous les modeles ont echoue".
+  F. Detection quota/erreur fatale : plus de correspondance sur "429"/"402" nus.
+
+Acquis conserves : browser=BrowserSession(...) + await start() manuel, consignes
+fusionnees dans task, ChatOpenAI pour tous les providers, timeout par appel LLM,
+verdict uniquement depuis done(), monkeypatch video (gel des frames).
 """
 import asyncio
 import glob
@@ -37,10 +31,10 @@ import json
 import logging
 import os
 import re
+import sys
 import threading
 import time
 
-# ⭐ ACTIVATION LOGS INTERNES DU FRAMEWORK (avant tout import openbrowser)
 logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s %(levelname)-8s [%(name)s] %(message)s",
@@ -59,31 +53,12 @@ from openbrowser.browser.watchdogs.recording_watchdog import RecordingWatchdog
 
 
 # ---------------------------------------------------------------------------
-# ⭐ MONKEYPATCH VIDEO : combler les trous pendant les attentes LLM
-#
-# Problème confirmé sur un vrai run : 205 s réelles -> 199 frames -> 6,6 s de
-# vidéo. CDP Page.startScreencast n'émet une frame que sur repaint visuel, donc
-# pendant qu'un LLM lent réfléchit (page figée) il n'arrive aucune frame, et
-# VideoRecorderService écrit à 30 fps fixes sans tenir compte du temps réel.
-#
-# Solution : quand une nouvelle frame arrive après une pause > MIN_GAP_SECONDS,
-# on réécrit d'abord la dernière image (gel) pendant min(pause, cap) secondes.
-#
-# Pourquoi pas un simple "rappeler add_frame N fois" :
-#   - add_frame() est appelé depuis un thread pool (run_in_executor) → il faut
-#     un verrou, sinon état partagé corrompu + "generator already executing"
-#   - add_frame() lance un sous-processus ffmpeg PAR frame → on réutilise le
-#     tableau numpy déjà décodé et on l'écrit directement dans le writer
-#   - le traitement d'une frame (ffmpeg) est plus lent que leur cadence d'arrivée
-#     sur un runner CPU : il faut mesurer les pauses à l'instant de RÉCEPTION de
-#     la frame (event loop, via on_screencastFrame), pas au moment où un thread
-#     la traite, sinon le retard de traitement serait pris pour un silence.
-#
-# Réglage : VIDEO_FREEZE_CAP_SECONDS (env). 3 s ≈ vidéo compacte (~19 s pour
-# le run de 205 s), 10 s ≈ plus proche du temps réel (~40 s).
+# MONKEYPATCH VIDEO : combler les trous pendant les attentes LLM
+# (Page.startScreencast n'emet une frame que sur repaint ; le recorder ecrit a
+# 30 fps fixes -> on rejoue la derniere image pendant les pauses, plafonnee.)
 # ---------------------------------------------------------------------------
 FREEZE_CAP_SECONDS = float(os.environ.get("VIDEO_FREEZE_CAP_SECONDS", "3.0"))
-MIN_GAP_SECONDS = 0.5  # en dessous : flux normal, on ne touche à rien
+MIN_GAP_SECONDS = 0.5
 
 _video_lock = threading.Lock()
 _orig_recorder_start = VideoRecorderService.start
@@ -107,10 +82,8 @@ def _patched_recorder_start(self):
 
 
 def _patched_recorder_add_frame(self, frame_data_b64, received_at=None):
-    # received_at : instant de réception (fourni par on_screencastFrame patché).
-    # Absent pour la capture finale de BrowserStopEvent -> on prend "maintenant".
     now = received_at if received_at is not None else time.monotonic()
-    with _video_lock:  # add_frame arrive depuis un thread pool : on sérialise
+    with _video_lock:
         last = getattr(self, "_last_array", None)
         last_t = getattr(self, "_last_wall", None)
         if (
@@ -123,16 +96,14 @@ def _patched_recorder_add_frame(self, frame_data_b64, received_at=None):
             if gap > MIN_GAP_SECONDS:
                 n_fill = int(min(gap, FREEZE_CAP_SECONDS) * self.framerate)
                 for _ in range(n_fill):
-                    # pas de ffmpeg : on réécrit l'image déjà décodée
                     self._raw_append(last)
         _orig_recorder_add_frame(self, frame_data_b64)
-        # max() : les threads peuvent passer le verrou dans le désordre
         self._last_wall = now if last_t is None else max(now, last_t)
 
 
 def _patched_on_screencast_frame(self, event, session_id):
     """Copie de RecordingWatchdog.on_screencastFrame (openbrowser-ai 0.1.50)
-    + horodatage de réception transmis à add_frame."""
+    + horodatage de reception transmis a add_frame."""
     if not self._recorder:
         return
     loop = asyncio.get_running_loop()
@@ -148,15 +119,30 @@ RecordingWatchdog.on_screencastFrame = _patched_on_screencast_frame
 
 
 # ---------------------------------------------------------------------------
-# Env
+# Env / reglages
 # ---------------------------------------------------------------------------
 SITE_URL = os.environ.get("SITE_URL", "")
 SITE_ID = os.environ.get("SITE_ID", "")
 SITE_TYPE = os.environ.get("SITE_TYPE", "generic")
 REQUIREMENTS = os.environ.get("REQUIREMENTS", "")
+PAGES_JSON = os.environ.get("PAGES_JSON", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+
+ENABLE_FALLBACKS = os.environ.get("ENABLE_FALLBACKS", "0") == "1"
+OPENROUTER_ATTEMPTS = int(os.environ.get("OPENROUTER_ATTEMPTS", "2"))
+MAX_PAGES_PER_RUN = int(os.environ.get("MAX_PAGES_PER_RUN", "2"))
+
+LLM_CALL_TIMEOUT = float(os.environ.get("LLM_CALL_TIMEOUT_SECONDS", "100"))
+GLOBAL_TIMEOUT_SECONDS = float(os.environ.get("GLOBAL_TIMEOUT_SECONDS", "360"))
+TOTAL_BUDGET_SECONDS = float(os.environ.get("TOTAL_BUDGET_SECONDS", "720"))
+MIN_ATTEMPT_SECONDS = 120  # ne pas demarrer un essai s'il reste moins que ca
+
+MAX_STEPS = int(os.environ.get("MAX_STEPS", "12"))
+TEST_STEPS = max(MAX_STEPS - 4, 4)   # etapes de test
+DONE_STEP = TEST_STEPS + 1           # a partir d'ici : done() obligatoire
+DELAY_BETWEEN_ATTEMPTS = 3
 
 RECORDINGS_DIR = os.path.abspath("./recordings")
 os.makedirs(RECORDINGS_DIR, exist_ok=True)
@@ -165,29 +151,23 @@ print("Recordings dir : " + RECORDINGS_DIR)
 print("Groq key          : " + str(bool(GROQ_API_KEY)))
 print("Google AI Std key : " + str(bool(GOOGLE_API_KEY)))
 print("OpenRouter key    : " + str(bool(OPENROUTER_API_KEY)))
+print("Fallbacks payants/quota : " + ("ON" if ENABLE_FALLBACKS else "OFF"))
 print("Video freeze cap  : %.1fs" % FREEZE_CAP_SECONDS)
+print("Max steps / essai : %d | pages max / run : %d" % (MAX_STEPS, MAX_PAGES_PER_RUN))
 
 
 # ---------------------------------------------------------------------------
-# Construction du LLM — ChatOpenAI pour TOUS les providers
-# (OpenRouter, Groq et Google AI Studio exposent des endpoints compatibles
-# OpenAI ; ChatOpenAI renvoie le ChatInvokeCompletion qu'attend openbrowser-ai)
+# LLM — ChatOpenAI pour TOUS les providers
 # ---------------------------------------------------------------------------
 def build_llm(model_config):
     llm_kwargs = {}
     if model_config["provider"] != "openrouter":
-        # openrouter/free : réglages historiques inchangés (validés en vrai).
-        # Groq / Google : on n'envoie ni frequency_penalty (0.3 par défaut dans
-        # ChatOpenAI) ni plafond de tokens, pour rester sur les défauts du provider.
         llm_kwargs = {"frequency_penalty": None, "max_completion_tokens": None}
     return ChatOpenAI(
         model=model_config["model"],
         base_url=model_config["base_url"],
         api_key=model_config["key"],
         temperature=0.0,
-        # Par défaut ChatOpenAI = timeout lecture 600 s + 5 retries : un appel
-        # muet bloquait tout le run. Ici l'appel échoue vite et la boucle
-        # interne d'openbrowser-ai le relance (compteur "consecutive errors").
         timeout=LLM_CALL_TIMEOUT,
         max_retries=0,
         **llm_kwargs,
@@ -195,137 +175,133 @@ def build_llm(model_config):
 
 
 # ---------------------------------------------------------------------------
-# Chaîne de modèles — OpenRouter d'abord
+# Chaine de modeles : OpenRouter (x OPENROUTER_ATTEMPTS) puis, si active, le reste
 # ---------------------------------------------------------------------------
 MODEL_CHAIN = []
 
 if OPENROUTER_API_KEY:
-    MODEL_CHAIN.append({
-        "provider": "openrouter",
-        "model": "openrouter/free",
-        "key": OPENROUTER_API_KEY,
-        "base_url": "https://openrouter.ai/api/v1",
-    })
-
-# IDs surchargeables par variable d'environnement (séparés par des virgules) :
-# les catalogues changent souvent (Groq a déjà retiré 4 modèles en 2026).
-# Défaut Groq = remplacements recommandés par Groq (console.groq.com/docs/deprecations)
-GROQ_MODELS = os.environ.get("GROQ_MODELS", "openai/gpt-oss-120b,qwen/qwen3.6-27b")
-GOOGLE_MODELS = os.environ.get("GOOGLE_MODELS", "gemini-3.5-flash,gemini-3.6-flash")
-
-if GROQ_API_KEY:
-    for m in [x.strip() for x in GROQ_MODELS.split(",") if x.strip()]:
+    for _ in range(max(OPENROUTER_ATTEMPTS, 1)):
         MODEL_CHAIN.append({
-            "provider": "groq",
-            "model": m,
-            "key": GROQ_API_KEY,
-            "base_url": "https://api.groq.com/openai/v1",
+            "provider": "openrouter",
+            "model": os.environ.get("OPENROUTER_MODEL", "openrouter/free"),
+            "key": OPENROUTER_API_KEY,
+            "base_url": "https://openrouter.ai/api/v1",
         })
 
-if GOOGLE_API_KEY:
-    for m in [x.strip() for x in GOOGLE_MODELS.split(",") if x.strip()]:
-        MODEL_CHAIN.append({
-            "provider": "google_openai",
-            "model": m,
-            "key": GOOGLE_API_KEY,
-            "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-        })
+if ENABLE_FALLBACKS:
+    GROQ_MODELS = os.environ.get("GROQ_MODELS", "openai/gpt-oss-120b")
+    GOOGLE_MODELS = os.environ.get("GOOGLE_MODELS", "gemini-3.5-flash")
+    if GROQ_API_KEY:
+        for m in [x.strip() for x in GROQ_MODELS.split(",") if x.strip()]:
+            MODEL_CHAIN.append({
+                "provider": "groq", "model": m, "key": GROQ_API_KEY,
+                "base_url": "https://api.groq.com/openai/v1",
+            })
+    if GOOGLE_API_KEY:
+        for m in [x.strip() for x in GOOGLE_MODELS.split(",") if x.strip()]:
+            MODEL_CHAIN.append({
+                "provider": "google_openai", "model": m, "key": GOOGLE_API_KEY,
+                "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+            })
 
 if not MODEL_CHAIN:
     print("ERREUR : aucune cle API disponible. Abandon.")
-    import sys
     sys.exit(1)
 
 print("Chaine finale :")
 for i, entry in enumerate(MODEL_CHAIN):
     print("  %d. [%s] %s" % (i + 1, entry["provider"], entry["model"]))
 
-# Un vrai run a montré des appels LLM légitimes de 68 s et 76 s sur openrouter/free
-# -> le timeout par appel doit rester au-dessus, et le global aussi.
-LLM_CALL_TIMEOUT = float(os.environ.get("LLM_CALL_TIMEOUT_SECONDS", "100"))
-GLOBAL_TIMEOUT_SECONDS = float(os.environ.get("GLOBAL_TIMEOUT_SECONDS", "300"))
-MAX_STEPS = 8
-DELAY_BETWEEN_ATTEMPTS = 3
-
 
 # ---------------------------------------------------------------------------
-# Template de consignes (fusionné dans task, pas dans system_prompt.md
-# puisque CodeAgent n'a aucun point d'injection pour un system prompt custom)
+# Consignes (fusionnees dans task : CodeAgent n'a pas de system prompt custom)
 # ---------------------------------------------------------------------------
 CONSIGNES_TEMPLATE = """
 Tu es un ingenieur QA fonctionnel. TESTE l'application web, ne te contente pas d'observer.
 
-FORMAT DE SORTIE (CRITIQUE) :
-Tu DOIS ecrire des blocs Python entre triple backticks. Exemple :
+FORMAT DE SORTIE (CRITIQUE : une reponse hors format fait PERDRE une etape) :
+- Chaque reponse = UNE phrase courte, puis UN SEUL bloc ```python.
+- JAMAIS de tags <tool_call>, <arg_key>, <arg_value>. JAMAIS de nom_outil(args) hors bloc python.
+- UNE seule petite action par etape (navigate, OU input_text puis click, OU un scroll).
+- N'ecris JAMAIS await done() dans la meme reponse que tes tests. Attends d'avoir
+  VU le resultat de tes actions (etape suivante) avant de conclure.
+- N'invente PAS de selecteurs CSS : utilise les index des elements affiches dans
+  l'etat de la page (click(index=N), input_text(index=N, text=...)).
 
+Exemple de reponse valide :
 Je verifie le titre de la page.
 ```python
 title = await evaluate('document.title')
 print(title)
 ```
 
-N'utilise PAS de tags XML. N'utilise PAS la syntaxe tool_name(args).
-UNIQUEMENT des blocs de code Python.
+BUDGET : __MAX_STEPS__ etapes au total.
+- Etapes 1 a __TEST_STEPS__ : tester.
+- A partir de l'etape __DONE_STEP__ : appelle done() avec ce que tu as observe, meme incomplet.
+- Un rapport incomplet mais honnete vaut mieux que pas de rapport.
 
-REGLES :
-1. Effectue au moins UNE vraie interaction utilisateur et verifie avec une assertion.
+REGLES DE TEST :
+1. Effectue au moins UNE vraie interaction utilisateur (click / input_text / scroll) et verifie le resultat.
 2. Page chargee N'EST PAS un test. Bouton existe N'EST PAS un test.
 3. Test valide = action + observation + assertion.
-4. Utilise Python assert.
-
-CONDITION D'ARRET STRICTE :
-- Apres 6 appels d'outils maximum, appelle done() quoi qu'il arrive.
-- Les resultats partiels sont acceptables.
+4. Ne declare UP que si tu as vu de tes yeux le resultat attendu apres ton interaction.
 
 ANOMALIES (echecs fonctionnels) :
 - Texte contenant Erreur, Error, Failed, undefined, null, 0 produit, Aucun produit.
-- Lien avec /undefined dans l'URL.
-- Liste de produits vide sur une page catalogue.
+- Lien avec /undefined dans l'URL. Image avec alt="undefined".
+- Liste de produits vide sur une page catalogue. Carrousel/composant en erreur de chargement.
 
+PAGE A TESTER : __TARGET_URL__
 INTERACTIONS REQUISES :
 __REQUIREMENTS__
 
 SORTIE FINALE :
 Appelle done(text=...) avec UNIQUEMENT un JSON valide dans text :
-  overall_status, site_type, actions_completed, model_used, pages[].
+  overall_status (UP ou DOWN), site_type, actions_completed, model_used, pages[].
 
-Exemple de forme attendue (remplace les valeurs par le resultat REEL observe) :
+Exemple de forme (remplace par le resultat REEL observe) :
 ```python
 import json
-result = {"overall_status": "DOWN ou UP selon ce que tu observes",
+result = {"overall_status": "DOWN ou UP selon ce que tu as observe",
 "site_type": "__SITE_TYPE__", "actions_completed": True,
 "model_used": "__MODEL_NAME__",
-"pages": [{"url": "page testee", "status": "DOWN ou UP",
+"pages": [{"url": "__TARGET_URL__", "status": "DOWN ou UP",
 "http_code": 200, "action_tested": "description de l'action",
 "assertion_passed": True_ou_False, "note": "ce que tu as observe"}]}
 await done(text=json.dumps(result, ensure_ascii=False), success=True)
 ```
 """
 
+# Pour les pages secondaires (le REQUIREMENTS du site vise la page d'accueil)
+PAGE_REQUIREMENTS = (
+    "1. Assert the page content loaded (title and main content are not an error, "
+    "placeholder or empty). 2. Perform ONE real interaction (click a link/button, "
+    "or scroll and click something) and assert the result is correct."
+)
 
-def build_full_task(model_name, basic_task):
-    """
-    Construit la tache complete : URL + instructions de base, puis les
-    consignes QA completes (format JSON, regles, limite d'appels).
 
-    IMPORTANT : CodeAgent n'a aucun parametre pour un system prompt custom
-    (system_prompt.md est fixe en interne, charge tel quel). Tout doit donc
-    passer par `task`, qui devient un simple UserMessage("Task: " + task).
-    extract_url_from_task() scanne l'integralite de la chaine (pas seulement
-    le debut) et deduplique via set(), donc repeter SITE_URL plus loin dans
-    les consignes ne casse pas la detection automatique d'URL.
-    """
+def build_full_task(model_name, target_url, requirements):
+    basic_task = (
+        "Navigate to " + target_url + ". "
+        "Execute the required interactions. Use Python assertions. "
+        "Detect anomalies (errors, undefined, empty listings). "
+        "IMPORTANT: write ONLY valid Python code blocks between triple backticks."
+    )
     consignes = (
         CONSIGNES_TEMPLATE
-        .replace("__REQUIREMENTS__", REQUIREMENTS)
+        .replace("__REQUIREMENTS__", requirements)
         .replace("__SITE_TYPE__", SITE_TYPE)
         .replace("__MODEL_NAME__", model_name)
+        .replace("__TARGET_URL__", target_url)
+        .replace("__MAX_STEPS__", str(MAX_STEPS))
+        .replace("__TEST_STEPS__", str(TEST_STEPS))
+        .replace("__DONE_STEP__", str(DONE_STEP))
     )
     return basic_task + "\n\n---\n\n" + consignes
 
 
 # ---------------------------------------------------------------------------
-# JSON helpers
+# JSON / rapport (le verdict vient UNIQUEMENT de done())
 # ---------------------------------------------------------------------------
 def extract_json_from_text(text):
     if not text:
@@ -374,7 +350,6 @@ _INTERACTION_RE = re.compile("|".join([
 
 
 def parse_report(text):
-    """JSON de rapport valide (overall_status reconnu) ou None. Aucune deduction."""
     if not text:
         return None
     candidate = None
@@ -395,18 +370,15 @@ def parse_report(text):
 
 
 def get_agent_report(agent, result):
-    """Source fiable = ce que l'agent a remis via done() : agent.namespace['_task_result']."""
     ns = getattr(agent, "namespace", None) or {}
     if ns.get("_task_done") and ns.get("_task_result"):
         report = parse_report(ns["_task_result"])
         if report is not None:
             return report
-    # second recours : anciens chemins (source de cellule done(...) / sortie)
     return parse_report(extract_final_result(result))
 
 
 def count_real_interactions(cells):
-    """Cellules reussies contenant une vraie interaction (pas navigate/evaluate de lecture)."""
     n = 0
     for cell in cells:
         if getattr(cell, "error", None):
@@ -422,7 +394,7 @@ def count_real_interactions(cells):
     return n
 
 
-def normalize_report(report, model_name):
+def normalize_report(report, model_name, target_url):
     status = str(report["overall_status"]).upper()
     report["overall_status"] = status
     report["model_used"] = model_name
@@ -430,7 +402,7 @@ def normalize_report(report, model_name):
     report.setdefault("actions_completed", True)
     if not isinstance(report.get("pages"), list) or not report["pages"]:
         report["pages"] = [{
-            "url": SITE_URL,
+            "url": target_url,
             "status": status,
             "http_code": None,
             "action_tested": None,
@@ -440,38 +412,82 @@ def normalize_report(report, model_name):
     return report
 
 
-def judge_run(agent, result, model_name):
-    """(rapport | None, raison). Le verdict vient de l'agent, jamais d'une heuristique."""
+def judge_run(agent, result, model_name, target_url):
     cells = list(getattr(result, "cells", None) or [])
     report = get_agent_report(agent, result)
     interactions = count_real_interactions(cells)
     if report is None:
         return None, "aucun rapport JSON remis par done() : l'agent n'a pas conclu"
     if str(report["overall_status"]).upper() == "UP" and interactions == 0:
-        return None, "UP annonce sans aucune interaction reelle (navigate/evaluate seuls) : pas un test"
-    return normalize_report(report, model_name), "%d interaction(s) reelle(s)" % interactions
+        return None, "UP annonce sans aucune interaction reelle : pas un test"
+    return normalize_report(report, model_name, target_url), \
+        "%d interaction(s) reelle(s)" % interactions
+
+
+def collapse_to_page(report, target_url):
+    """Un run = une entree de page, sur l'URL testee (URLs stables pour le relay :
+    pages-report supprime/recree les URLs absentes du rapport)."""
+    pages = [p for p in (report.get("pages") or []) if isinstance(p, dict)]
+    status = str(report["overall_status"]).upper()
+    actions = [str(p["action_tested"]) for p in pages if p.get("action_tested")]
+    notes = [str(p["note"]) for p in pages if p.get("note")]
+    codes = [p["http_code"] for p in pages if p.get("http_code")]
+    if pages:
+        passed = all(bool(p.get("assertion_passed")) for p in pages)
+    else:
+        passed = status == "UP"
+    return {
+        "url": target_url,
+        "status": status,
+        "http_code": codes[0] if codes else None,
+        "action_tested": (" ; ".join(actions))[:300] or None,
+        "assertion_passed": passed,
+        "note": (" | ".join(notes))[:400],
+    }
+
+
+def build_partial_report(cells, model_name, target_url):
+    """Constat partiel FACTUEL quand l'agent n'a pas conclu. Jamais UP/DOWN :
+    uniquement ERROR + ce qui a ete execute/observe. Retourne (page, score)."""
+    interactions = count_real_interactions(cells)
+    if interactions == 0:
+        return None, 0
+    obs = []
+    for cell in cells[-4:]:
+        err = getattr(cell, "error", None)
+        out = (getattr(cell, "output", "") or "").strip()
+        if err:
+            obs.append("erreur: " + str(err)[:150])
+        elif out:
+            obs.append(out[:150])
+    note = "Test incomplet (l'agent n'a pas remis de rapport done()). %d interaction(s) executee(s)." % interactions
+    if obs:
+        note += " Dernieres observations : " + " / ".join(obs)
+    return {
+        "url": target_url,
+        "status": "ERROR",
+        "http_code": None,
+        "action_tested": "%d interaction(s) sans conclusion (%s)" % (interactions, model_name),
+        "assertion_passed": False,
+        "note": note[:500],
+    }, interactions
 
 
 # ---------------------------------------------------------------------------
-# Fermeture session (le flush video se fait via BrowserStopEvent interne,
-# declenche par stop())
+# Fermeture session (flush video via BrowserStopEvent interne)
 # ---------------------------------------------------------------------------
 async def close_agent_session(agent):
     if agent is None:
         return
-
     session = None
     for attr_name in ("browser_session", "browser", "session"):
         session = getattr(agent, attr_name, None)
         if session is not None:
             print("Session trouvee via agent." + attr_name)
             break
-
     if session is None:
         print("Aucune session trouvee sur l'agent")
     else:
-        # stop() declenche BrowserStopEvent -> le RecordingWatchdog interne
-        # finalise automatiquement le fichier MP4 via CDP+ffmpeg
         for method_name in ("close", "stop", "kill", "shutdown", "cleanup"):
             if not hasattr(session, method_name):
                 continue
@@ -484,30 +500,24 @@ async def close_agent_session(agent):
             except Exception as e:
                 print("Echec " + method_name + "() : " + str(e))
 
-    # Laisser le pipeline CDP+ffmpeg ecrire le MP4 final sur disque
     await asyncio.sleep(5)
-
     videos = (
         glob.glob(os.path.join(RECORDINGS_DIR, "*.mp4"))
         + glob.glob(os.path.join(RECORDINGS_DIR, "*.webm"))
     )
-    print("Videos trouvees dans %s : %d" % (RECORDINGS_DIR, len(videos)))
+    print("Videos dans %s : %d" % (RECORDINGS_DIR, len(videos)))
     for v in videos:
         print("  -> " + v + " (" + str(os.path.getsize(v)) + " octets)")
-    if not videos:
-        print("Contenu du dossier : " + str(os.listdir(RECORDINGS_DIR)))
 
 
 # ---------------------------------------------------------------------------
-# Detection erreurs (appelees UNIQUEMENT si pas de resultat exploitable)
+# Detection erreurs fatales / quota (phrases precises, PAS de codes nus "429"/"402")
 # ---------------------------------------------------------------------------
-def is_fatal_model_error(output_text):
-    lower = output_text.lower()
+def is_fatal_model_error(text):
+    lower = text.lower()
     return any(p in lower for p in [
         "agentic harness",
         "only available on agentic",
-        "8 consecutive llm failures",
-        "terminating: 8 consecutive",
         "no endpoints found",
         "this model is unavailable",
         "model not found",
@@ -515,31 +525,35 @@ def is_fatal_model_error(output_text):
         "unavailable for free",
         "authenticationerror",
         "invalid_api_key",
-        "does not exist",
         "not found for account",
     ])
 
 
-def is_quota_error(output_text):
-    lower = output_text.lower()
+def is_quota_error(text):
+    lower = text.lower()
     return any(p in lower for p in [
         "quota exceeded",
         "resource_exhausted",
-        "429",
         "too many requests",
+        "rate limit exceeded",
+        "free-models-per-day",
         "free_tier_requests",
-        "please retry in",
         "insufficient balance",
         "insufficient_balance",
         "balance is not enough",
-        "402",
     ])
 
 
 # ---------------------------------------------------------------------------
-# Preflight API (1 token)
+# Preflight (1 token), mis en cache par modele
 # ---------------------------------------------------------------------------
+_preflight_cache = {}
+
+
 async def preflight_api_check(model_config):
+    key = (model_config["provider"], model_config["model"])
+    if key in _preflight_cache:
+        return _preflight_cache[key]
     try:
         client = AsyncOpenAI(
             api_key=model_config["key"],
@@ -554,43 +568,37 @@ async def preflight_api_check(model_config):
             timeout=20,
         )
         print("Preflight OK : %s" % model_config["model"])
-        return True
+        ok = True
     except Exception as e:
-        print("Preflight ECHEC : %s -> %s" % (
-            model_config["model"], str(e)[:200]))
-        return False
+        msg = str(e)
+        print("Preflight ECHEC : %s -> %s" % (model_config["model"], msg[:200]))
+        ok = False
+    _preflight_cache[key] = ok
+    return ok
 
 
 # ---------------------------------------------------------------------------
-# Tentative
-#   FIX #1 : succes AVANT erreurs fatales/quota
-#   FIX #2 : browser=BrowserSession(...) au lieu de browser_profile=...
-#   FIX #3 : consignes QA fusionnees dans task (pas de system prompt custom)
-#   FIX #4 : await browser_session.start() AVANT de la passer a CodeAgent
-#            (CodeAgent ne l'appelle que s'il cree lui-meme la session)
-#   FIX #6 : ChatOpenAI pour tous les providers + timeout par appel LLM
-#   FIX #7 : verdict = rapport de done() uniquement (plus d'heuristique par mots-cles)
-#   FIX #5 : monkeypatch VideoRecorderService (gel des frames pendant les
-#            attentes LLM, voir section MONKEYPATCH VIDEO en haut du fichier)
+# Une tentative sur UNE page. Retourne un dict :
+#   report  : rapport valide de done() ou None
+#   partial : (page_dict, score) constat partiel ou (None, 0)
+#   stop    : True si quota/erreur fatale -> inutile de continuer
 # ---------------------------------------------------------------------------
-async def run_attempt(model_config, task):
+async def run_attempt(model_config, target_url, requirements):
     provider = model_config["provider"]
     model_name = model_config["model"]
 
     print("=" * 60)
-    print("TENTATIVE - PROVIDER : %s | MODELE : %s" % (provider, model_name))
+    print("TENTATIVE - PROVIDER : %s | MODELE : %s | PAGE : %s" % (
+        provider, model_name, target_url))
     print("=" * 60)
 
+    outcome = {"report": None, "partial": (None, 0), "stop": False}
     agent = None
     browser_session = None
     start_time = time.time()
 
     try:
         llm = build_llm(model_config)
-
-        # ⭐ FIX #2 : CodeAgent n'accepte PAS browser_profile en kwarg
-        # (silencieusement ignore et logge dans "Ignoring additional kwargs").
-        # Il faut construire et passer une vraie BrowserSession.
         profile = BrowserProfile(
             headless=True,
             viewport_width=1280,
@@ -598,20 +606,9 @@ async def run_attempt(model_config, task):
             record_video_dir=RECORDINGS_DIR,
         )
         browser_session = BrowserSession(browser_profile=profile)
+        await browser_session.start()  # CodeAgent ne le fait pas pour une session fournie
 
-        # ⭐ FIX #4 : demarrage manuel obligatoire. CodeAgent.run() ne fait
-        # `await browser_session.start()` QUE s'il cree lui-meme la session
-        # (browser_session is None au depart). Comme on fournit une session
-        # deja construite via `browser=`, il faut la demarrer nous-memes,
-        # sinon toute action (navigate/evaluate/click) plante car le CDP
-        # n'est jamais initialise.
-        await browser_session.start()
-
-        # ⭐ FIX #3 : CodeAgent n'a pas de parametre pour un system prompt
-        # custom (system_prompt.md est fixe en interne, aucun point
-        # d'injection). Les consignes QA sont fusionnees dans task.
-        full_task = build_full_task(model_name, task)
-
+        full_task = build_full_task(model_name, target_url, requirements)
         agent = CodeAgent(
             task=full_task,
             llm=llm,
@@ -625,98 +622,189 @@ async def run_attempt(model_config, task):
             print("agent.run() termine en %.1fs" % (time.time() - start_time))
         except asyncio.TimeoutError:
             print("Timeout global pour " + model_name)
-            return None
+            return outcome
 
-        # --- ETAPE 1 : le verdict doit venir de done(), jamais d'une heuristique ---
-        raw_output_text = str(result)
-        cells = getattr(result, "cells", None) or []
-        report, reason = judge_run(agent, result, model_name)
+        cells = list(getattr(result, "cells", None) or [])
+        report, reason = judge_run(agent, result, model_name, target_url)
         print("Cellules executees : %d | %s" % (len(cells), reason))
 
         if report is not None:
             print("Rapport retenu (" + model_name + ") :")
             print(json.dumps(report, ensure_ascii=False)[:800])
-            return report
+            outcome["report"] = report
+            return outcome
 
-        # --- ETAPE 2 : seulement si pas de resultat exploitable ---
-        if is_fatal_model_error(raw_output_text):
-            print("ERREUR FATALE : %s -> skip" % model_name)
-            return None
-        if is_quota_error(raw_output_text):
-            print("QUOTA/SOLDE : %s -> skip" % model_name)
-            return None
-
-        print("REJETE : %s -> %s" % (model_name, reason))
-        return None
+        outcome["partial"] = build_partial_report(cells, model_name, target_url)
+        raw = str(result)
+        if is_fatal_model_error(raw):
+            print("ERREUR FATALE : %s -> stop" % model_name)
+            outcome["stop"] = True
+        elif is_quota_error(raw):
+            print("QUOTA/SOLDE : %s -> stop" % model_name)
+            outcome["stop"] = True
+        else:
+            print("REJETE : %s -> %s" % (model_name, reason))
+        return outcome
 
     except Exception as err:
-        print("Echec avec " + model_name + " : " + str(err))
-        return None
+        text = str(err)
+        print("Echec avec " + model_name + " : " + text)
+        if is_fatal_model_error(text) or is_quota_error(text):
+            outcome["stop"] = True
+        return outcome
 
     finally:
         await close_agent_session(agent)
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Test d'une page : parcourt la chaine (essais successifs), garde le meilleur partiel
 # ---------------------------------------------------------------------------
-async def main():
-    task = (
-        "Navigate to " + SITE_URL + ". "
-        "Execute the required interactions. "
-        "Use Python assertions. "
-        "Detect anomalies (errors, undefined, empty listings). "
-        "HARD LIMIT: 6 tool calls max, then call done(). "
-        "IMPORTANT: write ONLY valid Python code blocks between triple backticks."
-    )
-
-    final_report = None
-    total = len(MODEL_CHAIN)
-
+async def test_page(target_url, requirements, deadline):
+    best_partial = (None, 0)
+    stop = False
     for idx, model_config in enumerate(MODEL_CHAIN):
+        if time.monotonic() > deadline - MIN_ATTEMPT_SECONDS:
+            print("Budget de temps epuise : plus d'essai pour %s" % target_url)
+            break
         print("")
         print("#" * 60)
-        print("# Essai %d/%d : [%s] %s" % (
-            idx + 1, total, model_config["provider"], model_config["model"]))
+        print("# %s -- essai %d/%d : [%s] %s" % (
+            target_url, idx + 1, len(MODEL_CHAIN),
+            model_config["provider"], model_config["model"]))
         print("#" * 60)
 
         if not await preflight_api_check(model_config):
-            print("Modele ecarte des le preflight : %s" % model_config["model"])
             continue
 
-        report = await run_attempt(model_config, task)
-        if report is not None:
-            final_report = report
-            print("Modele retenu : %s" % model_config["model"])
+        outcome = await run_attempt(model_config, target_url, requirements)
+        if outcome["report"] is not None:
+            return outcome["report"], best_partial, False
+        if outcome["partial"][1] > best_partial[1]:
+            best_partial = outcome["partial"]
+        if outcome["stop"]:
+            stop = True
             break
-        else:
-            print("Modele ecarte : %s" % model_config["model"])
-            if idx < total - 1:
-                print("Attente %ds..." % DELAY_BETWEEN_ATTEMPTS)
-                await asyncio.sleep(DELAY_BETWEEN_ATTEMPTS)
+        if idx < len(MODEL_CHAIN) - 1:
+            print("Attente %ds..." % DELAY_BETWEEN_ATTEMPTS)
+            await asyncio.sleep(DELAY_BETWEEN_ATTEMPTS)
+    return None, best_partial, stop
 
-    if final_report is None:
-        final_report = {
-            "overall_status": "ERROR",
-            "site_type": SITE_TYPE,
-            "actions_completed": False,
-            "model_used": None,
-            "pages": [{
-                "url": SITE_URL,
-                "status": "ERROR",
-                "http_code": None,
-                "action_tested": None,
-                "assertion_passed": False,
-                "note": "Tous les modeles ont echoue.",
-            }],
-            "error": "Tous les modeles ont echoue.",
-        }
+
+# ---------------------------------------------------------------------------
+# Selection des pages : SITE_URL toujours, les autres par rotation (2 runs/jour)
+# ---------------------------------------------------------------------------
+def load_other_pages():
+    others, seen = [], {SITE_URL.rstrip("/")}
+    if not PAGES_JSON.strip():
+        return others
+    try:
+        data = json.loads(PAGES_JSON)
+    except json.JSONDecodeError as e:
+        print("PAGES_JSON invalide (%s) : ignore" % e)
+        return others
+    for p in data or []:
+        url = (p.get("url") if isinstance(p, dict) else str(p)) or ""
+        url = url.strip()
+        key = url.rstrip("/")
+        if url.startswith("http") and key not in seen:
+            seen.add(key)
+            others.append(url)
+    return others
+
+
+def select_pages():
+    others = load_other_pages()
+    slots = max(MAX_PAGES_PER_RUN - 1, 0)
+    if not others or slots == 0:
+        return [SITE_URL], others
+    slot_index = int(time.time() // 43200)  # change toutes les 12 h
+    start = (slot_index * slots) % len(others)
+    picked = [others[(start + i) % len(others)] for i in range(min(slots, len(others)))]
+    untested = [u for u in others if u not in picked]
+    return [SITE_URL] + picked, untested
+
+
+def merge_status(statuses):
+    if "DOWN" in statuses:
+        return "DOWN"
+    if "ERROR" in statuses:
+        return "ERROR"
+    if statuses and all(s == "UP" for s in statuses):
+        return "UP"
+    return "UNKNOWN"
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+async def main():
+    t0 = time.monotonic()
+    deadline = t0 + TOTAL_BUDGET_SECONDS
+
+    targets, untested = select_pages()
+    print("")
+    print("Pages a tester ce run : " + ", ".join(targets))
+    if untested:
+        print("Pages non testees (rapportees UNKNOWN) : " + ", ".join(untested))
+
+    page_entries = []
+    tested_statuses = []
+    models_used = []
+    completed_any = False
+    stopped = False
+
+    for i, url in enumerate(targets):
+        if stopped:
+            page_entries.append({
+                "url": url, "status": "UNKNOWN", "http_code": None,
+                "action_tested": None, "assertion_passed": False,
+                "note": "Non testee : quota ou erreur fatale du fournisseur sur un essai precedent.",
+            })
+            continue
+
+        requirements = REQUIREMENTS if i == 0 else PAGE_REQUIREMENTS
+        report, partial, stop = await test_page(url, requirements, deadline)
+        stopped = stopped or stop
+
+        if report is not None:
+            entry = collapse_to_page(report, url)
+            models_used.append(report.get("model_used"))
+            completed_any = True
+        elif partial[0] is not None:
+            entry = partial[0]
+        else:
+            entry = {
+                "url": url, "status": "ERROR", "http_code": None,
+                "action_tested": None, "assertion_passed": False,
+                "note": "Aucun test exploitable : tous les essais ont echoue.",
+            }
+        page_entries.append(entry)
+        tested_statuses.append(entry["status"])
+
+    for url in untested:
+        page_entries.append({
+            "url": url, "status": "UNKNOWN", "http_code": None,
+            "action_tested": None, "assertion_passed": False,
+            "note": "Non testee ce run (rotation) : conservee pour ne pas etre supprimee.",
+        })
+
+    final_report = {
+        "overall_status": merge_status(tested_statuses),
+        "site_type": SITE_TYPE,
+        "actions_completed": completed_any,
+        "model_used": models_used[-1] if models_used else None,
+        "pages": page_entries,
+    }
+    if not completed_any:
+        final_report["error"] = "Aucun rapport complet remis par l'agent."
 
     output_path = os.path.join(os.getcwd(), "output.json")
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(final_report, f, indent=2, ensure_ascii=False)
 
     print("")
+    print("Duree totale : %.0fs" % (time.monotonic() - t0))
     print("=== output.json ===")
     print(json.dumps(final_report, indent=2, ensure_ascii=False))
 
