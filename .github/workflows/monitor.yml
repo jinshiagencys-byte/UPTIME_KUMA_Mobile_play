@@ -1,5 +1,4 @@
 name: AutoSpec Agent - Monitoring Autonome Multi-Sites
-
 on:
   workflow_dispatch:
     inputs:
@@ -65,7 +64,7 @@ jobs:
           echo "$SITES" | jq .
 
   # ============================================================
-  # 2. AGENT OPENBROWSER-AI (stack 100% gratuit)
+  # 2. AGENT OPENBROWSER-AI (vidéo native + stack gratuit)
   # ============================================================
   autospec-test:
     needs: fetch-sites
@@ -90,7 +89,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Installer OpenBrowser-AI + dépendances + ffmpeg
+      - name: Installer OpenBrowser-AI + ffmpeg (pour conversion finale)
         run: |
           set -euo pipefail
           pip install --quiet "openbrowser-ai[agent,video]"
@@ -99,7 +98,6 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg
           echo "ffmpeg : $(which ffmpeg)"
-          ffmpeg -version | head -1
 
       - name: Détecter le type de site
         id: detect
@@ -150,58 +148,49 @@ jobs:
 
       - name: Préparer les dossiers
         run: |
-          mkdir -p recordings/shots recordings-mp4
+          mkdir -p recordings
 
-      - name: Exécuter le monitoring
+      - name: Exécuter le monitoring (vidéo native)
         env:
           SITE_URL: ${{ matrix.site.url }}
           SITE_ID: ${{ matrix.site.id }}
           SITE_TYPE: ${{ steps.detect.outputs.TYPE }}
           REQUIREMENTS: ${{ steps.prompt.outputs.REQUIREMENTS }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           PYTHONUNBUFFERED: "1"
         run: |
           set +e
           python -u run_monitor.py 2>&1 | tee execution.log
-          echo ""
-          echo "=== Screenshots captures ==="
-          JPG_COUNT=$(find recordings/shots -name '*.jpg' 2>/dev/null | wc -l)
-          PNG_COUNT=$(find recordings/shots -name '*.png' 2>/dev/null | wc -l)
-          echo "Total : $JPG_COUNT JPG, $PNG_COUNT PNG"
 
-      - name: Convertir les screenshots en timelapse MP4
+      - name: Convertir vidéo native webm → mp4
         if: always()
         run: |
           set +e
           mkdir -p recordings-mp4
-          JPG_COUNT=$(find recordings/shots -name "shot_*.jpg" 2>/dev/null | wc -l)
-          PNG_COUNT=$(find recordings/shots -name "shot_*.png" 2>/dev/null | wc -l)
-          echo "Screenshots : $JPG_COUNT JPG, $PNG_COUNT PNG"
-
-          if [ "$JPG_COUNT" -gt "$PNG_COUNT" ] && [ "$JPG_COUNT" -gt 0 ]; then
-            EXT="jpg"
-          elif [ "$PNG_COUNT" -gt 0 ]; then
-            EXT="png"
+          WEBM=$(ls -t recordings/*.webm 2>/dev/null | head -1)
+          MP4=$(ls -t recordings/*.mp4 2>/dev/null | head -1)
+          
+          if [ -n "$WEBM" ]; then
+            echo "🎬 Conversion webm → mp4 : $WEBM"
+            ffmpeg -y -i "$WEBM" -c:v libx264 -pix_fmt yuv420p -movflags +faststart \
+              recordings-mp4/timelapse.mp4 2>&1 | tail -5
+          elif [ -n "$MP4" ]; then
+            echo "🎬 MP4 natif trouvé, copie : $MP4"
+            cp "$MP4" recordings-mp4/timelapse.mp4
           else
-            echo "Aucun screenshot a convertir"
-            ls -la recordings-mp4/
+            echo "Aucune vidéo native trouvée"
+            ls -la recordings/
             exit 0
           fi
-
-          echo "🎬 Encodage avec pattern shot_%04d.$EXT"
-          ffmpeg -y -framerate 2 -i "recordings/shots/shot_%04d.$EXT" \
-            -c:v libx264 -pix_fmt yuv420p -movflags +faststart \
-            recordings-mp4/timelapse.mp4 2>&1 | tail -10
-
+          
           if [ -f "recordings-mp4/timelapse.mp4" ] && [ -s "recordings-mp4/timelapse.mp4" ]; then
-            echo "✅ Timelapse : $(ls -lh recordings-mp4/timelapse.mp4 | awk '{print $5}')"
+            echo "✅ Timelapse final : $(ls -lh recordings-mp4/timelapse.mp4 | awk '{print $5}')"
           else
-            echo "❌ Timelapse vide ou absent"
+            echo "❌ Conversion échouée"
           fi
-          ls -la recordings-mp4/
+          ls -la recordings/ recordings-mp4/
 
       - name: Afficher le résultat
         if: always()
