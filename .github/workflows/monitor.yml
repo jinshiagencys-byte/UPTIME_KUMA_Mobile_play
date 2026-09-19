@@ -55,7 +55,7 @@ jobs:
               PAGES=$(echo "$ALL_MONITORS" | jq -c --arg sid "$SID" '[.monitors[]? | select(.type == "http" and (.parent | tostring) == $sid) | {url: .url, name: .name}]')
               SITE_WITH_PAGES=$(echo "$site" | jq -c --argjson pages "$PAGES" '. + {pages: $pages}')
               SITES_ARRAY=$(echo "$SITES_ARRAY" | jq -c --argjson site "$SITE_WITH_PAGES" '. + [$site]')
-            done <<< "$(echo "$SITES_RAW" | jq -c '.[]?')"
+            done < <(echo "$SITES_RAW" | jq -c '.[]?')
             SITES="$SITES_ARRAY"
           fi
           SITES=$(echo "$SITES" | jq -c .)
@@ -64,7 +64,7 @@ jobs:
           echo "$SITES" | jq .
 
   # ============================================================
-  # 2. AGENT OPENBROWSER-AI (vidéo native + stack gratuit)
+  # 2. AGENT OPENBROWSER-AI (vidéo native + Cohere uniquement)
   # ============================================================
   autospec-test:
     needs: fetch-sites
@@ -79,7 +79,6 @@ jobs:
       max-parallel: 1
       matrix:
         site: ${{ fromJson(needs.fetch-sites.outputs.sites) }}
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -150,15 +149,18 @@ jobs:
         run: |
           mkdir -p recordings
 
-      - name: Exécuter le monitoring (vidéo native)
+      - name: Exécuter le monitoring (Cohere uniquement)
         env:
           SITE_URL: ${{ matrix.site.url }}
           SITE_ID: ${{ matrix.site.id }}
           SITE_TYPE: ${{ steps.detect.outputs.TYPE }}
           REQUIREMENTS: ${{ steps.prompt.outputs.REQUIREMENTS }}
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          PAGES_JSON: ${{ toJSON(matrix.site.pages) }}
+          COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
+          COHERE_MODEL: "command-a-03-2025"
+          COHERE_ATTEMPTS: "2"
+          OPENROUTER_ATTEMPTS: "0"
+          ENABLE_FALLBACKS: "0"
           PYTHONUNBUFFERED: "1"
         run: |
           set +e
@@ -171,9 +173,8 @@ jobs:
           mkdir -p recordings-mp4
           WEBM=$(ls -t recordings/*.webm 2>/dev/null | head -1)
           MP4=$(ls -t recordings/*.mp4 2>/dev/null | head -1)
-          
           if [ -n "$WEBM" ]; then
-            echo "🎬 Conversion webm → mp4 : $WEBM"
+            echo " Conversion webm → mp4 : $WEBM"
             ffmpeg -y -i "$WEBM" -c:v libx264 -pix_fmt yuv420p -movflags +faststart \
               recordings-mp4/timelapse.mp4 2>&1 | tail -5
           elif [ -n "$MP4" ]; then
@@ -184,7 +185,6 @@ jobs:
             ls -la recordings/
             exit 0
           fi
-          
           if [ -f "recordings-mp4/timelapse.mp4" ] && [ -s "recordings-mp4/timelapse.mp4" ]; then
             echo "✅ Timelapse final : $(ls -lh recordings-mp4/timelapse.mp4 | awk '{print $5}')"
           else
