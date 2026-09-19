@@ -1,8 +1,8 @@
 """
 OpenBrowser-AI — Monitoring fonctionnel.
-Priorité : thinkingmachines/inkling:free (OpenRouter)
-Fallback : Google AI Studio (Gemini 3.x) via wrapper custom
-           puis autres modèles gratuits OpenRouter
+PRIORITÉ 1 : DeepSeek (excellent pour le code, pricing ultra-compétitif)
+PRIORITÉ 2 : OpenRouter free router
+PRIORITÉ 3 : Google AI Studio (en backup)
 Screenshots + timelapse MP4
 Passe au modèle suivant si 0 action LLM réussie
 """
@@ -15,6 +15,7 @@ from openbrowser import CodeAgent
 from openbrowser.llm import ChatOpenAI
 from openbrowser.browser import BrowserProfile
 
+
 # ---------------------------------------------------------------------------
 # Env
 # ---------------------------------------------------------------------------
@@ -24,6 +25,7 @@ SITE_TYPE = os.environ.get("SITE_TYPE", "generic")
 REQUIREMENTS = os.environ.get("REQUIREMENTS", "")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 
 RECORDINGS_DIR = os.path.abspath("./recordings")
 SHOTS_DIR = os.path.join(RECORDINGS_DIR, "shots")
@@ -31,11 +33,13 @@ os.makedirs(SHOTS_DIR, exist_ok=True)
 
 print("Recordings dir : " + RECORDINGS_DIR)
 print("Shots dir      : " + SHOTS_DIR)
+print("DeepSeek key         : " + str(bool(DEEPSEEK_API_KEY)))
 print("Google AI Studio key : " + str(bool(GOOGLE_API_KEY)))
 print("OpenRouter key       : " + str(bool(OPENROUTER_API_KEY)))
 
+
 # ---------------------------------------------------------------------------
-# Wrapper custom pour Google AI Studio
+# Wrapper Google AI Studio (pour usage_metadata)
 # ---------------------------------------------------------------------------
 class GoogleGeminiWrapper:
     def __init__(self, model, api_key, base_url, temperature=0.0):
@@ -65,42 +69,49 @@ class GoogleGeminiWrapper:
                 content = str(msg)
             openai_messages.append({"role": role, "content": content})
 
+        response = await self.client.chat.completions.create(
+            model=self.model,
+            messages=openai_messages,
+            temperature=self.temperature,
+        )
+        content = response.choices[0].message.content
+
         try:
-            response = await self.client.chat.completions.create(
-                model=self.model,
-                messages=openai_messages,
-                temperature=self.temperature,
-            )
-            content = response.choices[0].message.content
-        except Exception as e:
-            print("Google API error: " + str(e))
-            raise
+            input_tokens = response.usage.prompt_tokens
+            output_tokens = response.usage.completion_tokens
+        except Exception:
+            input_tokens = 100
+            output_tokens = max(1, len(content) // 4)
 
         try:
             from langchain_core.messages import AIMessage
             msg = AIMessage(content=content)
-            msg.usage_metadata = {
-                "input_tokens": 100,
-                "output_tokens": max(1, len(content) // 4),
-                "total_tokens": 100 + max(1, len(content) // 4),
+            usage_dict = {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens,
             }
+            msg.usage_metadata = usage_dict
+            msg.usage = usage_dict
             msg.response_metadata = {
                 "model_name": self.model,
                 "finish_reason": "stop",
+                "token_usage": usage_dict,
             }
             return msg
         except ImportError:
             class SimpleMessage:
-                def __init__(self, content, model):
+                def __init__(self, content, model, usage):
                     self.content = content
                     self.type = "ai"
-                    self.usage_metadata = {
-                        "input_tokens": 100,
-                        "output_tokens": max(1, len(content) // 4),
-                        "total_tokens": 100 + max(1, len(content) // 4),
+                    self.usage = usage
+                    self.usage_metadata = usage
+                    self.response_metadata = {
+                        "model_name": model,
+                        "finish_reason": "stop",
+                        "token_usage": usage,
                     }
-                    self.response_metadata = {"model_name": model, "finish_reason": "stop"}
-            return SimpleMessage(content, self.model)
+            return SimpleMessage(content, self.model, usage_dict)
 
     async def acall(self, messages, **kwargs):
         return await self.ainvoke(messages, **kwargs)
@@ -113,41 +124,30 @@ class GoogleGeminiWrapper:
 
 
 # ---------------------------------------------------------------------------
-# Chaîne de modèles
+# Chaîne de modèles — DeepSeek EN PREMIER
 # ---------------------------------------------------------------------------
 MODEL_CHAIN = []
 
-# 🥇 PRIORITÉ 1 : thinkingmachines/inkling:free (OpenRouter)
-if OPENROUTER_API_KEY:
-    MODEL_CHAIN.append({
-        "provider": "openrouter",
-        "model": "thinkingmachines/inkling:free",
-        "key": OPENROUTER_API_KEY,
-        "base_url": "https://openrouter.ai/api/v1",
-        "use_wrapper": False,
-    })
-
-# 🥈 PRIORITÉ 2 : Google AI Studio (Gemini 3.x)
-if GOOGLE_API_KEY:
+# 🥇 PRIORITÉ 1 : DeepSeek (pricing imbattable, excellent pour le code)
+if DEEPSEEK_API_KEY:
     for m in [
-        "gemini-3.5-flash",
-        "gemini-3.6-flash",
-        "gemini-2.5-pro",
+        "deepseek-chat",       # DeepSeek V3 - rapide et efficace
+        "deepseek-reasoner",   # DeepSeek R1 - raisonnement avancé
     ]:
         MODEL_CHAIN.append({
-            "provider": "google_openai",
+            "provider": "deepseek",
             "model": m,
-            "key": GOOGLE_API_KEY,
-            "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-            "use_wrapper": True,
+            "key": DEEPSEEK_API_KEY,
+            "base_url": "https://api.deepseek.com",
+            "use_wrapper": False,  # Compatible OpenAI API
         })
 
-# 🥉 PRIORITÉ 3 : Fallbacks OpenRouter gratuits
+# 🥈 PRIORITÉ 2 : OpenRouter (routeur gratuit)
 if OPENROUTER_API_KEY:
     for m in [
-        "nousresearch/hermes-3-llama-3.1-405b:free",
-        "meta-llama/llama-3.2-3b-instruct:free",
-        "google/gemma-2-9b-it:free",
+        "openrouter/free",                        # Routeur auto
+        "poolside/laguna-s-2.1:free",             # Top gratuit
+        "inclusionai/ling-3.0-flash:free",        # Top gratuit
     ]:
         MODEL_CHAIN.append({
             "provider": "openrouter",
@@ -155,6 +155,20 @@ if OPENROUTER_API_KEY:
             "key": OPENROUTER_API_KEY,
             "base_url": "https://openrouter.ai/api/v1",
             "use_wrapper": False,
+        })
+
+# 🥉 PRIORITÉ 3 : Google AI Studio (quotas limités, en backup)
+if GOOGLE_API_KEY:
+    for m in [
+        "gemini-3.5-flash",
+        "gemini-3.6-flash",
+    ]:
+        MODEL_CHAIN.append({
+            "provider": "google_openai",
+            "model": m,
+            "key": GOOGLE_API_KEY,
+            "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+            "use_wrapper": True,
         })
 
 if not MODEL_CHAIN:
@@ -168,68 +182,36 @@ for i, entry in enumerate(MODEL_CHAIN):
 
 GLOBAL_TIMEOUT_SECONDS = 300
 MAX_STEPS = 12
+DELAY_BETWEEN_ATTEMPTS = 3
+
 
 # ---------------------------------------------------------------------------
 # Prompt système
 # ---------------------------------------------------------------------------
 SYSTEM_PROMPT_TEMPLATE = (
-    "You are a functional QA engineer. TEST the web app, do not just observe.\n"
-    "\n"
+    "You are a functional QA engineer. TEST the web app, do not just observe.\n\n"
     "OUTPUT FORMAT (CRITICAL):\n"
-    "You MUST write Python code blocks between triple backticks. Example:\n"
-    "\n"
-    "I will check the page title.\n"
-    "```python\n"
-    "title = await evaluate('document.title')\n"
-    "print(title)\n"
-    "```\n"
-    "\n"
-    "Do NOT use XML tags. Do NOT use tool_name(args) syntax.\n"
-    "ONLY Python code blocks.\n"
-    "\n"
+    "You MUST write Python code blocks between triple backticks.\n\n"
     "RULES:\n"
     "1. Perform at least ONE real user interaction and verify with an assertion.\n"
     "2. Page loaded is NOT a test. Button exists is NOT a test.\n"
     "3. Valid test = action + observation + assertion.\n"
-    "4. Use Python assert.\n"
-    "\n"
+    "4. Use Python assert.\n\n"
     "STRICT STOP CONDITION:\n"
-    "- After 6 tool calls max, call done() no matter what.\n"
-    "- Partial results are OK.\n"
-    "\n"
+    "- After 6 tool calls max, call done() no matter what.\n\n"
     "ANOMALIES (functional failures):\n"
     "- Text containing Erreur, Error, Failed, undefined, null, 0 produit, Aucun produit.\n"
     "- Link with /undefined in URL.\n"
-    "- Empty product listing on a catalog page.\n"
-    "\n"
-    "REQUIRED INTERACTIONS:\n"
-    "REQUIREMENTS\n"
-    "\n"
+    "- Empty product listing on a catalog page.\n\n"
+    "REQUIRED INTERACTIONS:\nREQUIREMENTS\n\n"
     "FINAL OUTPUT:\n"
     "Call done(text=...) with ONLY a valid JSON in text:\n"
     "  overall_status, site_type, actions_completed, model_used, pages[].\n"
-    "\n"
-    "Example done:\n"
-    "```python\n"
-    "import json\n"
-    "result = {\"overall_status\": \"DOWN\", \"site_type\": \"__SITE_TYPE__\", "
-    "\"actions_completed\": True, \"model_used\": \"__MODEL_NAME__\", "
-    "\"pages\": [{\"url\": \"__SITE_URL__\", \"status\": \"DOWN\", "
-    "\"http_code\": 200, \"action_tested\": \"search\", "
-    "\"assertion_passed\": False, \"note\": \"0 produit\"}]}\n"
-    "await done(text=json.dumps(result, ensure_ascii=False), success=True)\n"
-    "```\n"
 )
 
 
 def build_system_prompt(model_name: str) -> str:
-    return (
-        SYSTEM_PROMPT_TEMPLATE
-        .replace("REQUIREMENTS", REQUIREMENTS)
-        .replace("__SITE_TYPE__", SITE_TYPE)
-        .replace("__MODEL_NAME__", model_name)
-        .replace("__SITE_URL__", SITE_URL)
-    )
+    return SYSTEM_PROMPT_TEMPLATE.replace("REQUIREMENTS", REQUIREMENTS)
 
 
 # ---------------------------------------------------------------------------
@@ -264,16 +246,6 @@ def extract_final_result(result) -> str:
         )
         if match:
             return match.group(1)
-        match = re.search(
-            r"done\s*\(\s*text\s*=\s*json\.dumps\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*)",
-            source, re.DOTALL,
-        )
-        if match:
-            output = getattr(cell, "output", "") or ""
-            if output.strip():
-                return output
-        return source
-
     for cell in reversed(list(cells)):
         output = getattr(cell, "output", "") or ""
         if '"url"' in output or '"overall_status"' in output:
@@ -285,38 +257,35 @@ def normalize_report(report: dict, model_name: str) -> dict:
     if "overall_status" in report and "pages" in report:
         report["model_used"] = model_name
         return report
-
     text_blob = json.dumps(report, ensure_ascii=False).lower()
     has_anomaly = any(
         kw in text_blob
         for kw in ["erreur", "error", "undefined", "0 produit",
-                   "aucun produit", "no results", "anomalies_detected"]
+                   "aucun produit", "no results"]
     )
     status = "DOWN" if has_anomaly else "UP"
-    pages = [{
-        "url": report.get("url", SITE_URL),
-        "status": status,
-        "http_code": None,
-        "action_tested": "exploration",
-        "assertion_passed": not has_anomaly,
-        "note": report.get("done_summary") or report.get("message") or "Verification effectuee",
-    }]
     return {
         "overall_status": status,
         "site_type": report.get("site_type", SITE_TYPE),
         "actions_completed": True,
         "model_used": model_name,
-        "pages": pages,
+        "pages": [{
+            "url": report.get("url", SITE_URL),
+            "status": status,
+            "http_code": None,
+            "action_tested": "exploration",
+            "assertion_passed": not has_anomaly,
+            "note": "Verification effectuee",
+        }],
     }
 
 
 # ---------------------------------------------------------------------------
-# Récupération de la page Playwright
+# Récupération page Playwright
 # ---------------------------------------------------------------------------
 async def get_playwright_page(session):
     if session is None:
         return None
-
     for attr in ("current_page", "page", "_page", "playwright_page"):
         try:
             p = getattr(session, attr, None)
@@ -324,45 +293,43 @@ async def get_playwright_page(session):
                 return p
         except Exception:
             pass
-
     for method_name in ("must_get_current_page", "get_current_page", "get_page"):
         if hasattr(session, method_name):
             try:
                 r = getattr(session, method_name)()
                 if asyncio.iscoroutine(r):
                     r = await r
-                if r is not None:
-                    if hasattr(r, "screenshot"):
-                        return r
-                    for inner_attr in ("page", "_page", "playwright_page"):
-                        inner = getattr(r, inner_attr, None)
-                        if inner is not None and hasattr(inner, "screenshot"):
-                            return inner
+                if r is not None and hasattr(r, "screenshot"):
+                    return r
             except Exception:
                 pass
-
     if hasattr(session, "get_pages"):
         try:
             r = session.get_pages()
             if asyncio.iscoroutine(r):
                 r = await r
             if r and len(r) > 0:
-                page = r[0]
-                if hasattr(page, "screenshot"):
-                    return page
-                for inner_attr in ("page", "_page"):
-                    inner = getattr(page, inner_attr, None)
-                    if inner is not None and hasattr(inner, "screenshot"):
-                        return inner
+                return r[0]
         except Exception:
             pass
-
     return None
 
 
 # ---------------------------------------------------------------------------
-# Screenshot recorder
+# Screenshot recorder (auto-detection JPEG/PNG)
 # ---------------------------------------------------------------------------
+def detect_image_format(data: bytes) -> str:
+    if data[:4] == b'\x89PNG':
+        return "png"
+    if data[:3] == b'\xff\xd8\xff':
+        return "jpg"
+    if data[:4] == b'GIF8':
+        return "gif"
+    if data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+        return "webp"
+    return "png"
+
+
 async def screenshot_recorder(agent, interval=2.0):
     idx = 0
     misses = 0
@@ -373,58 +340,34 @@ async def screenshot_recorder(agent, interval=2.0):
             if session is None:
                 misses += 1
                 continue
-
             page = await get_playwright_page(session)
             if page is None:
                 misses += 1
                 if misses > 30:
-                    print("Screenshot recorder : abandon apres %d echecs (page introuvable)" % misses)
+                    print("Screenshot recorder : abandon (page introuvable)")
                     break
                 continue
-
-            path = os.path.join(SHOTS_DIR, "shot_%04d.png" % idx)
             try:
                 result = page.screenshot()
                 if asyncio.iscoroutine(result):
                     result = await result
-
+                img_bytes = None
                 if isinstance(result, bytes):
-                    with open(path, "wb") as f:
-                        f.write(result)
-                    idx += 1
-                    misses = 0
+                    img_bytes = result
                 elif isinstance(result, str):
                     import base64
-                    try:
-                        img_bytes = base64.b64decode(result)
-                        with open(path, "wb") as f:
-                            f.write(img_bytes)
-                        idx += 1
-                        misses = 0
-                    except Exception:
-                        misses += 1
-                elif hasattr(result, "save"):
-                    result.save(path)
-                    idx += 1
-                    misses = 0
+                    img_bytes = base64.b64decode(result)
                 elif hasattr(result, "read"):
+                    img_bytes = result.read()
+                if img_bytes and len(img_bytes) > 100:
+                    fmt = detect_image_format(img_bytes)
+                    path = os.path.join(SHOTS_DIR, "shot_%04d.%s" % (idx, fmt))
                     with open(path, "wb") as f:
-                        f.write(result.read())
+                        f.write(img_bytes)
                     idx += 1
                     misses = 0
                 else:
-                    if hasattr(page, "screenshot_as_bytes"):
-                        bytes_result = page.screenshot_as_bytes()
-                        if asyncio.iscoroutine(bytes_result):
-                            bytes_result = await bytes_result
-                        with open(path, "wb") as f:
-                            f.write(bytes_result)
-                        idx += 1
-                        misses = 0
-                    else:
-                        misses += 1
-                        if idx == 0:
-                            print("Screenshot : type de retour inconnu : " + str(type(result)))
+                    misses += 1
             except Exception as e:
                 if idx == 0:
                     print("Screenshot erreur : " + str(e))
@@ -432,27 +375,21 @@ async def screenshot_recorder(agent, interval=2.0):
         except asyncio.CancelledError:
             print("Screenshot recorder arrete (%d shots)" % idx)
             break
-        except Exception as e:
+        except Exception:
             misses += 1
-            if misses % 10 == 0:
-                print("Screenshot erreur globale : " + str(e))
 
 
 # ---------------------------------------------------------------------------
-# Fermeture de session
+# Fermeture session
 # ---------------------------------------------------------------------------
 async def close_agent_session(agent) -> None:
     if agent is None:
         return
-    
-    # ⚠️ IMPORTANT : Laisser le temps aux screenshots de se sauvegarder
     await asyncio.sleep(3)
-    
     session = None
     for attr_name in ("browser_session", "browser", "session"):
         session = getattr(agent, attr_name, None)
         if session is not None:
-            print("Session trouvee via agent." + attr_name)
             break
     if session is None:
         return
@@ -467,7 +404,6 @@ async def close_agent_session(agent) -> None:
             break
         except Exception as e:
             print("Echec " + method_name + "() : " + str(e))
-    await asyncio.sleep(2)
     try:
         shots = os.listdir(SHOTS_DIR) if os.path.isdir(SHOTS_DIR) else []
         print("Screenshots captures : " + str(len(shots)))
@@ -476,22 +412,11 @@ async def close_agent_session(agent) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Détection d'erreurs spécifiques
+# Détection erreurs fatales
 # ---------------------------------------------------------------------------
-def is_agentic_harness_error(error_text: str) -> bool:
-    """Détecte l'erreur spécifique OpenRouter 'agentic harness only'"""
-    lower = error_text.lower()
-    return (
-        "agentic harness" in lower or
-        "only available on agentic" in lower or
-        "try plugging it into a coding agent" in lower
-    )
-
-
 def is_fatal_model_error(output_text: str) -> bool:
-    """Détecte les erreurs qui justifient de passer immédiatement au modèle suivant"""
     lower = output_text.lower()
-    fatal_patterns = [
+    return any(p in lower for p in [
         "agentic harness",
         "only available on agentic",
         "8 consecutive llm failures",
@@ -499,8 +424,25 @@ def is_fatal_model_error(output_text: str) -> bool:
         "no endpoints found",
         "this model is unavailable",
         "model not found",
-    ]
-    return any(pattern in lower for pattern in fatal_patterns)
+        "is no longer available",
+        "unavailable for free",
+        "authenticationerror",
+        "invalid_api_key",
+    ])
+
+
+def is_quota_error(output_text: str) -> bool:
+    lower = output_text.lower()
+    return any(p in lower for p in [
+        "quota exceeded",
+        "resource_exhausted",
+        "rate limit",
+        "429",
+        "too many requests",
+        "free_tier_requests",
+        "please retry in",
+        "insufficient_balance",
+    ])
 
 
 # ---------------------------------------------------------------------------
@@ -519,22 +461,17 @@ async def run_attempt(model_config: dict, task: str):
 
     agent = None
     recorder_task = None
-    raw_output_text = ""
 
     try:
         if use_wrapper:
             llm = GoogleGeminiWrapper(
-                model=model_name,
-                api_key=api_key,
-                base_url=base_url,
-                temperature=0.0,
+                model=model_name, api_key=api_key,
+                base_url=base_url, temperature=0.0,
             )
         else:
             llm = ChatOpenAI(
-                model=model_name,
-                base_url=base_url,
-                api_key=api_key,
-                temperature=0.0,
+                model=model_name, base_url=base_url,
+                api_key=api_key, temperature=0.0,
             )
 
         profile = BrowserProfile(
@@ -544,9 +481,7 @@ async def run_attempt(model_config: dict, task: str):
         )
 
         agent = CodeAgent(
-            task=task,
-            llm=llm,
-            browser_profile=profile,
+            task=task, llm=llm, browser_profile=profile,
             max_steps=MAX_STEPS,
             extend_system_message=build_system_prompt(model_name),
         )
@@ -559,30 +494,27 @@ async def run_attempt(model_config: dict, task: str):
             print("Timeout global pour " + model_name)
             return None
 
-        # Capturer le texte brut pour détecter les erreurs fatales
         raw_output_text = str(result)
 
-        # ⚠️ DÉTECTION CRITIQUE : Erreur "agentic harness" ou échecs consécutifs
         if is_fatal_model_error(raw_output_text):
-            print("❌ ERREUR FATALE DETECTEE : le modele %s ne peut pas etre utilise" % model_name)
-            print("   → Passage immediat au modele suivant")
+            print("❌ ERREUR FATALE : %s → skip" % model_name)
+            return None
+        if is_quota_error(raw_output_text):
+            print("❌ QUOTA ÉPUISÉ : %s → skip" % model_name)
             return None
 
         cells = getattr(result, "cells", None) or getattr(result, "history", None) or []
         successful_cells = 0
         llm_actions = 0
-        
+
         for cell in cells:
             status = getattr(cell, "status", None)
             source = getattr(cell, "source", "") or ""
-            
-            # Ne compter que les actions générées par le LLM (pas la navigation initiale)
             is_llm_action = (
-                "await " in source and 
+                "await " in source and
                 "navigate(" not in source and
                 len(source.strip()) > 20
             )
-            
             if status is not None and "success" in str(status).lower():
                 successful_cells += 1
                 if is_llm_action:
@@ -592,18 +524,15 @@ async def run_attempt(model_config: dict, task: str):
                 if is_llm_action:
                     llm_actions += 1
 
-        print("Cellules totales : %d, reussies : %d, actions LLM : %d" % (
+        print("Cellules : %d totales, %d reussies, %d actions LLM" % (
             len(cells), successful_cells, llm_actions))
 
-        # ⚠️ VALIDATION RENFORCÉE : Exiger au moins 1 action LLM OU un JSON valide
         final_text = extract_final_result(result)
         report = extract_json_from_text(final_text)
-        
         has_valid_json = report is not None and "overall_status" in report
-        
+
         if llm_actions < 1 and not has_valid_json:
-            print("❌ REJETE : %s n'a effectue AUCUNE action LLM reelle" % model_name)
-            print("   (seule la navigation initiale a reussi)")
+            print("❌ REJETE : %s n'a effectue AUCUNE action LLM" % model_name)
             return None
 
         print("Resultat extrait (" + model_name + ") :")
@@ -616,7 +545,7 @@ async def run_attempt(model_config: dict, task: str):
         has_anomaly = any(
             kw in text_lower
             for kw in ["erreur", "error", "undefined", "0 produit",
-                       "no results", "aucun produit", "anomalies_detected"]
+                       "no results", "aucun produit"]
         )
 
         return {
@@ -628,7 +557,7 @@ async def run_attempt(model_config: dict, task: str):
                 "url": SITE_URL,
                 "status": "DOWN" if has_anomaly else "UP",
                 "http_code": None,
-                "action_tested": "exploration et assertions par l'agent",
+                "action_tested": "exploration et assertions",
                 "assertion_passed": not has_anomaly,
                 "note": "Exploration automatique effectuee.",
             }],
@@ -636,8 +565,6 @@ async def run_attempt(model_config: dict, task: str):
 
     except Exception as err:
         print("Echec avec " + model_name + " : " + str(err))
-        import traceback
-        traceback.print_exc()
         return None
 
     finally:
@@ -676,11 +603,13 @@ async def main() -> None:
         report = await run_attempt(model_config, task)
         if report is not None:
             final_report = report
-            print("Modele retenu : %s (%s)" % (
-                model_config["model"], model_config["provider"]))
+            print("✅ Modele retenu : %s" % model_config["model"])
             break
         else:
-            print("Modele ecarte : %s, on passe au suivant" % model_config["model"])
+            print("Modele ecarte : %s" % model_config["model"])
+            if idx < total - 1:
+                print("⏳ Attente %ds..." % DELAY_BETWEEN_ATTEMPTS)
+                await asyncio.sleep(DELAY_BETWEEN_ATTEMPTS)
 
     if final_report is None:
         final_report = {
@@ -696,7 +625,7 @@ async def main() -> None:
                 "assertion_passed": False,
                 "note": "Tous les modeles ont echoue.",
             }],
-            "error": "Tous les modeles ont echoue ou n'ont effectue aucune action.",
+            "error": "Tous les modeles ont echoue.",
         }
 
     output_path = os.path.join(os.getcwd(), "output.json")
@@ -704,7 +633,6 @@ async def main() -> None:
         json.dump(final_report, f, indent=2, ensure_ascii=False)
 
     print("")
-    print("output.json ecrit dans " + output_path)
     print("=== output.json ===")
     print(json.dumps(final_report, indent=2, ensure_ascii=False))
 
