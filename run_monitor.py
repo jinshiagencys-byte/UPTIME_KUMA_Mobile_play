@@ -1,20 +1,23 @@
 """
 OpenBrowser-AI — Monitoring fonctionnel.
-PRIORITÉ 1 : DeepSeek (excellent pour le code, pricing ultra-compétitif)
-PRIORITÉ 2 : OpenRouter free router
-PRIORITÉ 3 : Google AI Studio (en backup)
-Screenshots + timelapse MP4
-Passe au modèle suivant si 0 action LLM réussie
+STRATÉGIE 100% GRATUITE (aucun solde, aucune carte bancaire) :
+  1. Groq (openai/gpt-oss-120b, llama-3.3-70b-versatile) — free tier rapide et généreux
+  2. NVIDIA NIM (moonshotai/kimi-k2.6) — quota gratuit séparé
+  3. Google AI Studio (gemini-3.5-flash / 3.6-flash) — secours (quotas limités)
+  4. OpenRouter (openrouter/free) — routeur gratuit en dernier recours
+Screenshots (auto-détection JPEG/PNG) + timelapse MP4.
+Preflight API avant lancement navigateur (économise temps et minutes GitHub).
 """
 import asyncio
 import json
 import os
 import re
+import time
+
 from openai import AsyncOpenAI
 from openbrowser import CodeAgent
 from openbrowser.llm import ChatOpenAI
 from openbrowser.browser import BrowserProfile
-
 
 # ---------------------------------------------------------------------------
 # Env
@@ -23,9 +26,10 @@ SITE_URL = os.environ.get("SITE_URL", "")
 SITE_ID = os.environ.get("SITE_ID", "")
 SITE_TYPE = os.environ.get("SITE_TYPE", "generic")
 REQUIREMENTS = os.environ.get("REQUIREMENTS", "")
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", "")
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 
 RECORDINGS_DIR = os.path.abspath("./recordings")
 SHOTS_DIR = os.path.join(RECORDINGS_DIR, "shots")
@@ -33,15 +37,22 @@ os.makedirs(SHOTS_DIR, exist_ok=True)
 
 print("Recordings dir : " + RECORDINGS_DIR)
 print("Shots dir      : " + SHOTS_DIR)
-print("DeepSeek key         : " + str(bool(DEEPSEEK_API_KEY)))
-print("Google AI Studio key : " + str(bool(GOOGLE_API_KEY)))
-print("OpenRouter key       : " + str(bool(OPENROUTER_API_KEY)))
+print("Groq key           : " + str(bool(GROQ_API_KEY)))
+print("NVIDIA key         : " + str(bool(NVIDIA_API_KEY)))
+print("Google AI Std key  : " + str(bool(GOOGLE_API_KEY)))
+print("OpenRouter key     : " + str(bool(OPENROUTER_API_KEY)))
 
 
 # ---------------------------------------------------------------------------
-# Wrapper Google AI Studio (pour usage_metadata)
+# Wrapper Google AI Studio (endpoint OpenAI-compatible)
 # ---------------------------------------------------------------------------
 class GoogleGeminiWrapper:
+    """
+    Wrapper LLM pour Google AI Studio via endpoint OpenAI-compatible.
+    - N'envoie PAS frequency_penalty / presence_penalty (non supportés)
+    - Fournit usage + usage_metadata + response_metadata (exigés par openbrowser-ai)
+    """
+
     def __init__(self, model, api_key, base_url, temperature=0.0):
         self.client = AsyncOpenAI(api_key=api_key, base_url=base_url)
         self.model = model
@@ -83,14 +94,15 @@ class GoogleGeminiWrapper:
             input_tokens = 100
             output_tokens = max(1, len(content) // 4)
 
+        usage_dict = {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+        }
+
         try:
             from langchain_core.messages import AIMessage
             msg = AIMessage(content=content)
-            usage_dict = {
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "total_tokens": input_tokens + output_tokens,
-            }
             msg.usage_metadata = usage_dict
             msg.usage = usage_dict
             msg.response_metadata = {
@@ -124,45 +136,34 @@ class GoogleGeminiWrapper:
 
 
 # ---------------------------------------------------------------------------
-# Chaîne de modèles — DeepSeek EN PREMIER
+# Chaîne de modèles — 100% GRATUITE
 # ---------------------------------------------------------------------------
 MODEL_CHAIN = []
 
-# 🥇 PRIORITÉ 1 : DeepSeek (pricing imbattable, excellent pour le code)
-if DEEPSEEK_API_KEY:
-    for m in [
-        "deepseek-chat",       # DeepSeek V3 - rapide et efficace
-        "deepseek-reasoner",   # DeepSeek R1 - raisonnement avancé
-    ]:
+# 🥇 GROQ : gratuit, rapide, slugs stables (pas de modèles :free qui meurent)
+if GROQ_API_KEY:
+    for m in ["openai/gpt-oss-120b", "llama-3.3-70b-versatile"]:
         MODEL_CHAIN.append({
-            "provider": "deepseek",
+            "provider": "groq",
             "model": m,
-            "key": DEEPSEEK_API_KEY,
-            "base_url": "https://api.deepseek.com",
-            "use_wrapper": False,  # Compatible OpenAI API
-        })
-
-# 🥈 PRIORITÉ 2 : OpenRouter (routeur gratuit)
-if OPENROUTER_API_KEY:
-    for m in [
-        "openrouter/free",                        # Routeur auto
-        "poolside/laguna-s-2.1:free",             # Top gratuit
-        "inclusionai/ling-3.0-flash:free",        # Top gratuit
-    ]:
-        MODEL_CHAIN.append({
-            "provider": "openrouter",
-            "model": m,
-            "key": OPENROUTER_API_KEY,
-            "base_url": "https://openrouter.ai/api/v1",
+            "key": GROQ_API_KEY,
+            "base_url": "https://api.groq.com/openai/v1",
             "use_wrapper": False,
         })
 
-# 🥉 PRIORITÉ 3 : Google AI Studio (quotas limités, en backup)
+# 🥈 NVIDIA NIM : quota gratuit séparé, excellent en agentic
+if NVIDIA_API_KEY:
+    MODEL_CHAIN.append({
+        "provider": "nvidia",
+        "model": "moonshotai/kimi-k2.6",
+        "key": NVIDIA_API_KEY,
+        "base_url": "https://integrate.api.nvidia.com/v1",
+        "use_wrapper": False,
+    })
+
+# 🥉 GOOGLE AI STUDIO : en secours pour préserver les 20 req/jour
 if GOOGLE_API_KEY:
-    for m in [
-        "gemini-3.5-flash",
-        "gemini-3.6-flash",
-    ]:
+    for m in ["gemini-3.5-flash", "gemini-3.6-flash"]:
         MODEL_CHAIN.append({
             "provider": "google_openai",
             "model": m,
@@ -170,6 +171,16 @@ if GOOGLE_API_KEY:
             "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
             "use_wrapper": True,
         })
+
+# 4️⃣ OPENROUTER : routeur gratuit en dernier recours
+if OPENROUTER_API_KEY:
+    MODEL_CHAIN.append({
+        "provider": "openrouter",
+        "model": "openrouter/free",
+        "key": OPENROUTER_API_KEY,
+        "base_url": "https://openrouter.ai/api/v1",
+        "use_wrapper": False,
+    })
 
 if not MODEL_CHAIN:
     print("ERREUR : aucune cle API disponible. Abandon.")
@@ -180,10 +191,11 @@ print("Chaine finale :")
 for i, entry in enumerate(MODEL_CHAIN):
     print("  %d. [%s] %s" % (i + 1, entry["provider"], entry["model"]))
 
-GLOBAL_TIMEOUT_SECONDS = 300
-MAX_STEPS = 12
+# Consommation réduite pour faire durer les quotas gratuits
+GLOBAL_TIMEOUT_SECONDS = 240
+MAX_STEPS = 8
 DELAY_BETWEEN_ATTEMPTS = 3
-
+SCREENSHOT_INTERVAL = 3.0
 
 # ---------------------------------------------------------------------------
 # Prompt système
@@ -191,14 +203,22 @@ DELAY_BETWEEN_ATTEMPTS = 3
 SYSTEM_PROMPT_TEMPLATE = (
     "You are a functional QA engineer. TEST the web app, do not just observe.\n\n"
     "OUTPUT FORMAT (CRITICAL):\n"
-    "You MUST write Python code blocks between triple backticks.\n\n"
+    "You MUST write Python code blocks between triple backticks. Example:\n\n"
+    "I will check the page title.\n"
+    "```python\n"
+    "title = await evaluate('document.title')\n"
+    "print(title)\n"
+    "```\n\n"
+    "Do NOT use XML tags. Do NOT use tool_name(args) syntax.\n"
+    "ONLY Python code blocks.\n\n"
     "RULES:\n"
     "1. Perform at least ONE real user interaction and verify with an assertion.\n"
     "2. Page loaded is NOT a test. Button exists is NOT a test.\n"
     "3. Valid test = action + observation + assertion.\n"
     "4. Use Python assert.\n\n"
     "STRICT STOP CONDITION:\n"
-    "- After 6 tool calls max, call done() no matter what.\n\n"
+    "- After 6 tool calls max, call done() no matter what.\n"
+    "- Partial results are OK.\n\n"
     "ANOMALIES (functional failures):\n"
     "- Text containing Erreur, Error, Failed, undefined, null, 0 produit, Aucun produit.\n"
     "- Link with /undefined in URL.\n"
@@ -246,6 +266,14 @@ def extract_final_result(result) -> str:
         )
         if match:
             return match.group(1)
+        match = re.search(
+            r"done\s*\(\s*text\s*=\s*json\.dumps\s*\(\s*([a-zA-Z_][a-zA-Z0-9_]*)",
+            source, re.DOTALL,
+        )
+        if match:
+            output = getattr(cell, "output", "") or ""
+            if output.strip():
+                return output
     for cell in reversed(list(cells)):
         output = getattr(cell, "output", "") or ""
         if '"url"' in output or '"overall_status"' in output:
@@ -316,7 +344,7 @@ async def get_playwright_page(session):
 
 
 # ---------------------------------------------------------------------------
-# Screenshot recorder (auto-detection JPEG/PNG)
+# Screenshot recorder — auto-détection JPEG/PNG via signature magique
 # ---------------------------------------------------------------------------
 def detect_image_format(data: bytes) -> str:
     if data[:4] == b'\x89PNG':
@@ -330,7 +358,7 @@ def detect_image_format(data: bytes) -> str:
     return "png"
 
 
-async def screenshot_recorder(agent, interval=2.0):
+async def screenshot_recorder(agent, interval=SCREENSHOT_INTERVAL):
     idx = 0
     misses = 0
     while True:
@@ -390,6 +418,7 @@ async def close_agent_session(agent) -> None:
     for attr_name in ("browser_session", "browser", "session"):
         session = getattr(agent, attr_name, None)
         if session is not None:
+            print("Session trouvee via agent." + attr_name)
             break
     if session is None:
         return
@@ -412,7 +441,7 @@ async def close_agent_session(agent) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Détection erreurs fatales
+# Détection d'erreurs
 # ---------------------------------------------------------------------------
 def is_fatal_model_error(output_text: str) -> bool:
     lower = output_text.lower()
@@ -441,8 +470,36 @@ def is_quota_error(output_text: str) -> bool:
         "too many requests",
         "free_tier_requests",
         "please retry in",
+        "insufficient balance",
         "insufficient_balance",
+        "balance is not enough",
+        "402",
     ])
+
+
+# ---------------------------------------------------------------------------
+# Preflight API (1 token) avant de lancer le navigateur
+# ---------------------------------------------------------------------------
+async def preflight_api_check(model_config: dict) -> bool:
+    try:
+        client = AsyncOpenAI(
+            api_key=model_config["key"],
+            base_url=model_config["base_url"],
+        )
+        await asyncio.wait_for(
+            client.chat.completions.create(
+                model=model_config["model"],
+                messages=[{"role": "user", "content": "ping"}],
+                max_tokens=1,
+            ),
+            timeout=20,
+        )
+        print("✅ Preflight OK : %s" % model_config["model"])
+        return True
+    except Exception as e:
+        print("❌ Preflight ECHEC : %s -> %s" % (
+            model_config["model"], str(e)[:200]))
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -461,181 +518,8 @@ async def run_attempt(model_config: dict, task: str):
 
     agent = None
     recorder_task = None
+    start_time = time.time()
 
     try:
         if use_wrapper:
-            llm = GoogleGeminiWrapper(
-                model=model_name, api_key=api_key,
-                base_url=base_url, temperature=0.0,
-            )
-        else:
-            llm = ChatOpenAI(
-                model=model_name, base_url=base_url,
-                api_key=api_key, temperature=0.0,
-            )
-
-        profile = BrowserProfile(
-            headless=True,
-            viewport_width=1280,
-            viewport_height=720,
-        )
-
-        agent = CodeAgent(
-            task=task, llm=llm, browser_profile=profile,
-            max_steps=MAX_STEPS,
-            extend_system_message=build_system_prompt(model_name),
-        )
-
-        recorder_task = asyncio.create_task(screenshot_recorder(agent, interval=2.0))
-
-        try:
-            result = await asyncio.wait_for(agent.run(), timeout=GLOBAL_TIMEOUT_SECONDS)
-        except asyncio.TimeoutError:
-            print("Timeout global pour " + model_name)
-            return None
-
-        raw_output_text = str(result)
-
-        if is_fatal_model_error(raw_output_text):
-            print("❌ ERREUR FATALE : %s → skip" % model_name)
-            return None
-        if is_quota_error(raw_output_text):
-            print("❌ QUOTA ÉPUISÉ : %s → skip" % model_name)
-            return None
-
-        cells = getattr(result, "cells", None) or getattr(result, "history", None) or []
-        successful_cells = 0
-        llm_actions = 0
-
-        for cell in cells:
-            status = getattr(cell, "status", None)
-            source = getattr(cell, "source", "") or ""
-            is_llm_action = (
-                "await " in source and
-                "navigate(" not in source and
-                len(source.strip()) > 20
-            )
-            if status is not None and "success" in str(status).lower():
-                successful_cells += 1
-                if is_llm_action:
-                    llm_actions += 1
-            elif getattr(cell, "output", ""):
-                successful_cells += 1
-                if is_llm_action:
-                    llm_actions += 1
-
-        print("Cellules : %d totales, %d reussies, %d actions LLM" % (
-            len(cells), successful_cells, llm_actions))
-
-        final_text = extract_final_result(result)
-        report = extract_json_from_text(final_text)
-        has_valid_json = report is not None and "overall_status" in report
-
-        if llm_actions < 1 and not has_valid_json:
-            print("❌ REJETE : %s n'a effectue AUCUNE action LLM" % model_name)
-            return None
-
-        print("Resultat extrait (" + model_name + ") :")
-        print(final_text[:800])
-
-        if report:
-            return normalize_report(report, model_name)
-
-        text_lower = final_text.lower()
-        has_anomaly = any(
-            kw in text_lower
-            for kw in ["erreur", "error", "undefined", "0 produit",
-                       "no results", "aucun produit"]
-        )
-
-        return {
-            "overall_status": "DOWN" if has_anomaly else "UP",
-            "site_type": SITE_TYPE,
-            "actions_completed": True,
-            "model_used": model_name,
-            "pages": [{
-                "url": SITE_URL,
-                "status": "DOWN" if has_anomaly else "UP",
-                "http_code": None,
-                "action_tested": "exploration et assertions",
-                "assertion_passed": not has_anomaly,
-                "note": "Exploration automatique effectuee.",
-            }],
-        }
-
-    except Exception as err:
-        print("Echec avec " + model_name + " : " + str(err))
-        return None
-
-    finally:
-        if recorder_task is not None:
-            recorder_task.cancel()
-            try:
-                await recorder_task
-            except (asyncio.CancelledError, Exception):
-                pass
-        await close_agent_session(agent)
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-async def main() -> None:
-    task = (
-        "Navigate to " + SITE_URL + ". "
-        "Execute the required interactions. "
-        "Use Python assertions. "
-        "Detect anomalies (errors, undefined, empty listings). "
-        "HARD LIMIT: 6 tool calls max, then call done(). "
-        "IMPORTANT: write ONLY valid Python code blocks between triple backticks."
-    )
-
-    final_report = None
-    total = len(MODEL_CHAIN)
-
-    for idx, model_config in enumerate(MODEL_CHAIN):
-        print("")
-        print("#" * 60)
-        print("# Essai %d/%d : [%s] %s" % (
-            idx + 1, total, model_config["provider"], model_config["model"]))
-        print("#" * 60)
-
-        report = await run_attempt(model_config, task)
-        if report is not None:
-            final_report = report
-            print("✅ Modele retenu : %s" % model_config["model"])
-            break
-        else:
-            print("Modele ecarte : %s" % model_config["model"])
-            if idx < total - 1:
-                print("⏳ Attente %ds..." % DELAY_BETWEEN_ATTEMPTS)
-                await asyncio.sleep(DELAY_BETWEEN_ATTEMPTS)
-
-    if final_report is None:
-        final_report = {
-            "overall_status": "ERROR",
-            "site_type": SITE_TYPE,
-            "actions_completed": False,
-            "model_used": None,
-            "pages": [{
-                "url": SITE_URL,
-                "status": "ERROR",
-                "http_code": None,
-                "action_tested": None,
-                "assertion_passed": False,
-                "note": "Tous les modeles ont echoue.",
-            }],
-            "error": "Tous les modeles ont echoue.",
-        }
-
-    output_path = os.path.join(os.getcwd(), "output.json")
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(final_report, f, indent=2, ensure_ascii=False)
-
-    print("")
-    print("=== output.json ===")
-    print(json.dumps(final_report, indent=2, ensure_ascii=False))
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+            llm =
