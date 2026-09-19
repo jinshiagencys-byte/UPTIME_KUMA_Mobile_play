@@ -48,7 +48,6 @@ jobs:
             RAW=$(curl -fsS --retry 3 -H "x-relay-secret: $RELAY_SECRET" "$RELAY_URL/active-sites")
             SITES_RAW=$(echo "$RAW" | jq -c '[.sites[]? | {id: .id, url: .site_url}]' 2>/dev/null || echo "[]")
             [ -z "$SITES_RAW" ] || [ "$SITES_RAW" = "null" ] && SITES_RAW="[]"
-
             SITES_ARRAY="[]"
             while IFS= read -r site; do
               [ -z "$site" ] && continue
@@ -60,7 +59,6 @@ jobs:
             done <<< "$(echo "$SITES_RAW" | jq -c '.[]?')"
             SITES="$SITES_ARRAY"
           fi
-
           SITES=$(echo "$SITES" | jq -c .)
           echo "sites=$SITES" >> "$GITHUB_OUTPUT"
           echo "Sites a monitorer :"
@@ -92,12 +90,12 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Installer OpenBrowser-AI + Gemini + ffmpeg
+      - name: Installer OpenBrowser-AI + OpenAI + ffmpeg
         run: |
           set -euo pipefail
           pip install --quiet "openbrowser-ai[agent,video]"
           pip install --quiet openai
-          pip install --quiet langchain-google-genai
+          pip install --quiet langchain-core
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg
           echo "ffmpeg : $(which ffmpeg)"
@@ -110,7 +108,6 @@ jobs:
           set -euo pipefail
           URL="${{ matrix.site.url }}"
           HTML=$(curl -fsSL --max-time 15 "$URL" 2>/dev/null || echo "")
-
           if echo "$HTML" | grep -qiE '(marketplace|vendeur|seller|multi-vendor|boutique)'; then
             TYPE="marketplace"
           elif echo "$HTML" | grep -qiE '(panier|cart|checkout|prix|price|produit|acheter)'; then
@@ -122,7 +119,6 @@ jobs:
           else
             TYPE="generic"
           fi
-
           echo "TYPE=$TYPE" >> "$GITHUB_OUTPUT"
           echo "Type detecte : $TYPE"
 
@@ -177,15 +173,20 @@ jobs:
         run: |
           set +e
           mkdir -p recordings-mp4
-          count=$(find recordings/shots -name "*.png" 2>/dev/null | wc -l)
+          count=$(find recordings/shots -name "shot_*.png" 2>/dev/null | wc -l)
           echo "Screenshots disponibles : $count"
+
           if [ "$count" -gt 0 ]; then
-            ffmpeg -y -framerate 1 -pattern_type glob -i 'recordings/shots/shot_*.png' \
-              -c:v libx264 -pix_fmt yuv420p \
-              -vf "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2" \
-              recordings-mp4/timelapse.mp4 >/dev/null 2>&1
-            if [ -f "recordings-mp4/timelapse.mp4" ]; then
-              echo "Timelapse genere : $(ls -la recordings-mp4/timelapse.mp4 | awk '{print $5}') octets"
+            echo "🎬 Encodage du timelapse avec ffmpeg..."
+            # Utilisation du pattern standard %04d (beaucoup plus fiable que glob)
+            ffmpeg -y -framerate 2 -i 'recordings/shots/shot_%04d.png' \
+              -c:v libx264 -pix_fmt yuv420p -movflags +faststart \
+              recordings-mp4/timelapse.mp4
+
+            if [ -f "recordings-mp4/timelapse.mp4" ] && [ -s "recordings-mp4/timelapse.mp4" ]; then
+              echo "✅ Timelapse genere avec succes : $(ls -lh recordings-mp4/timelapse.mp4 | awk '{print $5}')"
+            else
+              echo "❌ Erreur : Le fichier timelapse.mp4 est vide ou absent"
             fi
           else
             echo "Aucun screenshot a convertir"
