@@ -16,6 +16,20 @@ Corrections appliquées après lecture directe du code source openbrowser-ai :
      une frame QUE quand la page se repeint, donc aucune frame pendant les attentes
      LLM, et le recorder écrit à 30 fps fixes → monkeypatch de VideoRecorderService
      (voir section dédiée plus bas).
+  5. Run réel usinformatique.com -> ERROR : un appel à openrouter/free est resté
+     muet 232 s (ChatOpenAI par défaut = timeout 600 s + 5 retries) jusqu'au
+     timeout global. -> timeout par appel LLM (LLM_CALL_TIMEOUT_SECONDS).
+  6. Erreur 'AIMessage' object has no attribute 'completion' (Gemini) : nos
+     wrappers maison renvoyaient un AIMessage alors qu'openbrowser-ai attend un
+     ChatInvokeCompletion. -> tous les providers passent par ChatOpenAI
+     (endpoints compatibles OpenAI), wrappers supprimés.
+  7. IDs Groq morts (llama-3.3-70b-specdec, qwen/qwen-3.5-32b) remplacés par
+     ceux que Groq recommande sur sa page de dépréciation.
+  8. Verdict fabriqué : sans JSON exploitable, le script déduisait UP/DOWN en
+     cherchant "error" dans str(result) — or repr(CodeCell) contient toujours
+     "error=None" -> DOWN systématique, sans aucun test réel. Supprimé : le
+     rapport doit venir de done() (agent.namespace['_task_result']), et un UP
+     sans interaction réelle (click/input/scroll...) est rejeté.
 """
 import asyncio
 import glob
@@ -155,192 +169,29 @@ print("Video freeze cap  : %.1fs" % FREEZE_CAP_SECONDS)
 
 
 # ---------------------------------------------------------------------------
-# Wrapper Google AI Studio (endpoint OpenAI-compatible)
+# Construction du LLM — ChatOpenAI pour TOUS les providers
+# (OpenRouter, Groq et Google AI Studio exposent des endpoints compatibles
+# OpenAI ; ChatOpenAI renvoie le ChatInvokeCompletion qu'attend openbrowser-ai)
 # ---------------------------------------------------------------------------
-class GoogleGeminiWrapper:
-    def __init__(self, model, api_key, base_url, temperature=0.0):
-        self.client = AsyncOpenAI(api_key=api_key, base_url=base_url)
-        self.model = model
-        self.temperature = temperature
-        self.provider = "google"
-        self.model_name = model
-
-    async def ainvoke(self, messages, config=None, **kwargs):
-        openai_messages = []
-        for msg in messages:
-            if hasattr(msg, "type"):
-                role = "user"
-                if msg.type == "human":
-                    role = "user"
-                elif msg.type == "ai":
-                    role = "assistant"
-                elif msg.type == "system":
-                    role = "system"
-                content = msg.content
-                if not isinstance(content, str):
-                    content = str(content)
-            elif isinstance(msg, dict):
-                role = msg.get("role", "user")
-                content = msg.get("content", "")
-                if not isinstance(content, str):
-                    content = str(content)
-            else:
-                role = "user"
-                content = str(msg)
-            openai_messages.append({"role": role, "content": content})
-
-        response = await self.client.chat.completions.create(
-            model=self.model,
-            messages=openai_messages,
-            temperature=self.temperature,
-        )
-        content = response.choices[0].message.content
-
-        try:
-            input_tokens = response.usage.prompt_tokens
-            output_tokens = response.usage.completion_tokens
-        except Exception:
-            input_tokens = 100
-            output_tokens = max(1, len(content) // 4)
-
-        # 9 champs exigés par TokenUsageEntry de openbrowser-ai
-        usage_dict = {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "total_tokens": input_tokens + output_tokens,
-            "prompt_tokens": input_tokens,
-            "completion_tokens": output_tokens,
-            "prompt_cached_tokens": 0,
-            "prompt_cache_creation_tokens": 0,
-            "prompt_image_tokens": 0,
-        }
-
-        try:
-            from langchain_core.messages import AIMessage
-            msg = AIMessage(content=content)
-            msg.usage_metadata = usage_dict
-            msg.usage = usage_dict
-            msg.response_metadata = {
-                "model_name": self.model,
-                "finish_reason": "stop",
-                "token_usage": usage_dict,
-            }
-            return msg
-        except ImportError:
-            class SimpleMessage:
-                def __init__(self, content, model, usage):
-                    self.content = content
-                    self.type = "ai"
-                    self.usage = usage
-                    self.usage_metadata = usage
-                    self.response_metadata = {
-                        "model_name": model,
-                        "finish_reason": "stop",
-                        "token_usage": usage,
-                    }
-            return SimpleMessage(content, self.model, usage_dict)
-
-    async def acall(self, messages, **kwargs):
-        return await self.ainvoke(messages, **kwargs)
-
-    def bind_tools(self, tools):
-        return self
-
-    def with_structured_output(self, schema):
-        return self
-
-
-# ---------------------------------------------------------------------------
-# Wrapper Groq
-# ---------------------------------------------------------------------------
-class GroqWrapper:
-    def __init__(self, model, api_key, base_url, temperature=0.0):
-        self.client = AsyncOpenAI(api_key=api_key, base_url=base_url)
-        self.model = model
-        self.temperature = temperature
-        self.provider = "groq"
-        self.model_name = model
-
-    async def ainvoke(self, messages, config=None, **kwargs):
-        openai_messages = []
-        for msg in messages:
-            if hasattr(msg, "type"):
-                role = "user"
-                if msg.type == "human":
-                    role = "user"
-                elif msg.type == "ai":
-                    role = "assistant"
-                elif msg.type == "system":
-                    role = "system"
-                content = msg.content
-            elif isinstance(msg, dict):
-                role = msg.get("role", "user")
-                content = msg.get("content", "")
-            else:
-                role = "user"
-                content = str(msg)
-            if not isinstance(content, str):
-                content = str(content)
-            openai_messages.append({"role": role, "content": content})
-
-        response = await self.client.chat.completions.create(
-            model=self.model,
-            messages=openai_messages,
-            temperature=self.temperature,
-        )
-        content = response.choices[0].message.content
-
-        try:
-            input_tokens = response.usage.prompt_tokens
-            output_tokens = response.usage.completion_tokens
-        except Exception:
-            input_tokens = 100
-            output_tokens = max(1, len(content) // 4)
-
-        usage_dict = {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "total_tokens": input_tokens + output_tokens,
-            "prompt_tokens": input_tokens,
-            "completion_tokens": output_tokens,
-            "prompt_cached_tokens": 0,
-            "prompt_cache_creation_tokens": 0,
-            "prompt_image_tokens": 0,
-        }
-
-        try:
-            from langchain_core.messages import AIMessage
-            msg = AIMessage(content=content)
-            msg.usage_metadata = usage_dict
-            msg.usage = usage_dict
-            msg.response_metadata = {
-                "model_name": self.model,
-                "finish_reason": "stop",
-                "token_usage": usage_dict,
-            }
-            return msg
-        except ImportError:
-            class SimpleMessage:
-                def __init__(self, content, model, usage):
-                    self.content = content
-                    self.type = "ai"
-                    self.usage = usage
-                    self.usage_metadata = usage
-                    self.response_metadata = {
-                        "model_name": model,
-                        "finish_reason": "stop",
-                        "token_usage": usage,
-                    }
-            return SimpleMessage(content, self.model, usage_dict)
-
-    async def acall(self, messages, **kwargs):
-        return await self.ainvoke(messages, **kwargs)
-
-    def bind_tools(self, tools):
-        return self
-
-    def with_structured_output(self, schema):
-        return self
+def build_llm(model_config):
+    llm_kwargs = {}
+    if model_config["provider"] != "openrouter":
+        # openrouter/free : réglages historiques inchangés (validés en vrai).
+        # Groq / Google : on n'envoie ni frequency_penalty (0.3 par défaut dans
+        # ChatOpenAI) ni plafond de tokens, pour rester sur les défauts du provider.
+        llm_kwargs = {"frequency_penalty": None, "max_completion_tokens": None}
+    return ChatOpenAI(
+        model=model_config["model"],
+        base_url=model_config["base_url"],
+        api_key=model_config["key"],
+        temperature=0.0,
+        # Par défaut ChatOpenAI = timeout lecture 600 s + 5 retries : un appel
+        # muet bloquait tout le run. Ici l'appel échoue vite et la boucle
+        # interne d'openbrowser-ai le relance (compteur "consecutive errors").
+        timeout=LLM_CALL_TIMEOUT,
+        max_retries=0,
+        **llm_kwargs,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -354,27 +205,30 @@ if OPENROUTER_API_KEY:
         "model": "openrouter/free",
         "key": OPENROUTER_API_KEY,
         "base_url": "https://openrouter.ai/api/v1",
-        "use_wrapper": False,
     })
 
+# IDs surchargeables par variable d'environnement (séparés par des virgules) :
+# les catalogues changent souvent (Groq a déjà retiré 4 modèles en 2026).
+# Défaut Groq = remplacements recommandés par Groq (console.groq.com/docs/deprecations)
+GROQ_MODELS = os.environ.get("GROQ_MODELS", "openai/gpt-oss-120b,qwen/qwen3.6-27b")
+GOOGLE_MODELS = os.environ.get("GOOGLE_MODELS", "gemini-3.5-flash,gemini-3.6-flash")
+
 if GROQ_API_KEY:
-    for m in ["llama-3.3-70b-specdec", "qwen/qwen-3.5-32b"]:
+    for m in [x.strip() for x in GROQ_MODELS.split(",") if x.strip()]:
         MODEL_CHAIN.append({
             "provider": "groq",
             "model": m,
             "key": GROQ_API_KEY,
             "base_url": "https://api.groq.com/openai/v1",
-            "use_wrapper": "groq_wrapper",
         })
 
 if GOOGLE_API_KEY:
-    for m in ["gemini-3.5-flash", "gemini-3.6-flash"]:
+    for m in [x.strip() for x in GOOGLE_MODELS.split(",") if x.strip()]:
         MODEL_CHAIN.append({
             "provider": "google_openai",
             "model": m,
             "key": GOOGLE_API_KEY,
             "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-            "use_wrapper": "google_wrapper",
         })
 
 if not MODEL_CHAIN:
@@ -386,7 +240,10 @@ print("Chaine finale :")
 for i, entry in enumerate(MODEL_CHAIN):
     print("  %d. [%s] %s" % (i + 1, entry["provider"], entry["model"]))
 
-GLOBAL_TIMEOUT_SECONDS = 240
+# Un vrai run a montré des appels LLM légitimes de 68 s et 76 s sur openrouter/free
+# -> le timeout par appel doit rester au-dessus, et le global aussi.
+LLM_CALL_TIMEOUT = float(os.environ.get("LLM_CALL_TIMEOUT_SECONDS", "100"))
+GLOBAL_TIMEOUT_SECONDS = float(os.environ.get("GLOBAL_TIMEOUT_SECONDS", "300"))
 MAX_STEPS = 8
 DELAY_BETWEEN_ATTEMPTS = 3
 
@@ -503,34 +360,96 @@ def extract_final_result(result):
         output = getattr(cell, "output", "") or ""
         if '"url"' in output or '"overall_status"' in output:
             return output
-    return str(result)
+    return ""  # surtout PAS str(result) : il contient toujours "error=None"
+
+
+VALID_STATUSES = ("UP", "DOWN", "ERROR", "UNKNOWN")
+
+_INTERACTION_RE = re.compile("|".join([
+    r"\b(?:click|input_text|send_keys|select_dropdown|scroll|upload_file)\s*\(",
+    r"\.(?:click|focus|submit)\s*\(",
+    r"\bscroll(?:To|By|IntoView)\b",
+    r"\bdispatchEvent\b",
+]))
+
+
+def parse_report(text):
+    """JSON de rapport valide (overall_status reconnu) ou None. Aucune deduction."""
+    if not text:
+        return None
+    candidate = None
+    if isinstance(text, dict):
+        candidate = text
+    else:
+        text = str(text).strip()
+        try:
+            candidate = json.loads(text)
+        except json.JSONDecodeError:
+            candidate = extract_json_from_text(text)
+    if (
+        isinstance(candidate, dict)
+        and str(candidate.get("overall_status", "")).upper() in VALID_STATUSES
+    ):
+        return candidate
+    return None
+
+
+def get_agent_report(agent, result):
+    """Source fiable = ce que l'agent a remis via done() : agent.namespace['_task_result']."""
+    ns = getattr(agent, "namespace", None) or {}
+    if ns.get("_task_done") and ns.get("_task_result"):
+        report = parse_report(ns["_task_result"])
+        if report is not None:
+            return report
+    # second recours : anciens chemins (source de cellule done(...) / sortie)
+    return parse_report(extract_final_result(result))
+
+
+def count_real_interactions(cells):
+    """Cellules reussies contenant une vraie interaction (pas navigate/evaluate de lecture)."""
+    n = 0
+    for cell in cells:
+        if getattr(cell, "error", None):
+            continue
+        source = getattr(cell, "source", "") or ""
+        if "done(" in source:
+            continue
+        code = "\n".join(
+            line for line in source.splitlines() if not line.strip().startswith("#")
+        )
+        if _INTERACTION_RE.search(code):
+            n += 1
+    return n
 
 
 def normalize_report(report, model_name):
-    if "overall_status" in report and "pages" in report:
-        report["model_used"] = model_name
-        return report
-    text_blob = json.dumps(report, ensure_ascii=False).lower()
-    has_anomaly = any(
-        kw in text_blob
-        for kw in ["erreur", "error", "undefined", "0 produit",
-                   "aucun produit", "no results"]
-    )
-    status = "DOWN" if has_anomaly else "UP"
-    return {
-        "overall_status": status,
-        "site_type": report.get("site_type", SITE_TYPE),
-        "actions_completed": True,
-        "model_used": model_name,
-        "pages": [{
-            "url": report.get("url", SITE_URL),
+    status = str(report["overall_status"]).upper()
+    report["overall_status"] = status
+    report["model_used"] = model_name
+    report.setdefault("site_type", SITE_TYPE)
+    report.setdefault("actions_completed", True)
+    if not isinstance(report.get("pages"), list) or not report["pages"]:
+        report["pages"] = [{
+            "url": SITE_URL,
             "status": status,
             "http_code": None,
-            "action_tested": "exploration",
-            "assertion_passed": not has_anomaly,
-            "note": "Verification effectuee",
-        }],
-    }
+            "action_tested": None,
+            "assertion_passed": status == "UP",
+            "note": "Rapport sans detail par page.",
+        }]
+    return report
+
+
+def judge_run(agent, result, model_name):
+    """(rapport | None, raison). Le verdict vient de l'agent, jamais d'une heuristique."""
+    cells = list(getattr(result, "cells", None) or [])
+    report = get_agent_report(agent, result)
+    interactions = count_real_interactions(cells)
+    if report is None:
+        return None, "aucun rapport JSON remis par done() : l'agent n'a pas conclu"
+    if str(report["overall_status"]).upper() == "UP" and interactions == 0:
+        return None, "UP annonce sans aucune interaction reelle (navigate/evaluate seuls) : pas un test"
+    return normalize_report(report, model_name), "%d interaction(s) reelle(s)" % interactions
 
 
 # ---------------------------------------------------------------------------
@@ -649,15 +568,14 @@ async def preflight_api_check(model_config):
 #   FIX #3 : consignes QA fusionnees dans task (pas de system prompt custom)
 #   FIX #4 : await browser_session.start() AVANT de la passer a CodeAgent
 #            (CodeAgent ne l'appelle que s'il cree lui-meme la session)
+#   FIX #6 : ChatOpenAI pour tous les providers + timeout par appel LLM
+#   FIX #7 : verdict = rapport de done() uniquement (plus d'heuristique par mots-cles)
 #   FIX #5 : monkeypatch VideoRecorderService (gel des frames pendant les
 #            attentes LLM, voir section MONKEYPATCH VIDEO en haut du fichier)
 # ---------------------------------------------------------------------------
 async def run_attempt(model_config, task):
     provider = model_config["provider"]
     model_name = model_config["model"]
-    api_key = model_config["key"]
-    base_url = model_config["base_url"]
-    wrapper_type = model_config.get("use_wrapper", False)
 
     print("=" * 60)
     print("TENTATIVE - PROVIDER : %s | MODELE : %s" % (provider, model_name))
@@ -668,21 +586,7 @@ async def run_attempt(model_config, task):
     start_time = time.time()
 
     try:
-        if wrapper_type == "google_wrapper":
-            llm = GoogleGeminiWrapper(
-                model=model_name, api_key=api_key,
-                base_url=base_url, temperature=0.0,
-            )
-        elif wrapper_type == "groq_wrapper":
-            llm = GroqWrapper(
-                model=model_name, api_key=api_key,
-                base_url=base_url, temperature=0.0,
-            )
-        else:
-            llm = ChatOpenAI(
-                model=model_name, base_url=base_url,
-                api_key=api_key, temperature=0.0,
-            )
+        llm = build_llm(model_config)
 
         # ⭐ FIX #2 : CodeAgent n'accepte PAS browser_profile en kwarg
         # (silencieusement ignore et logge dans "Ignoring additional kwargs").
@@ -723,64 +627,16 @@ async def run_attempt(model_config, task):
             print("Timeout global pour " + model_name)
             return None
 
-        # --- ETAPE 1 : Evaluer le resultat AVANT les erreurs ---
+        # --- ETAPE 1 : le verdict doit venir de done(), jamais d'une heuristique ---
         raw_output_text = str(result)
+        cells = getattr(result, "cells", None) or []
+        report, reason = judge_run(agent, result, model_name)
+        print("Cellules executees : %d | %s" % (len(cells), reason))
 
-        cells = getattr(result, "cells", None) or getattr(result, "history", None) or []
-        successful_cells = 0
-        llm_actions = 0
-
-        for cell in cells:
-            status = getattr(cell, "status", None)
-            source = getattr(cell, "source", "") or ""
-            is_llm_action = (
-                "await " in source and
-                "navigate(" not in source and
-                len(source.strip()) > 20
-            )
-            if status is not None and "success" in str(status).lower():
-                successful_cells += 1
-                if is_llm_action:
-                    llm_actions += 1
-            elif getattr(cell, "output", ""):
-                successful_cells += 1
-                if is_llm_action:
-                    llm_actions += 1
-
-        final_text = extract_final_result(result)
-        report = extract_json_from_text(final_text)
-        has_valid_json = report is not None and "overall_status" in report
-
-        # ⭐ FIX #1 : SUCCES D'ABORD
-        if has_valid_json or llm_actions >= 1:
-            print("Cellules : %d totales, %d reussies, %d actions LLM" % (
-                len(cells), successful_cells, llm_actions))
-            print("Resultat extrait (" + model_name + ") :")
-            print(final_text[:800])
-
-            if report:
-                return normalize_report(report, model_name)
-
-            text_lower = final_text.lower()
-            has_anomaly = any(
-                kw in text_lower
-                for kw in ["erreur", "error", "undefined", "0 produit",
-                           "no results", "aucun produit"]
-            )
-            return {
-                "overall_status": "DOWN" if has_anomaly else "UP",
-                "site_type": SITE_TYPE,
-                "actions_completed": True,
-                "model_used": model_name,
-                "pages": [{
-                    "url": SITE_URL,
-                    "status": "DOWN" if has_anomaly else "UP",
-                    "http_code": None,
-                    "action_tested": "exploration et assertions",
-                    "assertion_passed": not has_anomaly,
-                    "note": "Exploration automatique effectuee.",
-                }],
-            }
+        if report is not None:
+            print("Rapport retenu (" + model_name + ") :")
+            print(json.dumps(report, ensure_ascii=False)[:800])
+            return report
 
         # --- ETAPE 2 : seulement si pas de resultat exploitable ---
         if is_fatal_model_error(raw_output_text):
@@ -790,7 +646,7 @@ async def run_attempt(model_config, task):
             print("QUOTA/SOLDE : %s -> skip" % model_name)
             return None
 
-        print("REJETE : %s aucune action LLM et aucun report valide" % model_name)
+        print("REJETE : %s -> %s" % (model_name, reason))
         return None
 
     except Exception as err:
