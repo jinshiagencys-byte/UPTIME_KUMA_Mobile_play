@@ -1,18 +1,28 @@
 """
 OpenBrowser-AI — Monitoring fonctionnel.
-STRATÉGIE 100% GRATUITE + VIDÉO NATIVE :
-  1. Groq (llama-3.3-70b-specdec, qwen-3.5-32b)
-  2. Google AI Studio (gemini-3.5-flash / 3.6-flash)
-  3. OpenRouter (openrouter/free)
-Enregistrement vidéo natif via record_video_dir (plus de screenshots+ffmpeg).
-Preflight + détection erreurs fatales + quotas.
+STRATÉGIE : OpenRouter (confirmé) -> Groq -> Google (dernier recours)
+Vidéo native via CDP Page.startScreencast + imageio_ffmpeg (pas Playwright).
+Preflight + succès AVANT erreurs fatales.
+Logging DEBUG activé pour diagnostiquer le pipeline vidéo.
 """
 import asyncio
 import glob
 import json
+import logging
 import os
 import re
 import time
+
+# ⭐ ACTIVATION LOGS INTERNES DU FRAMEWORK (avant tout import openbrowser)
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s %(levelname)-8s [%(name)s] %(message)s",
+)
+# Réduire le bruit des libs tierces, garder openbrowser + notre script
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("openai").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 from openai import AsyncOpenAI
 from openbrowser import CodeAgent
@@ -41,7 +51,7 @@ print("OpenRouter key    : " + str(bool(OPENROUTER_API_KEY)))
 
 
 # ---------------------------------------------------------------------------
-# Wrapper Google AI Studio — TOUS les champs requis par TokenUsageEntry
+# Wrapper Google AI Studio (endpoint OpenAI-compatible)
 # ---------------------------------------------------------------------------
 class GoogleGeminiWrapper:
     def __init__(self, model, api_key, base_url, temperature=0.0):
@@ -63,7 +73,6 @@ class GoogleGeminiWrapper:
                 elif msg.type == "system":
                     role = "system"
                 content = msg.content
-                # Normaliser content en string (sinon Groq/Google rejettent)
                 if not isinstance(content, str):
                     content = str(content)
             elif isinstance(msg, dict):
@@ -90,7 +99,6 @@ class GoogleGeminiWrapper:
             input_tokens = 100
             output_tokens = max(1, len(content) // 4)
 
-        # ⚠️ TOUS les 5 champs exigés par TokenUsageEntry de openbrowser-ai
         usage_dict = {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
@@ -138,7 +146,7 @@ class GoogleGeminiWrapper:
 
 
 # ---------------------------------------------------------------------------
-# Wrapper Groq — normalise le content en string (corrige l'erreur multimodal)
+# Wrapper Groq
 # ---------------------------------------------------------------------------
 class GroqWrapper:
     def __init__(self, model, api_key, base_url, temperature=0.0):
@@ -166,11 +174,8 @@ class GroqWrapper:
             else:
                 role = "user"
                 content = str(msg)
-
-            # ⚠️ Groq exige du string pur — pas de listes multimodales
             if not isinstance(content, str):
                 content = str(content)
-
             openai_messages.append({"role": role, "content": content})
 
         response = await self.client.chat.completions.create(
@@ -234,11 +239,21 @@ class GroqWrapper:
 
 
 # ---------------------------------------------------------------------------
-# Chaîne de modèles — 100% GRATUITE
+# Chaîne de modèles — ORDRE : OpenRouter d'abord
 # ---------------------------------------------------------------------------
 MODEL_CHAIN = []
 
-# 🥇 GROQ : modèles à jour sept. 2026
+# 🥇 OPENROUTER : seul modèle confirmé fonctionnel
+if OPENROUTER_API_KEY:
+    MODEL_CHAIN.append({
+        "provider": "openrouter",
+        "model": "openrouter/free",
+        "key": OPENROUTER_API_KEY,
+        "base_url": "https://openrouter.ai/api/v1",
+        "use_wrapper": False,
+    })
+
+# 🥈 GROQ : à réactiver une fois les IDs corrigés
 if GROQ_API_KEY:
     for m in ["llama-3.3-70b-specdec", "qwen/qwen-3.5-32b"]:
         MODEL_CHAIN.append({
@@ -249,7 +264,7 @@ if GROQ_API_KEY:
             "use_wrapper": "groq_wrapper",
         })
 
-# 🥈 GOOGLE AI STUDIO : en secours (quotas limités)
+# 🥉 GOOGLE : dernier recours
 if GOOGLE_API_KEY:
     for m in ["gemini-3.5-flash", "gemini-3.6-flash"]:
         MODEL_CHAIN.append({
@@ -259,16 +274,6 @@ if GOOGLE_API_KEY:
             "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
             "use_wrapper": "google_wrapper",
         })
-
-# 🥉 OPENROUTER : routeur gratuit en dernier recours
-if OPENROUTER_API_KEY:
-    MODEL_CHAIN.append({
-        "provider": "openrouter",
-        "model": "openrouter/free",
-        "key": OPENROUTER_API_KEY,
-        "base_url": "https://openrouter.ai/api/v1",
-        "use_wrapper": False,
-    })
 
 if not MODEL_CHAIN:
     print("ERREUR : aucune cle API disponible. Abandon.")
@@ -388,41 +393,53 @@ def normalize_report(report, model_name):
 
 
 # ---------------------------------------------------------------------------
-# Fermeture session
+# Fermeture session (SIMPLIFIÉE : pas de browser_context Playwright,
+# la vidéo est gérée en interne par CDP + imageio/ffmpeg via BrowserStopEvent)
 # ---------------------------------------------------------------------------
 async def close_agent_session(agent):
     if agent is None:
         return
-    await asyncio.sleep(3)
+
     session = None
     for attr_name in ("browser_session", "browser", "session"):
         session = getattr(agent, attr_name, None)
         if session is not None:
             print("Session trouvee via agent." + attr_name)
             break
+
     if session is None:
-        return
-    for method_name in ("close", "stop", "kill", "shutdown", "cleanup"):
-        if not hasattr(session, method_name):
-            continue
-        try:
-            r = getattr(session, method_name)()
-            if asyncio.iscoroutine(r):
-                await r
-            print("Session fermee via " + method_name + "()")
-            break
-        except Exception as e:
-            print("Echec " + method_name + "() : " + str(e))
-    # Lister les vidéos enregistrées nativement
-    videos = glob.glob(os.path.join(RECORDINGS_DIR, "*.webm")) + \
-             glob.glob(os.path.join(RECORDINGS_DIR, "*.mp4"))
-    print("Videos natives : " + str(len(videos)))
+        print("Aucune session trouvee sur l'agent")
+    else:
+        # Juste stop() : BrowserStopEvent déclenchera automatiquement
+        # la finalisation du fichier MP4 via le recording_watchdog interne
+        for method_name in ("close", "stop", "kill", "shutdown", "cleanup"):
+            if not hasattr(session, method_name):
+                continue
+            try:
+                r = getattr(session, method_name)()
+                if asyncio.iscoroutine(r):
+                    await r
+                print("Session fermee via " + method_name + "()")
+                break
+            except Exception as e:
+                print("Echec " + method_name + "() : " + str(e))
+
+    # Laisser le temps au pipeline CDP+ffmpeg d'écrire le MP4 final
+    await asyncio.sleep(5)
+
+    videos = (
+        glob.glob(os.path.join(RECORDINGS_DIR, "*.mp4"))
+        + glob.glob(os.path.join(RECORDINGS_DIR, "*.webm"))
+    )
+    print("Videos trouvees dans %s : %d" % (RECORDINGS_DIR, len(videos)))
     for v in videos:
         print("  -> " + v + " (" + str(os.path.getsize(v)) + " octets)")
+    if not videos:
+        print("Contenu complet du dossier : " + str(os.listdir(RECORDINGS_DIR)))
 
 
 # ---------------------------------------------------------------------------
-# Détection erreurs
+# Détection erreurs (appelées UNIQUEMENT si pas de résultat exploitable)
 # ---------------------------------------------------------------------------
 def is_fatal_model_error(output_text):
     lower = output_text.lower()
@@ -448,7 +465,6 @@ def is_quota_error(output_text):
     return any(p in lower for p in [
         "quota exceeded",
         "resource_exhausted",
-        "rate limit",
         "429",
         "too many requests",
         "free_tier_requests",
@@ -461,7 +477,7 @@ def is_quota_error(output_text):
 
 
 # ---------------------------------------------------------------------------
-# Preflight API (1 token) avant lancement navigateur
+# Preflight API (1 token)
 # ---------------------------------------------------------------------------
 async def preflight_api_check(model_config):
     try:
@@ -486,7 +502,7 @@ async def preflight_api_check(model_config):
 
 
 # ---------------------------------------------------------------------------
-# Tentative — avec enregistrement vidéo NATIF
+# Tentative (FIX #1 : succès AVANT détection erreurs)
 # ---------------------------------------------------------------------------
 async def run_attempt(model_config, task):
     provider = model_config["provider"]
@@ -519,12 +535,13 @@ async def run_attempt(model_config, task):
                 api_key=api_key, temperature=0.0,
             )
 
-        # ⭐ ENREGISTREMENT VIDÉO NATIF — plus besoin de screenshots !
+        # Vidéo native : BrowserConnectedEvent → startScreencast CDP
+        # → imageio_ffmpeg → MP4. BrowserStopEvent finalise.
         profile = BrowserProfile(
             headless=True,
             viewport_width=1280,
             viewport_height=720,
-            record_video_dir=RECORDINGS_DIR,  # ← vidéo native .webm
+            record_video_dir=RECORDINGS_DIR,
         )
 
         agent = CodeAgent(
@@ -541,14 +558,8 @@ async def run_attempt(model_config, task):
             print("Timeout global pour " + model_name)
             return None
 
+        # --- ÉTAPE 1 : Évaluer le résultat AVANT les erreurs ---
         raw_output_text = str(result)
-
-        if is_fatal_model_error(raw_output_text):
-            print("ERREUR FATALE : %s -> skip" % model_name)
-            return None
-        if is_quota_error(raw_output_text):
-            print("QUOTA/SOLDE : %s -> skip" % model_name)
-            return None
 
         cells = getattr(result, "cells", None) or getattr(result, "history", None) or []
         successful_cells = 0
@@ -571,44 +582,51 @@ async def run_attempt(model_config, task):
                 if is_llm_action:
                     llm_actions += 1
 
-        print("Cellules : %d totales, %d reussies, %d actions LLM" % (
-            len(cells), successful_cells, llm_actions))
-
         final_text = extract_final_result(result)
         report = extract_json_from_text(final_text)
         has_valid_json = report is not None and "overall_status" in report
 
-        if llm_actions < 1 and not has_valid_json:
-            print("REJETE : %s n'a effectue AUCUNE action LLM" % model_name)
+        # ⭐ FIX #1 : SUCCÈS D'ABORD
+        if has_valid_json or llm_actions >= 1:
+            print("Cellules : %d totales, %d reussies, %d actions LLM" % (
+                len(cells), successful_cells, llm_actions))
+            print("Resultat extrait (" + model_name + ") :")
+            print(final_text[:800])
+
+            if report:
+                return normalize_report(report, model_name)
+
+            text_lower = final_text.lower()
+            has_anomaly = any(
+                kw in text_lower
+                for kw in ["erreur", "error", "undefined", "0 produit",
+                           "no results", "aucun produit"]
+            )
+            return {
+                "overall_status": "DOWN" if has_anomaly else "UP",
+                "site_type": SITE_TYPE,
+                "actions_completed": True,
+                "model_used": model_name,
+                "pages": [{
+                    "url": SITE_URL,
+                    "status": "DOWN" if has_anomaly else "UP",
+                    "http_code": None,
+                    "action_tested": "exploration et assertions",
+                    "assertion_passed": not has_anomaly,
+                    "note": "Exploration automatique effectuee.",
+                }],
+            }
+
+        # --- ÉTAPE 2 : seulement si pas de résultat exploitable ---
+        if is_fatal_model_error(raw_output_text):
+            print("ERREUR FATALE : %s -> skip" % model_name)
+            return None
+        if is_quota_error(raw_output_text):
+            print("QUOTA/SOLDE : %s -> skip" % model_name)
             return None
 
-        print("Resultat extrait (" + model_name + ") :")
-        print(final_text[:800])
-
-        if report:
-            return normalize_report(report, model_name)
-
-        text_lower = final_text.lower()
-        has_anomaly = any(
-            kw in text_lower
-            for kw in ["erreur", "error", "undefined", "0 produit",
-                       "no results", "aucun produit"]
-        )
-
-        return {
-            "overall_status": "DOWN" if has_anomaly else "UP",
-            "site_type": SITE_TYPE,
-            "actions_completed": True,
-            "model_used": model_name,
-            "pages": [{
-                "url": SITE_URL,
-                "status": "DOWN" if has_anomaly else "UP",
-                "http_code": None,
-                "action_tested": "exploration et assertions",
-                "assertion_passed": not has_anomaly,
-                "note": "Exploration automatique effectuee.",
-            }],
-        }
+        print("REJETE : %s aucune action LLM et aucun report valide" % model_name)
+        return None
 
     except Exception as err:
         print("Echec avec " + model_name + " : " + str(err))
