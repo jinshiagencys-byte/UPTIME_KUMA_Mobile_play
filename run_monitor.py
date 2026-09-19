@@ -1,9 +1,17 @@
 """
 OpenBrowser-AI — Monitoring fonctionnel.
 STRATÉGIE : OpenRouter (confirmé) -> Groq -> Google (dernier recours)
-Vidéo native via CDP Page.startScreencast + imageio_ffmpeg (pas Playwright).
+Vidéo native via CDP Page.startScreencast + imageio_ffmpeg (MP4 direct).
 Preflight + succès AVANT erreurs fatales.
 Logging DEBUG activé pour diagnostiquer le pipeline vidéo.
+
+Corrections appliquées après lecture directe du code source openbrowser-ai :
+  1. CodeAgent n'a PAS de paramètre `browser_profile` → passer via `browser=BrowserSession(...)`
+  2. CodeAgent n'a PAS de paramètre pour system prompt custom → fusionné dans `task`
+  3. CodeAgent n'appelle `browser_session.start()` QUE s'il crée lui-même la session
+     (browser_session is None) → puisqu'on passe une session déjà construite via
+     `browser=`, il faut l'appeler nous-mêmes AVANT de la passer, sinon toute
+     action browser plante (CDP jamais initialisé).
 """
 import asyncio
 import glob
@@ -18,7 +26,6 @@ logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s %(levelname)-8s [%(name)s] %(message)s",
 )
-# Réduire le bruit des libs tierces, garder openbrowser + notre script
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("openai").setLevel(logging.WARNING)
@@ -27,7 +34,7 @@ logging.getLogger("urllib3").setLevel(logging.WARNING)
 from openai import AsyncOpenAI
 from openbrowser import CodeAgent
 from openbrowser.llm import ChatOpenAI
-from openbrowser.browser import BrowserProfile
+from openbrowser.browser import BrowserProfile, BrowserSession
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +106,7 @@ class GoogleGeminiWrapper:
             input_tokens = 100
             output_tokens = max(1, len(content) // 4)
 
+        # 9 champs exigés par TokenUsageEntry de openbrowser-ai
         usage_dict = {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
@@ -239,11 +247,10 @@ class GroqWrapper:
 
 
 # ---------------------------------------------------------------------------
-# Chaîne de modèles — ORDRE : OpenRouter d'abord
+# Chaîne de modèles — OpenRouter d'abord
 # ---------------------------------------------------------------------------
 MODEL_CHAIN = []
 
-# 🥇 OPENROUTER : seul modèle confirmé fonctionnel
 if OPENROUTER_API_KEY:
     MODEL_CHAIN.append({
         "provider": "openrouter",
@@ -253,7 +260,6 @@ if OPENROUTER_API_KEY:
         "use_wrapper": False,
     })
 
-# 🥈 GROQ : à réactiver une fois les IDs corrigés
 if GROQ_API_KEY:
     for m in ["llama-3.3-70b-specdec", "qwen/qwen-3.5-32b"]:
         MODEL_CHAIN.append({
@@ -264,7 +270,6 @@ if GROQ_API_KEY:
             "use_wrapper": "groq_wrapper",
         })
 
-# 🥉 GOOGLE : dernier recours
 if GOOGLE_API_KEY:
     for m in ["gemini-3.5-flash", "gemini-3.6-flash"]:
         MODEL_CHAIN.append({
@@ -290,40 +295,79 @@ DELAY_BETWEEN_ATTEMPTS = 3
 
 
 # ---------------------------------------------------------------------------
-# Prompt système
+# Template de consignes (fusionné dans task, pas dans system_prompt.md
+# puisque CodeAgent n'a aucun point d'injection pour un system prompt custom)
 # ---------------------------------------------------------------------------
-SYSTEM_PROMPT_TEMPLATE = (
-    "You are a functional QA engineer. TEST the web app, do not just observe.\n\n"
-    "OUTPUT FORMAT (CRITICAL):\n"
-    "You MUST write Python code blocks between triple backticks. Example:\n\n"
-    "I will check the page title.\n"
-    "```python\n"
-    "title = await evaluate('document.title')\n"
-    "print(title)\n"
-    "```\n\n"
-    "Do NOT use XML tags. Do NOT use tool_name(args) syntax.\n"
-    "ONLY Python code blocks.\n\n"
-    "RULES:\n"
-    "1. Perform at least ONE real user interaction and verify with an assertion.\n"
-    "2. Page loaded is NOT a test. Button exists is NOT a test.\n"
-    "3. Valid test = action + observation + assertion.\n"
-    "4. Use Python assert.\n\n"
-    "STRICT STOP CONDITION:\n"
-    "- After 6 tool calls max, call done() no matter what.\n"
-    "- Partial results are OK.\n\n"
-    "ANOMALIES (functional failures):\n"
-    "- Text containing Erreur, Error, Failed, undefined, null, 0 produit, Aucun produit.\n"
-    "- Link with /undefined in URL.\n"
-    "- Empty product listing on a catalog page.\n\n"
-    "REQUIRED INTERACTIONS:\nREQUIREMENTS\n\n"
-    "FINAL OUTPUT:\n"
-    "Call done(text=...) with ONLY a valid JSON in text:\n"
-    "  overall_status, site_type, actions_completed, model_used, pages[].\n"
-)
+CONSIGNES_TEMPLATE = """
+Tu es un ingenieur QA fonctionnel. TESTE l'application web, ne te contente pas d'observer.
+
+FORMAT DE SORTIE (CRITIQUE) :
+Tu DOIS ecrire des blocs Python entre triple backticks. Exemple :
+
+Je verifie le titre de la page.
+```python
+title = await evaluate('document.title')
+print(title)
+```
+
+N'utilise PAS de tags XML. N'utilise PAS la syntaxe tool_name(args).
+UNIQUEMENT des blocs de code Python.
+
+REGLES :
+1. Effectue au moins UNE vraie interaction utilisateur et verifie avec une assertion.
+2. Page chargee N'EST PAS un test. Bouton existe N'EST PAS un test.
+3. Test valide = action + observation + assertion.
+4. Utilise Python assert.
+
+CONDITION D'ARRET STRICTE :
+- Apres 6 appels d'outils maximum, appelle done() quoi qu'il arrive.
+- Les resultats partiels sont acceptables.
+
+ANOMALIES (echecs fonctionnels) :
+- Texte contenant Erreur, Error, Failed, undefined, null, 0 produit, Aucun produit.
+- Lien avec /undefined dans l'URL.
+- Liste de produits vide sur une page catalogue.
+
+INTERACTIONS REQUISES :
+__REQUIREMENTS__
+
+SORTIE FINALE :
+Appelle done(text=...) avec UNIQUEMENT un JSON valide dans text :
+  overall_status, site_type, actions_completed, model_used, pages[].
+
+Exemple de forme attendue (remplace les valeurs par le resultat REEL observe) :
+```python
+import json
+result = {"overall_status": "DOWN ou UP selon ce que tu observes",
+"site_type": "__SITE_TYPE__", "actions_completed": True,
+"model_used": "__MODEL_NAME__",
+"pages": [{"url": "page testee", "status": "DOWN ou UP",
+"http_code": 200, "action_tested": "description de l'action",
+"assertion_passed": True_ou_False, "note": "ce que tu as observe"}]}
+await done(text=json.dumps(result, ensure_ascii=False), success=True)
+```
+"""
 
 
-def build_system_prompt(model_name):
-    return SYSTEM_PROMPT_TEMPLATE.replace("REQUIREMENTS", REQUIREMENTS)
+def build_full_task(model_name, basic_task):
+    """
+    Construit la tache complete : URL + instructions de base, puis les
+    consignes QA completes (format JSON, regles, limite d'appels).
+
+    IMPORTANT : CodeAgent n'a aucun parametre pour un system prompt custom
+    (system_prompt.md est fixe en interne, charge tel quel). Tout doit donc
+    passer par `task`, qui devient un simple UserMessage("Task: " + task).
+    extract_url_from_task() scanne l'integralite de la chaine (pas seulement
+    le debut) et deduplique via set(), donc repeter SITE_URL plus loin dans
+    les consignes ne casse pas la detection automatique d'URL.
+    """
+    consignes = (
+        CONSIGNES_TEMPLATE
+        .replace("__REQUIREMENTS__", REQUIREMENTS)
+        .replace("__SITE_TYPE__", SITE_TYPE)
+        .replace("__MODEL_NAME__", model_name)
+    )
+    return basic_task + "\n\n---\n\n" + consignes
 
 
 # ---------------------------------------------------------------------------
@@ -393,8 +437,8 @@ def normalize_report(report, model_name):
 
 
 # ---------------------------------------------------------------------------
-# Fermeture session (SIMPLIFIÉE : pas de browser_context Playwright,
-# la vidéo est gérée en interne par CDP + imageio/ffmpeg via BrowserStopEvent)
+# Fermeture session (le flush video se fait via BrowserStopEvent interne,
+# declenche par stop())
 # ---------------------------------------------------------------------------
 async def close_agent_session(agent):
     if agent is None:
@@ -410,8 +454,8 @@ async def close_agent_session(agent):
     if session is None:
         print("Aucune session trouvee sur l'agent")
     else:
-        # Juste stop() : BrowserStopEvent déclenchera automatiquement
-        # la finalisation du fichier MP4 via le recording_watchdog interne
+        # stop() declenche BrowserStopEvent -> le RecordingWatchdog interne
+        # finalise automatiquement le fichier MP4 via CDP+ffmpeg
         for method_name in ("close", "stop", "kill", "shutdown", "cleanup"):
             if not hasattr(session, method_name):
                 continue
@@ -424,7 +468,7 @@ async def close_agent_session(agent):
             except Exception as e:
                 print("Echec " + method_name + "() : " + str(e))
 
-    # Laisser le temps au pipeline CDP+ffmpeg d'écrire le MP4 final
+    # Laisser le pipeline CDP+ffmpeg ecrire le MP4 final sur disque
     await asyncio.sleep(5)
 
     videos = (
@@ -435,11 +479,11 @@ async def close_agent_session(agent):
     for v in videos:
         print("  -> " + v + " (" + str(os.path.getsize(v)) + " octets)")
     if not videos:
-        print("Contenu complet du dossier : " + str(os.listdir(RECORDINGS_DIR)))
+        print("Contenu du dossier : " + str(os.listdir(RECORDINGS_DIR)))
 
 
 # ---------------------------------------------------------------------------
-# Détection erreurs (appelées UNIQUEMENT si pas de résultat exploitable)
+# Detection erreurs (appelees UNIQUEMENT si pas de resultat exploitable)
 # ---------------------------------------------------------------------------
 def is_fatal_model_error(output_text):
     lower = output_text.lower()
@@ -502,7 +546,12 @@ async def preflight_api_check(model_config):
 
 
 # ---------------------------------------------------------------------------
-# Tentative (FIX #1 : succès AVANT détection erreurs)
+# Tentative
+#   FIX #1 : succes AVANT erreurs fatales/quota
+#   FIX #2 : browser=BrowserSession(...) au lieu de browser_profile=...
+#   FIX #3 : consignes QA fusionnees dans task (pas de system prompt custom)
+#   FIX #4 : await browser_session.start() AVANT de la passer a CodeAgent
+#            (CodeAgent ne l'appelle que s'il cree lui-meme la session)
 # ---------------------------------------------------------------------------
 async def run_attempt(model_config, task):
     provider = model_config["provider"]
@@ -516,6 +565,7 @@ async def run_attempt(model_config, task):
     print("=" * 60)
 
     agent = None
+    browser_session = None
     start_time = time.time()
 
     try:
@@ -535,19 +585,35 @@ async def run_attempt(model_config, task):
                 api_key=api_key, temperature=0.0,
             )
 
-        # Vidéo native : BrowserConnectedEvent → startScreencast CDP
-        # → imageio_ffmpeg → MP4. BrowserStopEvent finalise.
+        # ⭐ FIX #2 : CodeAgent n'accepte PAS browser_profile en kwarg
+        # (silencieusement ignore et logge dans "Ignoring additional kwargs").
+        # Il faut construire et passer une vraie BrowserSession.
         profile = BrowserProfile(
             headless=True,
             viewport_width=1280,
             viewport_height=720,
             record_video_dir=RECORDINGS_DIR,
         )
+        browser_session = BrowserSession(browser_profile=profile)
+
+        # ⭐ FIX #4 : demarrage manuel obligatoire. CodeAgent.run() ne fait
+        # `await browser_session.start()` QUE s'il cree lui-meme la session
+        # (browser_session is None au depart). Comme on fournit une session
+        # deja construite via `browser=`, il faut la demarrer nous-memes,
+        # sinon toute action (navigate/evaluate/click) plante car le CDP
+        # n'est jamais initialise.
+        await browser_session.start()
+
+        # ⭐ FIX #3 : CodeAgent n'a pas de parametre pour un system prompt
+        # custom (system_prompt.md est fixe en interne, aucun point
+        # d'injection). Les consignes QA sont fusionnees dans task.
+        full_task = build_full_task(model_name, task)
 
         agent = CodeAgent(
-            task=task, llm=llm, browser_profile=profile,
+            task=full_task,
+            llm=llm,
+            browser=browser_session,
             max_steps=MAX_STEPS,
-            extend_system_message=build_system_prompt(model_name),
         )
 
         try:
@@ -558,7 +624,7 @@ async def run_attempt(model_config, task):
             print("Timeout global pour " + model_name)
             return None
 
-        # --- ÉTAPE 1 : Évaluer le résultat AVANT les erreurs ---
+        # --- ETAPE 1 : Evaluer le resultat AVANT les erreurs ---
         raw_output_text = str(result)
 
         cells = getattr(result, "cells", None) or getattr(result, "history", None) or []
@@ -586,7 +652,7 @@ async def run_attempt(model_config, task):
         report = extract_json_from_text(final_text)
         has_valid_json = report is not None and "overall_status" in report
 
-        # ⭐ FIX #1 : SUCCÈS D'ABORD
+        # ⭐ FIX #1 : SUCCES D'ABORD
         if has_valid_json or llm_actions >= 1:
             print("Cellules : %d totales, %d reussies, %d actions LLM" % (
                 len(cells), successful_cells, llm_actions))
@@ -617,7 +683,7 @@ async def run_attempt(model_config, task):
                 }],
             }
 
-        # --- ÉTAPE 2 : seulement si pas de résultat exploitable ---
+        # --- ETAPE 2 : seulement si pas de resultat exploitable ---
         if is_fatal_model_error(raw_output_text):
             print("ERREUR FATALE : %s -> skip" % model_name)
             return None
