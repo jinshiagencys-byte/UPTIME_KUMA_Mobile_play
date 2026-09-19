@@ -7,8 +7,9 @@ on:
         description: "ID du site à tester spécifiquement (optionnel)"
         required: false
         type: string
+  # 2 runs/jour (8h et 20h) : préserve quotas gratuits ET minutes GitHub
   schedule:
-    - cron: "0 */6 * * *"
+    - cron: "0 8,20 * * *"
 
 permissions:
   contents: read
@@ -32,7 +33,6 @@ jobs:
         run: |
           set -euo pipefail
           SITE_ID="${SITE_ID_INPUT:-}"
-
           if [ -n "$SITE_ID" ]; then
             echo "Test cible sur $SITE_ID"
             DETAIL=$(curl -fsS --retry 3 -H "x-relay-secret: $RELAY_SECRET" "$RELAY_URL/monitors/$SITE_ID")
@@ -65,13 +65,13 @@ jobs:
           echo "$SITES" | jq .
 
   # ============================================================
-  # 2. AGENT OPENBROWSER-AI
+  # 2. AGENT OPENBROWSER-AI (stack 100% gratuit)
   # ============================================================
   autospec-test:
     needs: fetch-sites
     if: needs.fetch-sites.outputs.sites != '[]'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 12
     concurrency:
       group: autospec-check-${{ matrix.site.id }}
       cancel-in-progress: false
@@ -90,7 +90,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Installer OpenBrowser-AI + OpenAI + ffmpeg
+      - name: Installer OpenBrowser-AI + dépendances + ffmpeg
         run: |
           set -euo pipefail
           pip install --quiet "openbrowser-ai[agent,video]"
@@ -158,16 +158,19 @@ jobs:
           SITE_ID: ${{ matrix.site.id }}
           SITE_TYPE: ${{ steps.detect.outputs.TYPE }}
           REQUIREMENTS: ${{ steps.prompt.outputs.REQUIREMENTS }}
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          PYTHONUNBUFFERED: "1"
         run: |
           set +e
-          python run_monitor.py
+          python -u run_monitor.py 2>&1 | tee execution.log
           echo ""
           echo "=== Screenshots captures ==="
-          count=$(find recordings/shots -name '*.png' 2>/dev/null | wc -l)
-          echo "Total : $count"
+          JPG_COUNT=$(find recordings/shots -name '*.jpg' 2>/dev/null | wc -l)
+          PNG_COUNT=$(find recordings/shots -name '*.png' 2>/dev/null | wc -l)
+          echo "Total : $JPG_COUNT JPG, $PNG_COUNT PNG"
 
       - name: Convertir les screenshots en timelapse MP4
         if: always()
@@ -177,28 +180,26 @@ jobs:
           JPG_COUNT=$(find recordings/shots -name "shot_*.jpg" 2>/dev/null | wc -l)
           PNG_COUNT=$(find recordings/shots -name "shot_*.png" 2>/dev/null | wc -l)
           echo "Screenshots : $JPG_COUNT JPG, $PNG_COUNT PNG"
-       
+
           if [ "$JPG_COUNT" -gt "$PNG_COUNT" ] && [ "$JPG_COUNT" -gt 0 ]; then
             EXT="jpg"
           elif [ "$PNG_COUNT" -gt 0 ]; then
             EXT="png"
           else
-            echo "Aucun screenshot"
+            echo "Aucun screenshot a convertir"
+            ls -la recordings-mp4/
             exit 0
           fi
-       
-          echo "🎬 Encodage avec shot_%04d.$EXT"
+
+          echo "🎬 Encodage avec pattern shot_%04d.$EXT"
           ffmpeg -y -framerate 2 -i "recordings/shots/shot_%04d.$EXT" \
             -c:v libx264 -pix_fmt yuv420p -movflags +faststart \
             recordings-mp4/timelapse.mp4 2>&1 | tail -10
-       
+
           if [ -f "recordings-mp4/timelapse.mp4" ] && [ -s "recordings-mp4/timelapse.mp4" ]; then
             echo "✅ Timelapse : $(ls -lh recordings-mp4/timelapse.mp4 | awk '{print $5}')"
           else
-            echo "❌ Timelapse vide"
-          fi
-          else
-            echo "Aucun screenshot a convertir"
+            echo "❌ Timelapse vide ou absent"
           fi
           ls -la recordings-mp4/
 
@@ -249,5 +250,6 @@ jobs:
             recordings/
             recordings-mp4/
             output.json
+            execution.log
           if-no-files-found: warn
-          retention-days: 7
+          retention-days: 3
