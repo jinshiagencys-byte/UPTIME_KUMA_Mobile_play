@@ -156,10 +156,14 @@ jobs:
           SITE_TYPE: ${{ steps.detect.outputs.TYPE }}
           REQUIREMENTS: ${{ steps.prompt.outputs.REQUIREMENTS }}
           PAGES_JSON: ${{ toJSON(matrix.site.pages) }}
+          PUTER_API_KEY: ${{ secrets.PUTER_API_KEY }}
+          PUTER_MODEL: "gemini-2.5-flash-lite"
+          PUTER_ATTEMPTS: "2"
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENROUTER_ATTEMPTS: "1"
           COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
           COHERE_MODEL: "command-a-03-2025"
-          COHERE_ATTEMPTS: "2"
-          OPENROUTER_ATTEMPTS: "0"
+          COHERE_ATTEMPTS: "1"
           ENABLE_FALLBACKS: "0"
           PYTHONUNBUFFERED: "1"
         run: |
