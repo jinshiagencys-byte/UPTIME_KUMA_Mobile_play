@@ -131,9 +131,11 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 COHERE_API_KEY = os.environ.get("COHERE_API_KEY", "")
+PUTER_API_KEY = os.environ.get("PUTER_API_KEY", "")  # ton auth token puter.com/dashboard
 
 ENABLE_FALLBACKS = os.environ.get("ENABLE_FALLBACKS", "0") == "1"
-OPENROUTER_ATTEMPTS = int(os.environ.get("OPENROUTER_ATTEMPTS", "2"))
+PUTER_ATTEMPTS = int(os.environ.get("PUTER_ATTEMPTS", "2"))
+OPENROUTER_ATTEMPTS = int(os.environ.get("OPENROUTER_ATTEMPTS", "1"))
 COHERE_ATTEMPTS = int(os.environ.get("COHERE_ATTEMPTS", "1"))
 DEAD_PROVIDERS = set()  # fournisseurs abandonnes pour ce run (quota / erreur fatale)
 MAX_PAGES_PER_RUN = int(os.environ.get("MAX_PAGES_PER_RUN", "2"))
@@ -152,6 +154,7 @@ RECORDINGS_DIR = os.path.abspath("./recordings")
 os.makedirs(RECORDINGS_DIR, exist_ok=True)
 
 print("Recordings dir : " + RECORDINGS_DIR)
+print("Puter key         : " + str(bool(PUTER_API_KEY)))
 print("Groq key          : " + str(bool(GROQ_API_KEY)))
 print("Google AI Std key : " + str(bool(GOOGLE_API_KEY)))
 print("OpenRouter key    : " + str(bool(OPENROUTER_API_KEY)))
@@ -183,6 +186,15 @@ def build_llm(model_config):
 # Chaine de modeles : OpenRouter (x OPENROUTER_ATTEMPTS) puis, si active, le reste
 # ---------------------------------------------------------------------------
 MODEL_CHAIN = []
+
+if PUTER_API_KEY:
+    for _ in range(max(PUTER_ATTEMPTS, 1)):
+        MODEL_CHAIN.append({
+            "provider": "puter",
+            "model": os.environ.get("PUTER_MODEL", "gemini-2.5-flash-lite"),
+            "key": PUTER_API_KEY,
+            "base_url": "https://api.puter.com/puterai/openai/v1/",
+        })
 
 if OPENROUTER_API_KEY:
     for _ in range(max(OPENROUTER_ATTEMPTS, 1)):
