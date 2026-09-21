@@ -1,40 +1,42 @@
 """
-OpenBrowser-AI — Monitoring fonctionnel (version budget zero : OpenRouter gratuit).
+OpenBrowser-AI — Monitoring fonctionnel (budget zero : OpenRouter gratuit, qwen seul).
 
-STRATEGIE : openrouter/free (x2) puis Cohere command-a-03-2025 en secours.
-Test test_providers.py du 2026-09-19 : seuls OpenRouter et Cohere ont passe les 3 tests.
-Groq (limite 8000 tokens/min : prompt de l'agent refuse en 413), Google (quota), DeepSeek /
-HF (solde 0), NVIDIA (modele retire) restent DESACTIVES (ENABLE_FALLBACKS=1 pour Groq/Google).
+STRATEGIE (2026-09-21) : UN SEUL modele, qwen/qwen3.8-27b via OpenRouter.
+Le run du 2026-09-21 (odjafrik.com) a montre que nex-n2.5-mini:free et glm-5.2 echouent des
+l'etape 2 (openbrowser joint une capture d'ecran au prompt : "No endpoints found that support
+image input" / "Provider returned error"), alors que qwen3.8-27b conclut. Cohere n'est plus dans
+la chaine (ENABLE_COHERE=1 pour le reactiver). Groq / Google / DeepSeek / HF / NVIDIA restent
+DESACTIVES (ENABLE_FALLBACKS=1 pour Groq/Google) : voir test_providers.py du 2026-09-19.
 
-NOTE (2026-09-21) : TypeSafe Jev (typesafe/jev-1.13 / jev-latest) evalue puis ECARTE comme
-modele principal — il ne s'utilise pas via /chat/completions mais via l'endpoint OpenRouter
-"Decisions", qui renvoie une probabilite par question fermee (yes/no), pas du texte libre.
-Incompatible avec CodeAgent qui a besoin de blocs Python generes librement pour naviguer
-(click/input_text/etc.). Reste une piste possible plus tard comme validateur de fin de
-chaine (juger si le rapport produit est un JSON UP/DOWN valide), pas comme moteur de nav.
+NOTE (2026-09-21) : TypeSafe Jev ECARTE comme modele principal (endpoint OpenRouter "Decisions" :
+probabilite yes/no, pas de texte libre -> incompatible avec CodeAgent). Piste possible plus tard
+comme validateur de fin de chaine. Puter retire (402 subscription_required).
 
-Changements de cette version :
-  A. Plusieurs pages par run : le workflow doit passer PAGES_JSON (liste des pages
-     du relay). SITE_URL est toujours teste ; les autres pages tournent par
-     rotation (MAX_PAGES_PER_RUN). Les pages non testees sont rapportees en
-     UNKNOWN pour ne pas etre supprimees par pages-report.
-  B. Prompt plus strict : format ```python obligatoire (openrouter/free repond
-     parfois en <tool_call>...), une action par etape, jamais de done() avant
-     d'avoir vu le resultat, budget d'etapes explicite.
-  C. MAX_STEPS 8 -> 12 (les reponses hors format consomment des etapes).
-  D. Plusieurs essais du meme modele (OPENROUTER_ATTEMPTS) : openrouter/free
-     change de modele sous le capot, un 2e essai peut reussir.
-  E. Constat partiel conserve : si l'agent a interagi mais n'a pas appele done(),
-     on garde un rapport ERROR factuel (pas de verdict UP/DOWN invente) au lieu
-     de "Tous les modeles ont echoue".
-  F. Detection quota/erreur fatale : plus de correspondance sur "429"/"402" nus.
+Changements de cette version (par rapport a la version "budget zero" precedente) :
+  1. Qwen seul : OPENROUTER_FREE_MODELS = "qwen/qwen3.8-27b", Cohere derriere ENABLE_COHERE.
+  2. Anti-blocage : max 2 tentatives par interaction, une anomalie ne termine pas le test, toutes
+     les exigences doivent etre verifiees avant done(), pas d'URL inventee, verification du
+     CONTENU affiche et pas seulement de l'URL (constat du run : 8 etapes sur 8 gaspillees a
+     reessayer la meme recherche, auth jamais testee).
+  3. Coherence du verdict : UP + au moins une assertion_passed=False  ->  DOWN (normalize_report).
+  4. Latence : effort de raisonnement OpenRouter "low" injecte via extra_body (REASONING_EFFORT,
+     "off" pour desactiver) avec repli automatique si le preflight le refuse ; USE_VISION=0
+     possible pour ne plus envoyer de captures au LLM.
+  5. Budgets : MAX_STEPS 14, timeout LLM 120 s, essai 420 s, budget total 900 s ; l'essai est
+     borne par le temps restant (plus de depassement du budget) ; un timeout garde le constat
+     partiel (cellules deja executees) au lieu de le perdre.
+  6. Viewport 1280x720 reellement applique (viewport_width/height n'existent pas dans
+     BrowserProfile et etaient ignores -> 1920x1080).
+  7. Exemple du prompt : plus de "True_ou_False" (un petit modele pouvait le recopier -> NameError).
+  8. is_quota_error reconnait "insufficient credits" (message OpenRouter).
 
-Acquis conserves : browser=BrowserSession(...) + await start() manuel, consignes
-fusionnees dans task, ChatOpenAI pour tous les providers, timeout par appel LLM,
-verdict uniquement depuis done(), monkeypatch video (gel des frames).
+Acquis conserves : plusieurs pages par run (PAGES_JSON, rotation), browser=BrowserSession(...) +
+await start() manuel, consignes fusionnees dans task, ChatOpenAI pour tous les providers,
+verdict uniquement depuis done(), constat partiel ERROR, monkeypatch video (gel des frames).
 """
 import asyncio
 import glob
+import inspect
 import json
 import logging
 import os
@@ -138,32 +140,39 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 COHERE_API_KEY = os.environ.get("COHERE_API_KEY", "")
-# PUTER retire (2026-09-21) : confirme mort, preflight echoue en 402
-# subscription_required sur gemini-2.5-flash-lite -> le tier gratuit de
-# Puter ne couvre pas l'acces API cle-en-main, seulement le SDK navigateur.
 
-# Modeles OpenRouter GRATUITS nommes explicitement (au lieu de l'alias
-# "openrouter/free" qui route vers un modele cache/changeant -> source
-# d'une partie des reponses hors format). Ordre choisi pour un agent de
-# navigation/QA : le plus adapte a la tache en premier.
-OPENROUTER_FREE_MODELS = os.environ.get(
-    "OPENROUTER_FREE_MODELS",
-    "nex-agi/nex-n2.5-mini:free,z-ai/glm-5.2,qwen/qwen3.8-27b,"
-    "poolside/laguna-xs-2.1,nvidia/nemotron-3-super"
-)
+# Modele OpenRouter (qwen seul). Liste separee par des virgules, surchargeable.
+OPENROUTER_FREE_MODELS = os.environ.get("OPENROUTER_FREE_MODELS", "qwen/qwen3.8-27b")
 
 ENABLE_FALLBACKS = os.environ.get("ENABLE_FALLBACKS", "0") == "1"
+ENABLE_COHERE = os.environ.get("ENABLE_COHERE", "0") == "1"
 OPENROUTER_ATTEMPTS = int(os.environ.get("OPENROUTER_ATTEMPTS", "1"))
 COHERE_ATTEMPTS = int(os.environ.get("COHERE_ATTEMPTS", "1"))
 DEAD_PROVIDERS = set()  # (provider, modele) abandonnes pour ce run (quota / erreur fatale)
 MAX_PAGES_PER_RUN = int(os.environ.get("MAX_PAGES_PER_RUN", "2"))
 
-LLM_CALL_TIMEOUT = float(os.environ.get("LLM_CALL_TIMEOUT_SECONDS", "100"))
-GLOBAL_TIMEOUT_SECONDS = float(os.environ.get("GLOBAL_TIMEOUT_SECONDS", "360"))
-TOTAL_BUDGET_SECONDS = float(os.environ.get("TOTAL_BUDGET_SECONDS", "720"))
-MIN_ATTEMPT_SECONDS = 120  # ne pas demarrer un essai s'il reste moins que ca
+# Latence : effort de raisonnement OpenRouter (minimal|low|medium|high ; off/none/vide = desactive)
+_VALID_EFFORTS = ("minimal", "low", "medium", "high")
+REASONING_EFFORT = os.environ.get("REASONING_EFFORT", "low").strip().lower()
+if REASONING_EFFORT in ("", "off", "none", "0"):
+    REASONING_EFFORT = ""
+elif REASONING_EFFORT not in _VALID_EFFORTS:
+    print("REASONING_EFFORT invalide (%r) : desactive" % REASONING_EFFORT)
+    REASONING_EFFORT = ""
 
-MAX_STEPS = int(os.environ.get("MAX_STEPS", "12"))
+# USE_VISION=0 : ne plus joindre de capture d'ecran aux appels LLM (DOM texte seul)
+USE_VISION = os.environ.get("USE_VISION", "1") != "0"
+
+VIEWPORT_WIDTH = int(os.environ.get("VIEWPORT_WIDTH", "1280"))
+VIEWPORT_HEIGHT = int(os.environ.get("VIEWPORT_HEIGHT", "720"))
+
+LLM_CALL_TIMEOUT = float(os.environ.get("LLM_CALL_TIMEOUT_SECONDS", "120"))
+GLOBAL_TIMEOUT_SECONDS = float(os.environ.get("GLOBAL_TIMEOUT_SECONDS", "420"))
+TOTAL_BUDGET_SECONDS = float(os.environ.get("TOTAL_BUDGET_SECONDS", "900"))
+MIN_ATTEMPT_SECONDS = 120  # ne pas demarrer un essai s'il reste moins que ca
+DEADLINE_MARGIN_SECONDS = 20  # marge pour fermer le navigateur / flusher la video
+
+MAX_STEPS = int(os.environ.get("MAX_STEPS", "14"))
 TEST_STEPS = max(MAX_STEPS - 4, 4)   # etapes de test
 DONE_STEP = TEST_STEPS + 1           # a partir d'ici : done() obligatoire
 DELAY_BETWEEN_ATTEMPTS = 3
@@ -171,24 +180,72 @@ DELAY_BETWEEN_ATTEMPTS = 3
 RECORDINGS_DIR = os.path.abspath("./recordings")
 os.makedirs(RECORDINGS_DIR, exist_ok=True)
 
+# CodeAgent accepte **kwargs et IGNORE silencieusement les parametres inconnus
+# (c'est deja arrive avec browser_profile) : on ne passe use_vision que s'il existe.
+try:
+    _CODEAGENT_PARAMS = set(inspect.signature(CodeAgent.__init__).parameters)
+except (TypeError, ValueError):
+    _CODEAGENT_PARAMS = set()
+
 print("Recordings dir : " + RECORDINGS_DIR)
 print("Groq key          : " + str(bool(GROQ_API_KEY)))
 print("Google AI Std key : " + str(bool(GOOGLE_API_KEY)))
 print("OpenRouter key    : " + str(bool(OPENROUTER_API_KEY)))
-print("Cohere key        : " + str(bool(COHERE_API_KEY)))
+print("Cohere key        : " + str(bool(COHERE_API_KEY)) + (" (actif)" if ENABLE_COHERE else " (inactif)"))
 print("Fallbacks payants/quota : " + ("ON" if ENABLE_FALLBACKS else "OFF"))
 print("Video freeze cap  : %.1fs" % FREEZE_CAP_SECONDS)
+print("Viewport          : %dx%d" % (VIEWPORT_WIDTH, VIEWPORT_HEIGHT))
+print("Reasoning effort  : " + (REASONING_EFFORT or "off"))
+print("Vision (captures) : " + ("ON" if USE_VISION else "OFF")
+      + ("" if "use_vision" in _CODEAGENT_PARAMS else " [ATTENTION : CodeAgent sans parametre use_vision, ignore]"))
 print("Max steps / essai : %d | pages max / run : %d" % (MAX_STEPS, MAX_PAGES_PER_RUN))
+print("Timeouts : LLM %.0fs | essai %.0fs | budget total %.0fs" % (
+    LLM_CALL_TIMEOUT, GLOBAL_TIMEOUT_SECONDS, TOTAL_BUDGET_SECONDS))
 
 
 # ---------------------------------------------------------------------------
 # LLM — ChatOpenAI pour TOUS les providers
 # ---------------------------------------------------------------------------
+class ReasoningChatOpenAI(ChatOpenAI):
+    """ChatOpenAI + parametre OpenRouter `reasoning` (extra_body).
+    ChatOpenAI n'a pas de extra_body : on enveloppe chat.completions.create du client
+    (get_client() en construit un nouveau a chaque appel). Effort porte par
+    self._or_reasoning (None = ne rien envoyer)."""
+
+    def get_client(self):
+        client = super().get_client()
+        effort = getattr(self, "_or_reasoning", None)
+        if effort:
+            completions = client.chat.completions
+            orig_create = completions.create
+
+            async def create_with_reasoning(*args, **kwargs):
+                extra = dict(kwargs.get("extra_body") or {})
+                extra.setdefault("reasoning", {"effort": effort})
+                kwargs["extra_body"] = extra
+                return await orig_create(*args, **kwargs)
+
+            completions.create = create_with_reasoning
+        return client
+
+
+_reasoning_disabled = set()  # (provider, modele) dont le preflight a refuse `reasoning`
+
+
+def reasoning_for(model_config):
+    """Effort de raisonnement a envoyer pour ce modele, ou None."""
+    if model_config["provider"] != "openrouter" or not REASONING_EFFORT:
+        return None
+    if (model_config["provider"], model_config["model"]) in _reasoning_disabled:
+        return None
+    return REASONING_EFFORT
+
+
 def build_llm(model_config):
     llm_kwargs = {}
     if model_config["provider"] != "openrouter":
         llm_kwargs = {"frequency_penalty": None, "max_completion_tokens": None}
-    return ChatOpenAI(
+    llm = ReasoningChatOpenAI(
         model=model_config["model"],
         base_url=model_config["base_url"],
         api_key=model_config["key"],
@@ -197,10 +254,12 @@ def build_llm(model_config):
         max_retries=0,
         **llm_kwargs,
     )
+    llm._or_reasoning = reasoning_for(model_config)
+    return llm
 
 
 # ---------------------------------------------------------------------------
-# Chaine de modeles : OpenRouter (x OPENROUTER_ATTEMPTS) puis, si active, le reste
+# Chaine de modeles : OpenRouter (qwen) puis, si actives explicitement, le reste
 # ---------------------------------------------------------------------------
 MODEL_CHAIN = []
 
@@ -215,7 +274,7 @@ if OPENROUTER_API_KEY:
                 "base_url": "https://openrouter.ai/api/v1",
             })
 
-if COHERE_API_KEY:
+if COHERE_API_KEY and ENABLE_COHERE:
     for _ in range(max(COHERE_ATTEMPTS, 1)):
         MODEL_CHAIN.append({
             "provider": "cohere",
@@ -276,11 +335,24 @@ BUDGET : __MAX_STEPS__ etapes au total.
 - A partir de l'etape __DONE_STEP__ : appelle done() avec ce que tu as observe, meme incomplet.
 - Un rapport incomplet mais honnete vaut mieux que pas de rapport.
 
+REGLES ANTI-BLOCAGE (CRITIQUES, elles decident de ce que tu as le temps de tester) :
+- Verifie les INTERACTIONS REQUISES l'une apres l'autre, dans l'ordre. Toutes doivent etre
+  tentees avant done().
+- MAXIMUM 2 TENTATIVES par interaction (ex : bouton Rechercher, puis touche Entree). Si elle
+  echoue toujours, c'est une ANOMALIE : garde-la pour le rapport (assertion_passed=False) et
+  PASSE IMMEDIATEMENT a l'interaction requise suivante. Ne reessaie pas une 3e fois.
+- Une anomalie ne met PAS fin au test : les interactions suivantes doivent quand meme etre testees.
+- N'invente JAMAIS d'URL ni de route (par exemple /recherche?q=...) : utilise uniquement les
+  liens et boutons visibles dans l'etat de la page.
+- Verifie le CONTENU affiche (resultats, message, nombre d'elements), pas seulement l'URL :
+  une application web peut mettre a jour la page sans changer l'URL.
+
 REGLES DE TEST :
 1. Effectue au moins UNE vraie interaction utilisateur (click / input_text / scroll) et verifie le resultat.
 2. Page chargee N'EST PAS un test. Bouton existe N'EST PAS un test.
 3. Test valide = action + observation + assertion.
 4. Ne declare UP que si tu as vu de tes yeux le resultat attendu apres ton interaction.
+5. overall_status = DOWN si au moins une assertion a echoue (assertion_passed=False).
 
 ANOMALIES (echecs fonctionnels) :
 - Texte contenant Erreur, Error, Failed, undefined, null, 0 produit, Aucun produit.
@@ -294,8 +366,10 @@ __REQUIREMENTS__
 SORTIE FINALE :
 Appelle done(text=...) avec UNIQUEMENT un JSON valide dans text :
   overall_status (UP ou DOWN), site_type, actions_completed, model_used, pages[].
+Une entree de pages[] par page ou vue testee ; assertion_passed vaut False si une assertion a echoue.
 
-Exemple de forme (remplace par le resultat REEL observe) :
+Exemple de forme (remplace par le resultat REEL observe ; mets assertion_passed a False
+si une assertion a echoue, et alors overall_status DOWN) :
 ```python
 import json
 result = {"overall_status": "DOWN ou UP selon ce que tu as observe",
@@ -303,7 +377,7 @@ result = {"overall_status": "DOWN ou UP selon ce que tu as observe",
 "model_used": "__MODEL_NAME__",
 "pages": [{"url": "__TARGET_URL__", "status": "DOWN ou UP",
 "http_code": 200, "action_tested": "description de l'action",
-"assertion_passed": True_ou_False, "note": "ce que tu as observe"}]}
+"assertion_passed": True, "note": "ce que tu as observe"}]}
 await done(text=json.dumps(result, ensure_ascii=False), success=True)
 ```
 """
@@ -430,13 +504,37 @@ def count_real_interactions(cells):
     return n
 
 
+def _as_bool(value):
+    """True seulement pour un vrai True (ou "true"/"1"/"oui"/"yes"). None / autre -> False."""
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "oui", "yes")
+    return value is True
+
+
+def _is_false(value):
+    """True si l'assertion est EXPLICITEMENT False (ou "false"/"0"/"non"/"no")."""
+    if isinstance(value, str):
+        return value.strip().lower() in ("false", "0", "non", "no")
+    return value is False
+
+
 def normalize_report(report, model_name, target_url):
     status = str(report["overall_status"]).upper()
+    pages = [p for p in (report.get("pages") or []) if isinstance(p, dict)]
+
+    # Coherence : un rapport ne peut pas etre UP si l'agent lui-meme a note une assertion echouee.
+    failed = [p for p in pages if _is_false(p.get("assertion_passed"))]
+    if status == "UP" and failed:
+        status = "DOWN"
+        first = failed[0]
+        first["note"] = (str(first.get("note") or "").strip()
+                         + " | Verdict corrige UP -> DOWN : assertion echouee.").strip(" |")
+
     report["overall_status"] = status
     report["model_used"] = model_name
     report.setdefault("site_type", SITE_TYPE)
     report.setdefault("actions_completed", True)
-    if not isinstance(report.get("pages"), list) or not report["pages"]:
+    if not pages:
         report["pages"] = [{
             "url": target_url,
             "status": status,
@@ -469,7 +567,7 @@ def collapse_to_page(report, target_url):
     notes = [str(p["note"]) for p in pages if p.get("note")]
     codes = [p["http_code"] for p in pages if p.get("http_code")]
     if pages:
-        passed = all(bool(p.get("assertion_passed")) for p in pages)
+        passed = all(_as_bool(p.get("assertion_passed")) for p in pages)
     else:
         passed = status == "UP"
     return {
@@ -576,39 +674,58 @@ def is_quota_error(text):
         "free_tier_requests",
         "insufficient balance",
         "insufficient_balance",
+        "insufficient credits",
         "balance is not enough",
     ])
 
 
 # ---------------------------------------------------------------------------
-# Preflight (1 token), mis en cache par modele
+# Preflight (1 token), mis en cache par modele.
+# Pour OpenRouter avec REASONING_EFFORT : on teste AVEC le parametre `reasoning` ; s'il est
+# refuse mais que le modele repond sans, on desactive `reasoning` pour ce modele (repli).
 # ---------------------------------------------------------------------------
 _preflight_cache = {}
+
+
+async def _ping(model_config, effort=None):
+    client = AsyncOpenAI(
+        api_key=model_config["key"],
+        base_url=model_config["base_url"],
+    )
+    kwargs = {
+        "model": model_config["model"],
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 5,
+    }
+    if effort:
+        kwargs["extra_body"] = {"reasoning": {"effort": effort}}
+    await asyncio.wait_for(client.chat.completions.create(**kwargs), timeout=20)
 
 
 async def preflight_api_check(model_config):
     key = (model_config["provider"], model_config["model"])
     if key in _preflight_cache:
         return _preflight_cache[key]
+    effort = reasoning_for(model_config)
+    ok = False
     try:
-        client = AsyncOpenAI(
-            api_key=model_config["key"],
-            base_url=model_config["base_url"],
-        )
-        await asyncio.wait_for(
-            client.chat.completions.create(
-                model=model_config["model"],
-                messages=[{"role": "user", "content": "ping"}],
-                max_tokens=5,
-            ),
-            timeout=20,
-        )
-        print("Preflight OK : %s" % model_config["model"])
+        await _ping(model_config, effort)
+        print("Preflight OK : %s%s" % (
+            model_config["model"], " (reasoning=%s)" % effort if effort else ""))
         ok = True
     except Exception as e:
-        msg = str(e)
-        print("Preflight ECHEC : %s -> %s" % (model_config["model"], msg[:200]))
-        ok = False
+        print("Preflight ECHEC : %s%s -> %s" % (
+            model_config["model"], " (reasoning=%s)" % effort if effort else "",
+            str(e)[:200]))
+        if effort:
+            try:
+                await _ping(model_config, None)
+                _reasoning_disabled.add(key)
+                print("Preflight OK sans `reasoning` : %s -> parametre desactive pour ce modele"
+                      % model_config["model"])
+                ok = True
+            except Exception as e2:
+                print("Preflight ECHEC aussi sans `reasoning` : %s" % str(e2)[:200])
     _preflight_cache[key] = ok
     return ok
 
@@ -619,7 +736,7 @@ async def preflight_api_check(model_config):
 #   partial : (page_dict, score) constat partiel ou (None, 0)
 #   stop    : True si quota/erreur fatale -> inutile de continuer
 # ---------------------------------------------------------------------------
-async def run_attempt(model_config, target_url, requirements):
+async def run_attempt(model_config, target_url, requirements, deadline):
     provider = model_config["provider"]
     model_name = model_config["model"]
 
@@ -637,27 +754,42 @@ async def run_attempt(model_config, target_url, requirements):
         llm = build_llm(model_config)
         profile = BrowserProfile(
             headless=True,
-            viewport_width=1280,
-            viewport_height=720,
+            viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
             record_video_dir=RECORDINGS_DIR,
         )
         browser_session = BrowserSession(browser_profile=profile)
         await browser_session.start()  # CodeAgent ne le fait pas pour une session fournie
 
         full_task = build_full_task(model_name, target_url, requirements)
+        agent_kwargs = {}
+        if "use_vision" in _CODEAGENT_PARAMS:
+            agent_kwargs["use_vision"] = USE_VISION
         agent = CodeAgent(
             task=full_task,
             llm=llm,
             browser=browser_session,
             max_steps=MAX_STEPS,
+            **agent_kwargs,
         )
 
+        # Essai borne par le temps restant du budget total (pas seulement GLOBAL_TIMEOUT)
+        attempt_timeout = min(
+            GLOBAL_TIMEOUT_SECONDS,
+            deadline - time.monotonic() - DEADLINE_MARGIN_SECONDS,
+        )
+        if attempt_timeout < 60:
+            print("Temps restant insuffisant (%.0fs) : essai abandonne" % attempt_timeout)
+            return outcome
+
         try:
-            result = await asyncio.wait_for(
-                agent.run(), timeout=GLOBAL_TIMEOUT_SECONDS)
+            result = await asyncio.wait_for(agent.run(), timeout=attempt_timeout)
             print("agent.run() termine en %.1fs" % (time.time() - start_time))
         except asyncio.TimeoutError:
-            print("Timeout global pour " + model_name)
+            print("Timeout (%.0fs) pour %s" % (attempt_timeout, model_name))
+            # On garde ce qui a deja ete execute (constat partiel factuel)
+            cells = list(getattr(getattr(agent, "session", None), "cells", None) or [])
+            outcome["partial"] = build_partial_report(cells, model_name, target_url)
+            print("Cellules executees avant timeout : %d" % len(cells))
             return outcome
 
         cells = list(getattr(result, "cells", None) or [])
@@ -715,7 +847,7 @@ async def test_page(target_url, requirements, deadline):
         if not await preflight_api_check(model_config):
             continue
 
-        outcome = await run_attempt(model_config, target_url, requirements)
+        outcome = await run_attempt(model_config, target_url, requirements, deadline)
         if outcome["report"] is not None:
             return outcome["report"], best_partial, False
         if outcome["partial"][1] > best_partial[1]:
