@@ -6,6 +6,13 @@ Test test_providers.py du 2026-09-19 : seuls OpenRouter et Cohere ont passe les 
 Groq (limite 8000 tokens/min : prompt de l'agent refuse en 413), Google (quota), DeepSeek /
 HF (solde 0), NVIDIA (modele retire) restent DESACTIVES (ENABLE_FALLBACKS=1 pour Groq/Google).
 
+NOTE (2026-09-21) : TypeSafe Jev (typesafe/jev-1.13 / jev-latest) evalue puis ECARTE comme
+modele principal — il ne s'utilise pas via /chat/completions mais via l'endpoint OpenRouter
+"Decisions", qui renvoie une probabilite par question fermee (yes/no), pas du texte libre.
+Incompatible avec CodeAgent qui a besoin de blocs Python generes librement pour naviguer
+(click/input_text/etc.). Reste une piste possible plus tard comme validateur de fin de
+chaine (juger si le rapport produit est un JSON UP/DOWN valide), pas comme moteur de nav.
+
 Changements de cette version :
   A. Plusieurs pages par run : le workflow doit passer PAGES_JSON (liste des pages
      du relay). SITE_URL est toujours teste ; les autres pages tournent par
@@ -131,13 +138,24 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 COHERE_API_KEY = os.environ.get("COHERE_API_KEY", "")
-PUTER_API_KEY = os.environ.get("PUTER_API_KEY", "")  # ton auth token puter.com/dashboard
+# PUTER retire (2026-09-21) : confirme mort, preflight echoue en 402
+# subscription_required sur gemini-2.5-flash-lite -> le tier gratuit de
+# Puter ne couvre pas l'acces API cle-en-main, seulement le SDK navigateur.
+
+# Modeles OpenRouter GRATUITS nommes explicitement (au lieu de l'alias
+# "openrouter/free" qui route vers un modele cache/changeant -> source
+# d'une partie des reponses hors format). Ordre choisi pour un agent de
+# navigation/QA : le plus adapte a la tache en premier.
+OPENROUTER_FREE_MODELS = os.environ.get(
+    "OPENROUTER_FREE_MODELS",
+    "nex-agi/nex-n2.5-mini,z-ai/glm-5.2,qwen/qwen3.8-27b,"
+    "poolside/laguna-xs-2.1,nvidia/nemotron-3-super"
+)
 
 ENABLE_FALLBACKS = os.environ.get("ENABLE_FALLBACKS", "0") == "1"
-PUTER_ATTEMPTS = int(os.environ.get("PUTER_ATTEMPTS", "2"))
 OPENROUTER_ATTEMPTS = int(os.environ.get("OPENROUTER_ATTEMPTS", "1"))
 COHERE_ATTEMPTS = int(os.environ.get("COHERE_ATTEMPTS", "1"))
-DEAD_PROVIDERS = set()  # fournisseurs abandonnes pour ce run (quota / erreur fatale)
+DEAD_PROVIDERS = set()  # (provider, modele) abandonnes pour ce run (quota / erreur fatale)
 MAX_PAGES_PER_RUN = int(os.environ.get("MAX_PAGES_PER_RUN", "2"))
 
 LLM_CALL_TIMEOUT = float(os.environ.get("LLM_CALL_TIMEOUT_SECONDS", "100"))
@@ -187,23 +205,16 @@ def build_llm(model_config):
 # ---------------------------------------------------------------------------
 MODEL_CHAIN = []
 
-if PUTER_API_KEY:
-    for _ in range(max(PUTER_ATTEMPTS, 1)):
-        MODEL_CHAIN.append({
-            "provider": "puter",
-            "model": os.environ.get("PUTER_MODEL", "gemini-2.5-flash-lite"),
-            "key": PUTER_API_KEY,
-            "base_url": "https://api.puter.com/puterai/openai/v1/",
-        })
-
 if OPENROUTER_API_KEY:
-    for _ in range(max(OPENROUTER_ATTEMPTS, 1)):
-        MODEL_CHAIN.append({
-            "provider": "openrouter",
-            "model": os.environ.get("OPENROUTER_MODEL", "openrouter/free"),
-            "key": OPENROUTER_API_KEY,
-            "base_url": "https://openrouter.ai/api/v1",
-        })
+    free_models = [m.strip() for m in OPENROUTER_FREE_MODELS.split(",") if m.strip()]
+    for model_name in free_models:
+        for _ in range(max(OPENROUTER_ATTEMPTS, 1)):
+            MODEL_CHAIN.append({
+                "provider": "openrouter",
+                "model": model_name,
+                "key": OPENROUTER_API_KEY,
+                "base_url": "https://openrouter.ai/api/v1",
+            })
 
 if COHERE_API_KEY:
     for _ in range(max(COHERE_ATTEMPTS, 1)):
@@ -689,7 +700,8 @@ async def run_attempt(model_config, target_url, requirements):
 async def test_page(target_url, requirements, deadline):
     best_partial = (None, 0)
     for idx, model_config in enumerate(MODEL_CHAIN):
-        if model_config["provider"] in DEAD_PROVIDERS:
+        dead_key = (model_config["provider"], model_config["model"])
+        if dead_key in DEAD_PROVIDERS:
             continue
         if time.monotonic() > deadline - MIN_ATTEMPT_SECONDS:
             print("Budget de temps epuise : plus d'essai pour %s" % target_url)
