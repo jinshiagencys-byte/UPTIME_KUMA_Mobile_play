@@ -172,7 +172,6 @@ RECORDINGS_DIR = os.path.abspath("./recordings")
 os.makedirs(RECORDINGS_DIR, exist_ok=True)
 
 print("Recordings dir : " + RECORDINGS_DIR)
-print("Puter key         : " + str(bool(PUTER_API_KEY)))
 print("Groq key          : " + str(bool(GROQ_API_KEY)))
 print("Google AI Std key : " + str(bool(GOOGLE_API_KEY)))
 print("OpenRouter key    : " + str(bool(OPENROUTER_API_KEY)))
@@ -722,13 +721,13 @@ async def test_page(target_url, requirements, deadline):
         if outcome["partial"][1] > best_partial[1]:
             best_partial = outcome["partial"]
         if outcome["stop"]:
-            DEAD_PROVIDERS.add(model_config["provider"])
-            print("Fournisseur abandonne pour ce run : " + model_config["provider"])
+            DEAD_PROVIDERS.add(dead_key)
+            print("Modele abandonne pour ce run : [%s] %s" % dead_key)
             continue
         if idx < len(MODEL_CHAIN) - 1:
             print("Attente %ds..." % DELAY_BETWEEN_ATTEMPTS)
             await asyncio.sleep(DELAY_BETWEEN_ATTEMPTS)
-    all_dead = all(mc["provider"] in DEAD_PROVIDERS for mc in MODEL_CHAIN)
+    all_dead = all((mc["provider"], mc["model"]) in DEAD_PROVIDERS for mc in MODEL_CHAIN)
     return None, best_partial, all_dead
 
 
