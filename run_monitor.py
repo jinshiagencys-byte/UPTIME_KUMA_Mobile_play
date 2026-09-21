@@ -148,7 +148,7 @@ COHERE_API_KEY = os.environ.get("COHERE_API_KEY", "")
 # navigation/QA : le plus adapte a la tache en premier.
 OPENROUTER_FREE_MODELS = os.environ.get(
     "OPENROUTER_FREE_MODELS",
-    "nex-agi/nex-n2.5-mini,z-ai/glm-5.2,qwen/qwen3.8-27b,"
+    "nex-agi/nex-n2.5-mini:free,z-ai/glm-5.2,qwen/qwen3.8-27b,"
     "poolside/laguna-xs-2.1,nvidia/nemotron-3-super"
 )
 
