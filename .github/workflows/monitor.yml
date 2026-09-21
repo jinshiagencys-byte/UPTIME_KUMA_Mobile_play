@@ -170,32 +170,6 @@ jobs:
           set +e
           python -u run_monitor.py 2>&1 | tee execution.log
 
-      - name: Convertir vidéo native webm → mp4
-        if: always()
-        run: |
-          set +e
-          mkdir -p recordings-mp4
-          WEBM=$(ls -t recordings/*.webm 2>/dev/null | head -1)
-          MP4=$(ls -t recordings/*.mp4 2>/dev/null | head -1)
-          if [ -n "$WEBM" ]; then
-            echo " Conversion webm → mp4 : $WEBM"
-            ffmpeg -y -i "$WEBM" -c:v libx264 -pix_fmt yuv420p -movflags +faststart \
-              recordings-mp4/timelapse.mp4 2>&1 | tail -5
-          elif [ -n "$MP4" ]; then
-            echo "🎬 MP4 natif trouvé, copie : $MP4"
-            cp "$MP4" recordings-mp4/timelapse.mp4
-          else
-            echo "Aucune vidéo native trouvée"
-            ls -la recordings/
-            exit 0
-          fi
-          if [ -f "recordings-mp4/timelapse.mp4" ] && [ -s "recordings-mp4/timelapse.mp4" ]; then
-            echo "✅ Timelapse final : $(ls -lh recordings-mp4/timelapse.mp4 | awk '{print $5}')"
-          else
-            echo "❌ Conversion échouée"
-          fi
-          ls -la recordings/ recordings-mp4/
-
       - name: Afficher le résultat
         if: always()
         run: |
@@ -241,7 +215,6 @@ jobs:
           name: openbrowser-monitoring-${{ matrix.site.id }}
           path: |
             recordings/
-            recordings-mp4/
             output.json
             execution.log
           if-no-files-found: warn
