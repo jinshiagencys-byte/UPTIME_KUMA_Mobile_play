@@ -288,6 +288,25 @@ REGLES ANTI-BLOCAGE (CRITIQUES, elles decident de ce que tu as le temps de teste
   liens et boutons visibles dans l'etat de la page.
 - Verifie le CONTENU affiche (resultats, message, nombre d'elements), pas seulement l'URL :
   une application web peut mettre a jour la page sans changer l'URL.
+- Si un element met du temps a se charger (produits, images, listes), ATTENDS (sleep 2-3s puis
+  relis le contenu) avant de conclure qu'il est absent ou casse. Ne rapporte "vide"/"absent" que
+  si c'est toujours vide apres une seconde verification.
+
+OBSERVATION EXHAUSTIVE (CRITIQUE, aussi importante que les tests eux-memes) :
+- Rapporte TOUT ce que tu remarques d'anormal ou d'inattendu en cours de route, meme si ce n'est
+  pas dans la liste des INTERACTIONS REQUISES et meme si cela ne fait pas echouer ton assertion
+  principale. Exemples : un element dupplique qui ne fait rien (ex. une deuxieme barre de
+  recherche qui ne renvoie aucun resultat alors que la premiere fonctionne), un bouton visible
+  mais non cliquable, un texte ou une image qui ne correspond pas au contexte, un champ qui
+  accepte une saisie invalide sans erreur.
+- Une observation notable ne doit JAMAIS etre passee sous silence simplement parce qu'elle n'a
+  pas fait partie du test que tu executais a ce moment-la. Ajoute-la au champ "note" de la page
+  concernee dans le rapport final, meme si assertion_passed reste True pour cette page.
+- Ne te contente pas d'un seul type de test (ex. recherche + panier) si le temps restant le
+  permet : essaie aussi, quand c'est visible sur la page, une tentative de connexion/inscription
+  (avec des identifiants factices) et navigue vers au moins une autre page ou section du site
+  (menu, footer, categorie) avant d'appeler done(). Un rapport qui ne couvre qu'un seul flux
+  alors que d'autres etaient accessibles est un rapport incomplet.
 
 REGLES DE TEST :
 1. Effectue au moins UNE vraie interaction utilisateur (click / input_text / scroll) et verifie le resultat.
