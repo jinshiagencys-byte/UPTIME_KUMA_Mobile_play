@@ -112,10 +112,11 @@ SITE_TYPE = os.environ.get("SITE_TYPE", "generic")
 REQUIREMENTS = os.environ.get("REQUIREMENTS", "")
 PAGES_JSON = os.environ.get("PAGES_JSON", "")
 
-# UnoRouter (seul provider desormais)
-UNOROUTER_API_KEY = os.environ.get("UNOROUTER_API_KEY", "")
-UNOROUTER_MODEL = os.environ.get("UNOROUTER_MODEL", "glm-5.3-flash:free")
-UNOROUTER_BASE_URL = os.environ.get("UNOROUTER_BASE_URL", "https://api.unorouter.com/v1")
+# GitHub Models (seul provider desormais) : utilise le GITHUB_TOKEN natif du workflow,
+# aucun secret externe a gerer. Endpoint compatible OpenAI.
+GITHUB_MODELS_TOKEN = os.environ.get("GITHUB_MODELS_TOKEN", "") or os.environ.get("GITHUB_TOKEN", "")
+GITHUB_MODELS_MODEL = os.environ.get("GITHUB_MODELS_MODEL", "openai/gpt-4o-mini")
+GITHUB_MODELS_BASE_URL = os.environ.get("GITHUB_MODELS_BASE_URL", "https://models.github.ai/inference")
 
 DEAD_PROVIDERS = set()  # (provider, modele) abandonnes pour ce run (quota / erreur fatale)
 MAX_PAGES_PER_RUN = int(os.environ.get("MAX_PAGES_PER_RUN", "2"))
@@ -157,8 +158,8 @@ except (TypeError, ValueError):
     _CODEAGENT_PARAMS = set()
 
 print("Recordings dir : " + RECORDINGS_DIR)
-print("UnoRouter key     : " + str(bool(UNOROUTER_API_KEY)))
-print("UnoRouter modele  : " + UNOROUTER_MODEL)
+print("GitHub Models token : " + str(bool(GITHUB_MODELS_TOKEN)))
+print("GitHub Models modele: " + GITHUB_MODELS_MODEL)
 print("Video freeze cap  : %.1fs" % FREEZE_CAP_SECONDS)
 print("Viewport          : %dx%d" % (VIEWPORT_WIDTH, VIEWPORT_HEIGHT))
 print("Reasoning effort  : " + (REASONING_EFFORT or "off"))
@@ -210,7 +211,7 @@ def reasoning_for(model_config):
 
 def build_llm(model_config):
     llm_kwargs = {}
-    if model_config["provider"] not in ("openrouter", "unorouter"):
+    if model_config["provider"] not in ("openrouter", "unorouter", "github"):
         llm_kwargs = {"frequency_penalty": None, "max_completion_tokens": None}
     llm = ReasoningChatOpenAI(
         model=model_config["model"],
@@ -226,16 +227,16 @@ def build_llm(model_config):
 
 
 # ---------------------------------------------------------------------------
-# Chaine de modeles : UnoRouter uniquement, aucun fallback
+# Chaine de modeles : GitHub Models uniquement, aucun fallback
 # ---------------------------------------------------------------------------
 MODEL_CHAIN = []
 
-if UNOROUTER_API_KEY:
+if GITHUB_MODELS_TOKEN:
     MODEL_CHAIN.append({
-        "provider": "unorouter",
-        "model": UNOROUTER_MODEL,
-        "key": UNOROUTER_API_KEY,
-        "base_url": UNOROUTER_BASE_URL,
+        "provider": "github",
+        "model": GITHUB_MODELS_MODEL,
+        "key": GITHUB_MODELS_TOKEN,
+        "base_url": GITHUB_MODELS_BASE_URL,
     })
 
 if not MODEL_CHAIN:
