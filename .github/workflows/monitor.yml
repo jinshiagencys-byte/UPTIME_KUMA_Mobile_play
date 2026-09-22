@@ -158,7 +158,8 @@ jobs:
           REQUIREMENTS: ${{ steps.prompt.outputs.REQUIREMENTS }}
           PAGES_JSON: ${{ toJSON(matrix.site.pages) }}
           GITHUB_MODELS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_MODELS_MODEL: "openai/gpt-4o-mini"
+          GITHUB_MODELS_MODEL: "openai/gpt-4.1-mini"
+          USE_VISION: "0"
           PYTHONUNBUFFERED: "1"
         run: |
           set +e
