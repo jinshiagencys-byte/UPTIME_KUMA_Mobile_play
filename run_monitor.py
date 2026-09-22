@@ -1,9 +1,10 @@
 """
-OpenBrowser-AI — Monitoring fonctionnel (budget zero : UnoRouter, glm-5.3-flash:free seul).
+OpenBrowser-AI — Monitoring fonctionnel (Ollama Cloud, un seul provider).
 
-STRATEGIE (mise a jour) : UN SEUL modele, glm-5.3-flash:free via UnoRouter (API compatible
-OpenAI). Tous les autres providers (OpenRouter/qwen, Cohere, Groq, Google) sont retires de la
-chaine : plus de fallback, plus de logique ENABLE_FALLBACKS/ENABLE_COHERE.
+STRATEGIE (mise a jour 2026-09-22) : UN SEUL provider, Ollama Cloud (API compatible
+OpenAI, https://ollama.com/v1), modele par defaut gpt-oss:120b. Tous les autres
+providers (GitHub Models, OpenRouter/qwen, Cohere, Cline, Groq, Google) sont retires
+de la chaine : plus de fallback, plus de logique ENABLE_FALLBACKS/ENABLE_*.
 
 Acquis conserves : plusieurs pages par run (PAGES_JSON, rotation), browser=BrowserSession(...) +
 await start() manuel, consignes fusionnees dans task, ChatOpenAI pour l'appel LLM,
@@ -112,16 +113,17 @@ SITE_TYPE = os.environ.get("SITE_TYPE", "generic")
 REQUIREMENTS = os.environ.get("REQUIREMENTS", "")
 PAGES_JSON = os.environ.get("PAGES_JSON", "")
 
-# GitHub Models (seul provider desormais) : utilise le GITHUB_TOKEN natif du workflow,
-# aucun secret externe a gerer. Endpoint compatible OpenAI.
-GITHUB_MODELS_TOKEN = os.environ.get("GITHUB_MODELS_TOKEN", "") or os.environ.get("GITHUB_TOKEN", "")
-GITHUB_MODELS_MODEL = os.environ.get("GITHUB_MODELS_MODEL", "openai/gpt-4o-mini")
-GITHUB_MODELS_BASE_URL = os.environ.get("GITHUB_MODELS_BASE_URL", "https://models.github.ai/inference")
+# Ollama Cloud (seul provider desormais) : cle personnelle OLLAMA_TOKEN, endpoint
+# compatible OpenAI. gpt-oss:120b par defaut (gpt-oss:20b et nemotron-3-nano:30b
+# sont aussi couverts par l'usage gratuit ; deepseek-v4.1-flash/glm-5.3-flash non).
+OLLAMA_TOKEN = os.environ.get("OLLAMA_TOKEN", "")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "gpt-oss:120b")
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "https://ollama.com/v1")
 
 DEAD_PROVIDERS = set()  # (provider, modele) abandonnes pour ce run (quota / erreur fatale)
 MAX_PAGES_PER_RUN = int(os.environ.get("MAX_PAGES_PER_RUN", "2"))
 
-# Latence : effort de raisonnement (reserve a OpenRouter ; sans effet pour UnoRouter)
+# Latence : effort de raisonnement (reserve a OpenRouter ; sans effet pour Ollama Cloud)
 _VALID_EFFORTS = ("minimal", "low", "medium", "high")
 REASONING_EFFORT = os.environ.get("REASONING_EFFORT", "low").strip().lower()
 if REASONING_EFFORT in ("", "off", "none", "0"):
@@ -158,8 +160,8 @@ except (TypeError, ValueError):
     _CODEAGENT_PARAMS = set()
 
 print("Recordings dir : " + RECORDINGS_DIR)
-print("GitHub Models token : " + str(bool(GITHUB_MODELS_TOKEN)))
-print("GitHub Models modele: " + GITHUB_MODELS_MODEL)
+print("Ollama Cloud token : " + str(bool(OLLAMA_TOKEN)))
+print("Ollama Cloud modele: " + OLLAMA_MODEL)
 print("Video freeze cap  : %.1fs" % FREEZE_CAP_SECONDS)
 print("Viewport          : %dx%d" % (VIEWPORT_WIDTH, VIEWPORT_HEIGHT))
 print("Reasoning effort  : " + (REASONING_EFFORT or "off"))
@@ -211,7 +213,7 @@ def reasoning_for(model_config):
 
 def build_llm(model_config):
     llm_kwargs = {}
-    if model_config["provider"] not in ("openrouter", "unorouter", "github"):
+    if model_config["provider"] not in ("openrouter", "unorouter", "ollama"):
         llm_kwargs = {"frequency_penalty": None, "max_completion_tokens": None}
     llm = ReasoningChatOpenAI(
         model=model_config["model"],
@@ -227,20 +229,20 @@ def build_llm(model_config):
 
 
 # ---------------------------------------------------------------------------
-# Chaine de modeles : GitHub Models uniquement, aucun fallback
+# Chaine de modeles : Ollama Cloud uniquement, aucun fallback
 # ---------------------------------------------------------------------------
 MODEL_CHAIN = []
 
-if GITHUB_MODELS_TOKEN:
+if OLLAMA_TOKEN:
     MODEL_CHAIN.append({
-        "provider": "github",
-        "model": GITHUB_MODELS_MODEL,
-        "key": GITHUB_MODELS_TOKEN,
-        "base_url": GITHUB_MODELS_BASE_URL,
+        "provider": "ollama",
+        "model": OLLAMA_MODEL,
+        "key": OLLAMA_TOKEN,
+        "base_url": OLLAMA_BASE_URL,
     })
 
 if not MODEL_CHAIN:
-    print("ERREUR : aucune cle API disponible. Abandon.")
+    print("ERREUR : aucune cle API disponible (OLLAMA_TOKEN manquant). Abandon.")
     sys.exit(1)
 
 print("Chaine finale :")
@@ -616,6 +618,7 @@ def is_quota_error(text):
         "insufficient_balance",
         "insufficient credits",
         "balance is not enough",
+        "not included in your free usage",
     ])
 
 
