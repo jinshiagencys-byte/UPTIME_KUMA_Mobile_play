@@ -156,14 +156,8 @@ jobs:
           SITE_TYPE: ${{ steps.detect.outputs.TYPE }}
           REQUIREMENTS: ${{ steps.prompt.outputs.REQUIREMENTS }}
           PAGES_JSON: ${{ toJSON(matrix.site.pages) }}
-          CLINE_API_KEY: ${{ secrets.CLINE_API_KEY }}
-          CLINE_ATTEMPTS: "1"
-          # Secours optionnel, désactivé par défaut dans run_monitor.py (ENABLE_OPENROUTER=0 / ENABLE_COHERE=0) :
-          # laisser les clés ici ne les active pas, elles ne servent que si tu passes ces deux flags à "1".
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
-          COHERE_MODEL: "command-a-03-2025"
-          ENABLE_FALLBACKS: "0"
+          UNOROUTER_API_KEY: ${{ secrets.UNOROUTER_API_KEY }}
+          UNOROUTER_MODEL: "glm-5.3-flash:free"
           PYTHONUNBUFFERED: "1"
         run: |
           set +e
