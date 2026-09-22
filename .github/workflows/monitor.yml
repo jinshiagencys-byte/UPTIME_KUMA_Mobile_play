@@ -12,7 +12,6 @@ on:
 
 permissions:
   contents: read
-  models: read
 
 jobs:
   # ============================================================
@@ -65,7 +64,7 @@ jobs:
           echo "$SITES" | jq .
 
   # ============================================================
-  # 2. AGENT OPENBROWSER-AI (GitHub Models uniquement)
+  # 2. AGENT OPENBROWSER-AI (Ollama Cloud uniquement)
   # ============================================================
   autospec-test:
     needs: fetch-sites
@@ -150,15 +149,15 @@ jobs:
         run: |
           mkdir -p recordings
 
-      - name: Exécuter le monitoring (GitHub Models)
+      - name: Exécuter le monitoring (Ollama Cloud)
         env:
           SITE_URL: ${{ matrix.site.url }}
           SITE_ID: ${{ matrix.site.id }}
           SITE_TYPE: ${{ steps.detect.outputs.TYPE }}
           REQUIREMENTS: ${{ steps.prompt.outputs.REQUIREMENTS }}
           PAGES_JSON: ${{ toJSON(matrix.site.pages) }}
-          GITHUB_MODELS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_MODELS_MODEL: "openai/gpt-4.1-mini"
+          OLLAMA_TOKEN: ${{ secrets.OLLAMA_TOKEN }}
+          OLLAMA_MODEL: "gpt-oss:120b"
           USE_VISION: "0"
           PYTHONUNBUFFERED: "1"
         run: |
