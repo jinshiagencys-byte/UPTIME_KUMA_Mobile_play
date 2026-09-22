@@ -1,34 +1,31 @@
 """
-OpenBrowser-AI — Monitoring fonctionnel (budget zero : OpenRouter gratuit, qwen seul).
+OpenBrowser-AI — Monitoring fonctionnel (budget zero : Cline (3 modeles gratuits), un seul actif a la fois).
 
-STRATEGIE (2026-09-21) : UN SEUL modele, qwen/qwen3.8-27b via OpenRouter.
-Le run du 2026-09-21 (odjafrik.com) a montre que nex-n2.5-mini:free et glm-5.2 echouent des
-l'etape 2 (openbrowser joint une capture d'ecran au prompt : "No endpoints found that support
-image input" / "Provider returned error"), alors que qwen3.8-27b conclut. Cohere n'est plus dans
-la chaine (ENABLE_COHERE=1 pour le reactiver). Groq / Google / DeepSeek / HF / NVIDIA restent
-DESACTIVES (ENABLE_FALLBACKS=1 pour Groq/Google) : voir test_providers.py du 2026-09-19.
+STRATEGIE (2026-09-22) : chaine de modeles GRATUITS via le Cline Provider (api.cline.bot),
+un seul modele actif par tentative, essaye dans l'ordre :
+  1. minimax/minimax-m2.5   (MiniMax, 1M contexte)
+  2. kwaipilot/kat-coder-pro (Kwaipilot, 32K contexte)
+  3. z-ai/glm-5             (Z-AI, 128K contexte, avait deja donne de bons resultats via OpenRouter)
+Des qu'un modele rend un rapport valide (done() avec JSON exploitable), la chaine s'arrete
+la (voir test_page) : les modeles suivants ne sont PAS testes. On ne passe au suivant que si
+le modele courant echoue (erreur fatale, quota/solde epuise, ou rapport non exploitable).
 
-NOTE (2026-09-21) : TypeSafe Jev ECARTE comme modele principal (endpoint OpenRouter "Decisions" :
-probabilite yes/no, pas de texte libre -> incompatible avec CodeAgent). Piste possible plus tard
-comme validateur de fin de chaine. Puter retire (402 subscription_required).
+Cline (api.cline.bot) est un point d'entree OpenAI-compatible : meme mecanique ChatOpenAI
+que les autres providers, juste une base_url + une cle differentes. Cle a creer sur
+app.cline.bot (Settings > API Keys), transmise via la variable d'environnement CLINE_API_KEY.
 
-Changements de cette version (par rapport a la version "budget zero" precedente) :
-  1. Qwen seul : OPENROUTER_FREE_MODELS = "qwen/qwen3.8-27b", Cohere derriere ENABLE_COHERE.
-  2. Anti-blocage : max 2 tentatives par interaction, une anomalie ne termine pas le test, toutes
-     les exigences doivent etre verifiees avant done(), pas d'URL inventee, verification du
-     CONTENU affiche et pas seulement de l'URL (constat du run : 8 etapes sur 8 gaspillees a
-     reessayer la meme recherche, auth jamais testee).
-  3. Coherence du verdict : UP + au moins une assertion_passed=False  ->  DOWN (normalize_report).
-  4. Latence : effort de raisonnement OpenRouter "low" injecte via extra_body (REASONING_EFFORT,
-     "off" pour desactiver) avec repli automatique si le preflight le refuse ; USE_VISION=0
-     possible pour ne plus envoyer de captures au LLM.
-  5. Budgets : MAX_STEPS 14, timeout LLM 120 s, essai 420 s, budget total 900 s ; l'essai est
-     borne par le temps restant (plus de depassement du budget) ; un timeout garde le constat
-     partiel (cellules deja executees) au lieu de le perdre.
-  6. Viewport 1280x720 reellement applique (viewport_width/height n'existent pas dans
-     BrowserProfile et etaient ignores -> 1920x1080).
-  7. Exemple du prompt : plus de "True_ou_False" (un petit modele pouvait le recopier -> NameError).
-  8. is_quota_error reconnait "insufficient credits" (message OpenRouter).
+ATTENTION : "gratuit" ici correspond a la liste FREE publiee par Cline au moment de l'ecriture
+de ce script (minimax-m2.5 / kat-coder-pro / glm-5). Cette liste peut changer : verifier sur
+app.cline.bot si un modele renvoie une erreur de type "not found"/"unavailable".
+
+OpenRouter et Cohere restent dans le code mais DESACTIVES PAR DEFAUT (ENABLE_OPENROUTER=1 /
+ENABLE_COHERE=1 pour les reactiver en secours) : l'objectif de cette version est de pouvoir
+s'en passer entierement si la chaine Cline suffit. Groq / Google restent derriere
+ENABLE_FALLBACKS comme avant.
+
+NOTE HISTORIQUE (2026-09-21, conservee) : TypeSafe Jev ecarte comme modele principal (endpoint
+OpenRouter "Decisions" : probabilite yes/no, pas de texte libre -> incompatible avec CodeAgent).
+Puter retire (402 subscription_required).
 
 Acquis conserves : plusieurs pages par run (PAGES_JSON, rotation), browser=BrowserSession(...) +
 await start() manuel, consignes fusionnees dans task, ChatOpenAI pour tous les providers,
@@ -138,16 +135,26 @@ REQUIREMENTS = os.environ.get("REQUIREMENTS", "")
 PAGES_JSON = os.environ.get("PAGES_JSON", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
+CLINE_API_KEY = os.environ.get("CLINE_API_KEY", "")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 COHERE_API_KEY = os.environ.get("COHERE_API_KEY", "")
 
-# Modele OpenRouter (qwen seul). Liste separee par des virgules, surchargeable.
-OPENROUTER_FREE_MODELS = os.environ.get("OPENROUTER_FREE_MODELS", "qwen/qwen3.8-27b")
+# Chaine Cline (3 modeles gratuits, dans l'ordre d'essai). Surchargeable via env.
+CLINE_FREE_MODELS = os.environ.get(
+    "CLINE_FREE_MODELS",
+    "minimax/minimax-m2.5,kwaipilot/kat-coder-pro,z-ai/glm-5",
+)
+CLINE_ATTEMPTS = int(os.environ.get("CLINE_ATTEMPTS", "1"))
 
-ENABLE_FALLBACKS = os.environ.get("ENABLE_FALLBACKS", "0") == "1"
+# OpenRouter/Cohere desormais optionnels (secours), desactives par defaut :
+# l'objectif de cette version est de s'appuyer uniquement sur la chaine Cline.
+ENABLE_OPENROUTER = os.environ.get("ENABLE_OPENROUTER", "0") == "1"
 ENABLE_COHERE = os.environ.get("ENABLE_COHERE", "0") == "1"
+OPENROUTER_FREE_MODELS = os.environ.get("OPENROUTER_FREE_MODELS", "qwen/qwen3.8-27b")
 OPENROUTER_ATTEMPTS = int(os.environ.get("OPENROUTER_ATTEMPTS", "1"))
 COHERE_ATTEMPTS = int(os.environ.get("COHERE_ATTEMPTS", "1"))
+
+ENABLE_FALLBACKS = os.environ.get("ENABLE_FALLBACKS", "0") == "1"
 DEAD_PROVIDERS = set()  # (provider, modele) abandonnes pour ce run (quota / erreur fatale)
 MAX_PAGES_PER_RUN = int(os.environ.get("MAX_PAGES_PER_RUN", "2"))
 
@@ -188,11 +195,12 @@ except (TypeError, ValueError):
     _CODEAGENT_PARAMS = set()
 
 print("Recordings dir : " + RECORDINGS_DIR)
+print("Cline key         : " + str(bool(CLINE_API_KEY)))
 print("Groq key          : " + str(bool(GROQ_API_KEY)))
 print("Google AI Std key : " + str(bool(GOOGLE_API_KEY)))
-print("OpenRouter key    : " + str(bool(OPENROUTER_API_KEY)))
+print("OpenRouter key    : " + str(bool(OPENROUTER_API_KEY)) + (" (actif)" if ENABLE_OPENROUTER else " (inactif)"))
 print("Cohere key        : " + str(bool(COHERE_API_KEY)) + (" (actif)" if ENABLE_COHERE else " (inactif)"))
-print("Fallbacks payants/quota : " + ("ON" if ENABLE_FALLBACKS else "OFF"))
+print("Fallbacks payants/quota (Groq/Google) : " + ("ON" if ENABLE_FALLBACKS else "OFF"))
 print("Video freeze cap  : %.1fs" % FREEZE_CAP_SECONDS)
 print("Viewport          : %dx%d" % (VIEWPORT_WIDTH, VIEWPORT_HEIGHT))
 print("Reasoning effort  : " + (REASONING_EFFORT or "off"))
@@ -233,7 +241,9 @@ _reasoning_disabled = set()  # (provider, modele) dont le preflight a refuse `re
 
 
 def reasoning_for(model_config):
-    """Effort de raisonnement a envoyer pour ce modele, ou None."""
+    """Effort de raisonnement a envoyer pour ce modele, ou None.
+    Seul OpenRouter documente ce parametre `reasoning` (extra_body) ; Cline n'est
+    pas connu pour le supporter, donc on ne l'envoie que pour openrouter."""
     if model_config["provider"] != "openrouter" or not REASONING_EFFORT:
         return None
     if (model_config["provider"], model_config["model"]) in _reasoning_disabled:
@@ -259,11 +269,22 @@ def build_llm(model_config):
 
 
 # ---------------------------------------------------------------------------
-# Chaine de modeles : OpenRouter (qwen) puis, si actives explicitement, le reste
+# Chaine de modeles : Cline (3 gratuits) en tete, puis secours optionnels
 # ---------------------------------------------------------------------------
 MODEL_CHAIN = []
 
-if OPENROUTER_API_KEY:
+if CLINE_API_KEY:
+    free_models = [m.strip() for m in CLINE_FREE_MODELS.split(",") if m.strip()]
+    for model_name in free_models:
+        for _ in range(max(CLINE_ATTEMPTS, 1)):
+            MODEL_CHAIN.append({
+                "provider": "cline",
+                "model": model_name,
+                "key": CLINE_API_KEY,
+                "base_url": "https://api.cline.bot/api/v1",
+            })
+
+if OPENROUTER_API_KEY and ENABLE_OPENROUTER:
     free_models = [m.strip() for m in OPENROUTER_FREE_MODELS.split(",") if m.strip()]
     for model_name in free_models:
         for _ in range(max(OPENROUTER_ATTEMPTS, 1)):
@@ -826,7 +847,9 @@ async def run_attempt(model_config, target_url, requirements, deadline):
 
 
 # ---------------------------------------------------------------------------
-# Test d'une page : parcourt la chaine (essais successifs), garde le meilleur partiel
+# Test d'une page : parcourt la chaine (essais successifs), garde le meilleur partiel.
+# S'ARRETE des qu'un modele rend un rapport exploitable (outcome["report"] is not None) :
+# les modeles restants de la chaine ne sont pas testes pour cette page.
 # ---------------------------------------------------------------------------
 async def test_page(target_url, requirements, deadline):
     best_partial = (None, 0)
@@ -849,7 +872,7 @@ async def test_page(target_url, requirements, deadline):
 
         outcome = await run_attempt(model_config, target_url, requirements, deadline)
         if outcome["report"] is not None:
-            return outcome["report"], best_partial, False
+            return outcome["report"], best_partial, False  # succes : arret immediat de la chaine
         if outcome["partial"][1] > best_partial[1]:
             best_partial = outcome["partial"]
         if outcome["stop"]:
