@@ -12,6 +12,7 @@ on:
 
 permissions:
   contents: read
+  models: read
 
 jobs:
   # ============================================================
@@ -64,7 +65,7 @@ jobs:
           echo "$SITES" | jq .
 
   # ============================================================
-  # 2. AGENT OPENBROWSER-AI (vidéo native + chaîne Cline gratuite)
+  # 2. AGENT OPENBROWSER-AI (GitHub Models uniquement)
   # ============================================================
   autospec-test:
     needs: fetch-sites
@@ -149,15 +150,15 @@ jobs:
         run: |
           mkdir -p recordings
 
-      - name: Exécuter le monitoring (chaîne Cline, 3 modèles gratuits)
+      - name: Exécuter le monitoring (GitHub Models)
         env:
           SITE_URL: ${{ matrix.site.url }}
           SITE_ID: ${{ matrix.site.id }}
           SITE_TYPE: ${{ steps.detect.outputs.TYPE }}
           REQUIREMENTS: ${{ steps.prompt.outputs.REQUIREMENTS }}
           PAGES_JSON: ${{ toJSON(matrix.site.pages) }}
-          UNOROUTER_API_KEY: ${{ secrets.UNOROUTER_API_KEY }}
-          UNOROUTER_MODEL: "deepseek-v4-flash:free"
+          GITHUB_MODELS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_MODELS_MODEL: "openai/gpt-4o-mini"
           PYTHONUNBUFFERED: "1"
         run: |
           set +e
