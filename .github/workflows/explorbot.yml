@@ -1,4 +1,4 @@
-name: Explorbot Ollama Cloud
+name: Explorbot TokenHarbor
 
 on:
   workflow_dispatch:
@@ -9,7 +9,12 @@ permissions:
 jobs:
   explorbot:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
+
+    env:
+      TOKENHARBOR_API_KEY: ${{ secrets.TOKENHARBOR_API_KEY }}
+      TOKENHARBOR_BASE_URL: https://tokenharbor.ai/v1
+      TOKENHARBOR_MODEL: deepseek-v4.1-flash:free
 
     steps:
       - name: Checkout
@@ -22,65 +27,99 @@ jobs:
 
       - name: Install Explorbot
         run: |
-          npm install explorbot ollama-ai-provider-v2
+          npm install explorbot @ai-sdk/openai-compatible
           npx playwright install --with-deps chromium
 
-      - name: Check Ollama API key
-        env:
-          OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
+      - name: Check TokenHarbor API key
         run: |
-          if [ -z "$OLLAMA_API_KEY" ]; then
-            echo "ERROR: OLLAMA_API_KEY is missing"
+          if [ -z "$TOKENHARBOR_API_KEY" ]; then
+            echo "ERROR: TOKENHARBOR_API_KEY is missing"
             exit 1
           fi
 
-          echo "OLLAMA_API_KEY is present"
+          echo "TOKENHARBOR_API_KEY is present"
 
-      - name: Verify Ollama Cloud connection
-        env:
-          OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
+      - name: Verify TokenHarbor connection
         run: |
-          echo "Testing Ollama Cloud..."
+          echo "Testing TokenHarbor (simple call)..."
 
-          RESPONSE=$(curl -sS \
-            https://ollama.com/api/chat \
+          RESPONSE=$(curl -sS -w "\nTemps: %{time_total}s\n" \
+            "$TOKENHARBOR_BASE_URL/chat/completions" \
             -H "Content-Type: application/json" \
-            -H "Authorization: Bearer $OLLAMA_API_KEY" \
-            -d '{
-              "model": "gemma4:31b",
-              "messages": [
+            -H "Authorization: Bearer $TOKENHARBOR_API_KEY" \
+            -d "{
+              \"model\": \"$TOKENHARBOR_MODEL\",
+              \"messages\": [
                 {
-                  "role": "user",
-                  "content": "Réponds uniquement par: OK"
+                  \"role\": \"user\",
+                  \"content\": \"Réponds uniquement par: OK\"
                 }
               ],
-              "stream": false
-            }')
+              \"max_tokens\": 50
+            }")
 
           echo "$RESPONSE"
 
           if echo "$RESPONSE" | grep -q '"error"'; then
-            echo "ERROR: Ollama Cloud rejected the request."
+            echo "ERROR: TokenHarbor rejected the request."
             exit 1
           fi
 
-          echo "Ollama Cloud connection OK."
+          echo "TokenHarbor connection OK."
+
+      - name: Verify tool calling (informational)
+        run: |
+          echo "Testing forced tool calling..."
+
+          RESPONSE=$(curl -sS -w "\nTemps: %{time_total}s\n" \
+            "$TOKENHARBOR_BASE_URL/chat/completions" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $TOKENHARBOR_API_KEY" \
+            -d "{
+              \"model\": \"$TOKENHARBOR_MODEL\",
+              \"messages\": [
+                {
+                  \"role\": \"user\",
+                  \"content\": \"Appelle la fonction ping.\"
+                }
+              ],
+              \"tools\": [
+                {
+                  \"type\": \"function\",
+                  \"function\": {
+                    \"name\": \"ping\",
+                    \"description\": \"Ping\",
+                    \"parameters\": {
+                      \"type\": \"object\",
+                      \"properties\": {}
+                    }
+                  }
+                }
+              ],
+              \"tool_choice\": \"required\",
+              \"max_tokens\": 100
+            }")
+
+          echo "$RESPONSE"
+
+          if echo "$RESPONSE" | grep -q '"tool_calls"'; then
+            echo "Tool calling OK."
+          else
+            echo "WARNING: no tool call returned, Explorbot may struggle with this model."
+          fi
 
       - name: Create Explorbot config
-        env:
-          OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
         run: |
           cat > explorbot.config.js <<'EOF'
-          import { createOllama } from 'ollama-ai-provider-v2';
+          import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
 
-          const ollamaCloud = createOllama({
-            baseURL: 'https://ollama.com/api',
-            headers: {
-              Authorization: `Bearer ${process.env.OLLAMA_API_KEY}`,
-            },
+          const tokenharbor = createOpenAICompatible({
+            name: 'tokenharbor',
+            baseURL: process.env.TOKENHARBOR_BASE_URL,
+            apiKey: process.env.TOKENHARBOR_API_KEY,
           });
 
-          const model = ollamaCloud('gemma4:31b');
+          const model = tokenharbor(process.env.TOKENHARBOR_MODEL);
 
           export default {
             web: {
@@ -98,7 +137,13 @@ jobs:
                 tester: { model },
                 navigator: { model },
                 pilot: { model },
-                historian: { model },
+                historian: {
+                  model,
+                  screencast: {
+                    size: { width: 1280, height: 720 },
+                    quality: 95,
+                  },
+                },
                 analyst: { model },
                 'experience-compactor': { model },
               },
@@ -125,21 +170,19 @@ jobs:
           echo "Explorbot configuration created."
 
       - name: Run Explorbot
-        env:
-          OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
         run: |
           echo "========================================"
           echo "Starting Explorbot"
-          echo "Provider: Ollama Cloud"
-          echo "Model: gemma4:31b"
+          echo "Provider: TokenHarbor"
+          echo "Model: $TOKENHARBOR_MODEL"
           echo "Target: https://odjafrik.com"
           echo "Maximum tests: 3"
-          echo "Maximum duration: 300"
+          echo "Maximum duration: 600"
           echo "========================================"
 
-          npx explorbot explore https://odjafrik.com \
+          timeout 22m npx explorbot explore https://odjafrik.com \
             --max-tests 3 \
-            --max-duration 300
+            --max-duration 600
 
       - name: Show results
         if: always()
@@ -169,7 +212,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: explorbot-ollama-gemma4
+          name: explorbot-tokenharbor-deepseek
           path: |
             output/
             explorbot.config.js
