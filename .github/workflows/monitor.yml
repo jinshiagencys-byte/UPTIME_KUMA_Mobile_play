@@ -5,213 +5,7 @@ on:
       site_id:
         description: "ID du site à tester spécifiquement (optionnel)"
         required: false
-        type: stringname: AutoSpec Agent - Monitoring Autonome Multi-Sites
-on:
-  workflow_dispatch:
-    inputs:
-      site_id:
-        description: "ID du site à tester spécifiquement (optionnel)"
-        required: false
         type: string
-  schedule:
-    - cron: "0 8,20 * * *"
-
-permissions:
-  contents: read
-
-jobs:
-  fetch-sites:
-    runs-on: ubuntu-latest
-    outputs:
-      sites: ${{ steps.get-sites.outputs.sites }}
-    steps:
-      - name: Récupérer les sites actifs
-        id: get-sites
-        env:
-          SITE_ID_INPUT: ${{ github.event.inputs.site_id }}
-          RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
-          RELAY_URL: ${{ secrets.RELAY_URL }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          SITE_ID="${SITE_ID_INPUT:-}"
-          if [ -n "$SITE_ID" ]; then
-            echo "Test cible sur $SITE_ID"
-            DETAIL=$(curl -fsS --retry 3 -H "x-relay-secret: $RELAY_SECRET" "$RELAY_URL/monitors/$SITE_ID")
-            MONITOR=$(echo "$DETAIL" | jq -c '.monitor | if .type == "http" then {id: .parent, url: .url, name: .parentName} else {id: .id, url: .url, name: .name} end')
-            if [ -z "$MONITOR" ] || [ "$MONITOR" = "null" ]; then
-              echo "sites=[]" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-            ALL_MONITORS=$(curl -fsS --retry 3 -H "x-relay-secret: $RELAY_SECRET" "$RELAY_URL/monitors")
-            PAGES=$(echo "$ALL_MONITORS" | jq -c --arg sid "$(echo "$MONITOR" | jq -r '.id')" '[.monitors[]? | select(.type == "http" and (.parent | tostring) == $sid) | {url: .url, name: .name}]')
-            SITES=$(jq -cn --argjson mon "$MONITOR" --argjson pages "$PAGES" '[{id: $mon.id, url: $mon.url, name: $mon.name, pages: $pages}]')
-          else
-            RAW=$(curl -fsS --retry 3 -H "x-relay-secret: $RELAY_SECRET" "$RELAY_URL/active-sites")
-            SITES_RAW=$(echo "$RAW" | jq -c '[.sites[]? | {id: .id, url: .site_url}]' 2>/dev/null || echo "[]")
-            [ -z "$SITES_RAW" ] || [ "$SITES_RAW" = "null" ] && SITES_RAW="[]"
-            SITES_ARRAY="[]"
-            while IFS= read -r site; do
-              [ -z "$site" ] && continue
-              SID=$(echo "$site" | jq -r '.id')
-              ALL_MONITORS=$(curl -fsS --retry 3 -H "x-relay-secret: $RELAY_SECRET" "$RELAY_URL/monitors")
-              PAGES=$(echo "$ALL_MONITORS" | jq -c --arg sid "$SID" '[.monitors[]? | select(.type == "http" and (.parent | tostring) == $sid) | {url: .url, name: .name}]')
-              SITE_WITH_PAGES=$(echo "$site" | jq -c --argjson pages "$PAGES" '. + {pages: $pages}')
-              SITES_ARRAY=$(echo "$SITES_ARRAY" | jq -c --argjson site "$SITE_WITH_PAGES" '. + [$site]')
-            done < <(echo "$SITES_RAW" | jq -c '.[]?')
-            SITES="$SITES_ARRAY"
-          fi
-          SITES=$(echo "$SITES" | jq -c .)
-          echo "sites=$SITES" >> "$GITHUB_OUTPUT"
-          echo "Sites a monitorer :"
-          echo "$SITES" | jq .
-
-  autospec-test:
-    needs: fetch-sites
-    if: needs.fetch-sites.outputs.sites != '[]'
-    runs-on: ubuntu-latest
-    timeout-minutes: 12
-    concurrency:
-      group: autospec-check-${{ matrix.site.id }}
-      cancel-in-progress: false
-    strategy:
-      fail-fast: false
-      max-parallel: 1
-      matrix:
-        site: ${{ fromJson(needs.fetch-sites.outputs.sites) }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Installer Python 3.12
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Installer OpenBrowser-AI + ffmpeg
-        run: |
-          set -euo pipefail
-          pip install --quiet "openbrowser-ai[agent,video]"
-          pip install --quiet openai
-          pip install --quiet langchain-core
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg
-
-      - name: Détecter le type de site
-        id: detect
-        shell: bash
-        run: |
-          set -euo pipefail
-          URL="${{ matrix.site.url }}"
-          HTML=$(curl -fsSL --max-time 15 "$URL" 2>/dev/null || echo "")
-          if echo "$HTML" | grep -qiE '(marketplace|vendeur|seller|multi-vendor|boutique)'; then
-            TYPE="marketplace"
-          elif echo "$HTML" | grep -qiE '(panier|cart|checkout|prix|price|produit|acheter)'; then
-            TYPE="ecommerce"
-          elif echo "$HTML" | grep -qiE '(login|connexion|dashboard|subscription|pricing)'; then
-            TYPE="saas"
-          elif echo "$HTML" | grep -qiE '(blog|article|post|news)'; then
-            TYPE="blog"
-          else
-            TYPE="generic"
-          fi
-          echo "TYPE=$TYPE" >> "$GITHUB_OUTPUT"
-
-      - name: Générer le prompt adaptatif
-        id: prompt
-        shell: bash
-        run: |
-          TYPE="${{ steps.detect.outputs.TYPE }}"
-          case "$TYPE" in
-            marketplace)
-              REQ="1. Type a product name in the search bar, click Search, assert results appear. 2. Click the first product, assert the detail page loads."
-              ;;
-            ecommerce)
-              REQ="1. Find a product listing, assert price visible. 2. Click Add to Cart, assert cart count updates."
-              ;;
-            saas)
-              REQ="1. Locate login form, fill with fake creds, submit, assert dashboard or clear error."
-              ;;
-            blog)
-              REQ="1. Assert 3+ articles listed. 2. Click first article, assert full content loads."
-              ;;
-            *)
-              REQ="1. Assert page title is not a placeholder. 2. Click a link, assert URL changes."
-              ;;
-          esac
-          echo "REQUIREMENTS<<EOF">> "$GITHUB_OUTPUT"
-          echo "$REQ" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
-
-      - name: Préparer les dossiers
-        run: |
-          mkdir -p recordings
-
-      - name: Exécuter le monitoring (Cloudflare Workers AI)
-        env:
-          SITE_URL: ${{ matrix.site.url }}
-          SITE_ID: ${{ matrix.site.id }}
-          SITE_TYPE: ${{ steps.detect.outputs.TYPE }}
-          REQUIREMENTS: ${{ steps.prompt.outputs.REQUIREMENTS }}
-          PAGES_JSON: ${{ toJSON(matrix.site.pages) }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          CLOUDFLARE_AUTH_TOKEN: ${{ secrets.CLOUDFLARE_AUTH_TOKEN }}
-          CLOUDFLARE_MODEL: "@cf/zai-org/glm-4.7-flash"
-          USE_VISION: "0"
-          PYTHONUNBUFFERED: "1"
-        run: |
-          set +e
-          python -u run_monitor.py 2>&1 | tee execution.log
-
-      - name: Afficher le résultat
-        if: always()
-        run: |
-          if [ -f output.json ]; then jq . output.json; else echo "output.json absent"; fi
-
-      - name: Envoyer le rapport des pages
-        if: always()
-        env:
-          SITE_ID: ${{ matrix.site.id }}
-          RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
-          RELAY_URL: ${{ secrets.RELAY_URL }}
-        run: |
-          set +e
-          [ ! -f output.json ] && exit 0
-          if jq -e '.pages' output.json >/dev/null 2>&1; then
-            jq -c '{pages: .pages}' output.json > pages_payload.json
-            curl -sS --retry 3 -X POST "$RELAY_URL/sites/$SITE_ID/pages-report" \
-              -H "x-relay-secret: $RELAY_SECRET" -H "Content-Type: application/json" -d @pages_payload.json
-          fi
-
-      - name: Envoyer le statut global
-        if: always()
-        env:
-          SITE_ID: ${{ matrix.site.id }}
-          RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
-          RELAY_URL: ${{ secrets.RELAY_URL }}
-        run: |
-          set +e
-          STATUS="ERROR"; MESSAGE="OpenBrowser-AI error"
-          if [ -f output.json ]; then
-            STATUS=$(jq -r '.overall_status // "ERROR"' output.json | tr '[:lower:]' '[:upper:]')
-            MESSAGE=$(jq -c '{actions_completed, model_used, pages}' output.json)
-          fi
-          jq -nc --arg status "$STATUS" --arg message "$MESSAGE" \
-            '{status: $status, message: $message}' > status_payload.json
-          curl -sS --retry 3 -X POST "$RELAY_URL/sites/$SITE_ID/mark-crawled" \
-            -H "x-relay-secret: $RELAY_SECRET" -H "Content-Type: application/json" -d @status_payload.json
-
-      - name: Uploader les artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: openbrowser-monitoring-${{ matrix.site.id }}
-          path: |
-            recordings/
-            output.json
-            execution.log
-          if-no-files-found: warn
-          retention-days: 3
   # 2 runs/jour (8h et 20h) : préserve quotas gratuits ET minutes GitHub
   schedule:
     - cron: "0 8,20 * * *"
@@ -270,7 +64,7 @@ jobs:
           echo "$SITES" | jq .
 
   # ============================================================
-  # 2. AGENT OPENBROWSER-AI (Ollama Cloud uniquement)
+  # 2. AGENT OPENBROWSER-AI (Cloudflare Workers AI uniquement)
   # ============================================================
   autospec-test:
     needs: fetch-sites
@@ -300,6 +94,7 @@ jobs:
           pip install --quiet "openbrowser-ai[agent,video]"
           pip install --quiet openai
           pip install --quiet langchain-core
+          pip install --quiet cactus-needle
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg
           echo "ffmpeg : $(which ffmpeg)"
@@ -355,15 +150,16 @@ jobs:
         run: |
           mkdir -p recordings
 
-      - name: Exécuter le monitoring (Ollama Cloud)
+      - name: Exécuter le monitoring (Cloudflare Workers AI)
         env:
           SITE_URL: ${{ matrix.site.url }}
           SITE_ID: ${{ matrix.site.id }}
           SITE_TYPE: ${{ steps.detect.outputs.TYPE }}
           REQUIREMENTS: ${{ steps.prompt.outputs.REQUIREMENTS }}
           PAGES_JSON: ${{ toJSON(matrix.site.pages) }}
-          OLLAMA_TOKEN: ${{ secrets.OLLAMA_TOKEN }}
-          OLLAMA_MODEL: "gpt-oss:120b"
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_AUTH_TOKEN: ${{ secrets.CLOUDFLARE_AUTH_TOKEN }}
+          CLOUDFLARE_MODEL: "@cf/zai-org/glm-4.7-flash"
           USE_VISION: "0"
           PYTHONUNBUFFERED: "1"
         run: |
