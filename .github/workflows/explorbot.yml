@@ -9,7 +9,7 @@ permissions:
 jobs:
   explorbot:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -23,6 +23,14 @@ jobs:
         run: |
           npm install explorbot @ai-sdk/openai
           npx playwright install --with-deps chromium
+
+      - name: Show Explorbot CLI help (diagnostic)
+        run: |
+          echo "===== explorbot --help ====="
+          npx explorbot --help || true
+          echo ""
+          echo "===== explorbot explore --help ====="
+          npx explorbot explore --help || true
 
       - name: Check UnoRouter API key
         env:
@@ -155,13 +163,13 @@ jobs:
           echo "Provider: UnoRouter"
           echo "Model: glm-5.3-flash:free"
           echo "Target: https://odjafrik.com"
-          echo "Maximum tests: 1"
-          echo "Maximum duration: 7 minutes"
+          echo "Maximum tests: 3"
+          echo "Maximum duration: 900 (check help output above for unit)"
           echo "========================================"
 
           npx explorbot explore https://odjafrik.com \
-            --max-tests 1 \
-            --max-duration 7
+            --max-tests 3 \
+            --max-duration 900
 
       - name: Show results
         if: always()
