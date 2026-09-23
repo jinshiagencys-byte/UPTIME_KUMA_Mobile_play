@@ -1,21 +1,6 @@
-name: "Explorbot - Exploration autonome (Cloudflare)"
+name: Explorbot Cloudflare
 
-on:
-workflow_dispatch:
-inputs:
-site_url:
-description: "URL du site à explorer"
-required: false
-type: string
-default: "https://odjafrik.com"
-
-```
-  max_tests:
-    description: "Nombre de scénarios maximum"
-    required: false
-    type: string
-    default: "3"
-```
+on: workflow_dispatch
 
 permissions:
 contents: read
@@ -27,44 +12,41 @@ timeout-minutes: 30
 
 ```
 steps:
-  - name: "Checkout"
+
+  - name: Checkout
     uses: actions/checkout@v4
 
-  - name: "Installer Node.js"
+  - name: Setup Node
     uses: actions/setup-node@v4
     with:
       node-version: "24"
 
-  - name: "Installer Explorbot et client OpenAI"
+  - name: Install Explorbot
     run: |
       npm install explorbot @ai-sdk/openai
       npx playwright install --with-deps chromium
 
-  - name: "Créer la configuration Explorbot"
+  - name: Create Explorbot config
+    env:
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
     run: |
-      cat > explorbot.config.js <<'EOF'
+      cat > explorbot.config.js <<EOF
       import { createOpenAI } from '@ai-sdk/openai';
 
       const cloudflare = createOpenAI({
         apiKey: process.env.CLOUDFLARE_AUTH_TOKEN,
-        baseURL:
-          `https://api.cloudflare.com/client/v4/accounts/` +
-          `${process.env.CLOUDFLARE_ACCOUNT_ID}/ai/v1`,
+        baseURL: 'https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/v1',
       });
 
       const model = cloudflare('@cf/zai-org/glm-4.7-flash');
 
-      const visionModel =
-        cloudflare('@cf/meta/llama-4-scout-17b-16e-instruct');
-
       export default {
         web: {
-          url: process.env.SITE_URL,
+          url: 'https://odjafrik.com',
         },
 
         ai: {
           model,
-          visionModel,
           agenticModel: model,
 
           agents: {
@@ -81,7 +63,6 @@ steps:
           timeout: 30000,
           waitForNavigation: 'networkidle',
           waitForTimeout: 2000,
-
           args: [
             '--no-sandbox',
             '--disable-gpu',
@@ -100,78 +81,69 @@ steps:
       };
       EOF
 
-  - name: "Vérifier les secrets Cloudflare"
+  - name: Check Cloudflare secrets
     env:
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       CLOUDFLARE_AUTH_TOKEN: ${{ secrets.CLOUDFLARE_AUTH_TOKEN }}
     run: |
-      set -euo pipefail
+      set -e
 
       if [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
-        echo "ERREUR: CLOUDFLARE_ACCOUNT_ID est absent."
+        echo "CLOUDFLARE_ACCOUNT_ID is missing"
         exit 1
       fi
 
       if [ -z "$CLOUDFLARE_AUTH_TOKEN" ]; then
-        echo "ERREUR: CLOUDFLARE_AUTH_TOKEN est absent."
+        echo "CLOUDFLARE_AUTH_TOKEN is missing"
         exit 1
       fi
 
-      echo "CLOUDFLARE_ACCOUNT_ID : présent"
-      echo "CLOUDFLARE_AUTH_TOKEN : présent"
+      echo "Cloudflare secrets are present"
 
-  - name: "Tester GLM-4.7-Flash"
+  - name: Test GLM 4.7 Flash
     env:
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       CLOUDFLARE_AUTH_TOKEN: ${{ secrets.CLOUDFLARE_AUTH_TOKEN }}
     run: |
-      set -euo pipefail
+      set -e
 
       curl --fail-with-body \
-        --request POST \
-        --url "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/v1/chat/completions" \
-        --header "Authorization: Bearer ${CLOUDFLARE_AUTH_TOKEN}" \
-        --header "Content-Type: application/json" \
-        --data '{
+        -X POST \
+        "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/v1/chat/completions" \
+        -H "Authorization: Bearer ${CLOUDFLARE_AUTH_TOKEN}" \
+        -H "Content-Type: application/json" \
+        -d '{
           "model": "@cf/zai-org/glm-4.7-flash",
           "messages": [
             {
               "role": "user",
-              "content": "Reply with exactly: CLOUDFLARE_OK"
+              "content": "Say exactly CLOUDFLARE_OK"
             }
           ],
           "max_tokens": 20
         }'
 
-  - name: "Lancer Explorbot"
+  - name: Run Explorbot
     env:
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       CLOUDFLARE_AUTH_TOKEN: ${{ secrets.CLOUDFLARE_AUTH_TOKEN }}
-      SITE_URL: ${{ inputs.site_url }}
     run: |
-      set -euo pipefail
+      set -e
 
-      npx explorbot explore / \
-        --max-tests "${{ inputs.max_tests }}"
+      npx explorbot explore / --max-tests 3
 
-  - name: "Afficher les résultats"
+  - name: Show generated files
     if: always()
     run: |
-      echo "===== RAPPORTS ====="
-      find output/reports -type f 2>/dev/null || true
+      echo "===== OUTPUT ====="
+      find output -type f 2>/dev/null || true
 
-      echo "===== TESTS ====="
-      find output/tests -type f 2>/dev/null || true
-
-      echo "===== SCREENCASTS ====="
-      find output/screencasts -type f 2>/dev/null || true
-
-  - name: "Uploader les résultats"
+  - name: Upload Explorbot results
     if: always()
     uses: actions/upload-artifact@v4
     with:
-      name: "explorbot-cloudflare-${{ github.run_id }}"
-      path: "output/"
+      name: explorbot-cloudflare-${{ github.run_id }}
+      path: output/
       if-no-files-found: warn
       retention-days: 14
 ```
