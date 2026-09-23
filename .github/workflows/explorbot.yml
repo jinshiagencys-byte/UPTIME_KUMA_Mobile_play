@@ -10,6 +10,7 @@ jobs:
   explorbot:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -26,7 +27,7 @@ jobs:
 
       - name: Check Ollama API key
         env:
-          OLLAMA_API_KEY: ${{ secrets.OLLAMA_TOKEN }}
+          OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
         run: |
           if [ -z "$OLLAMA_API_KEY" ]; then
             echo "ERROR: OLLAMA_API_KEY is missing"
@@ -37,7 +38,7 @@ jobs:
 
       - name: Verify Ollama Cloud connection
         env:
-          OLLAMA_API_KEY: ${{ secrets.OLLAMA_TOKEN }}
+          OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
         run: |
           echo "Testing Ollama Cloud..."
 
@@ -67,7 +68,7 @@ jobs:
 
       - name: Create Explorbot config
         env:
-          OLLAMA_API_KEY: ${{ secrets.OLLAMA_TOKEN }}
+          OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
         run: |
           cat > explorbot.config.js <<'EOF'
           import { createOllama } from 'ollama-ai-provider-v2';
@@ -92,47 +93,21 @@ jobs:
               visionModel: model,
 
               agents: {
-                planner: {
-                  model,
-                },
-
-                researcher: {
-                  model,
-                },
-
-                tester: {
-                  model,
-                },
-
-                navigator: {
-                  model,
-                },
-
-                pilot: {
-                  model,
-                },
-
-                historian: {
-                  model,
-                },
-
-                analyst: {
-                  model,
-                },
-
-                'experience-compactor': {
-                  model,
-                },
+                planner: { model },
+                researcher: { model },
+                tester: { model },
+                navigator: { model },
+                pilot: { model },
+                historian: { model },
+                analyst: { model },
+                'experience-compactor': { model },
               },
             },
 
             playwright: {
               show: false,
-
               timeout: 30000,
-
               waitForNavigation: 'domcontentloaded',
-
               args: [
                 '--no-sandbox',
                 '--disable-gpu',
@@ -151,7 +126,7 @@ jobs:
 
       - name: Run Explorbot
         env:
-          OLLAMA_API_KEY: ${{ secrets.OLLAMA_TOKEN }}
+          OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
         run: |
           echo "========================================"
           echo "Starting Explorbot"
