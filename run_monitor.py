@@ -219,9 +219,9 @@ REQUIREMENTS = os.environ.get("REQUIREMENTS", "")
 PAGES_JSON = os.environ.get("PAGES_JSON", "")
 
 # Cloudflare Workers AI (seul provider desormais) : endpoint compatible OpenAI,
-# cle CLOUDFLARE_API_TOKEN + compte CLOUDFLARE_ACCOUNT_ID. glm-4.7-flash par defaut.
+# cle CLOUDFLARE_AUTH_TOKEN + compte CLOUDFLARE_ACCOUNT_ID. glm-4.7-flash par defaut.
 CLOUDFLARE_ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
-CLOUDFLARE_API_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "")
+CLOUDFLARE_AUTH_TOKEN = os.environ.get("CLOUDFLARE_AUTH_TOKEN", "")
 CLOUDFLARE_MODEL = os.environ.get("CLOUDFLARE_MODEL", "@cf/zai-org/glm-4.7-flash")
 CLOUDFLARE_BASE_URL = (
     "https://api.cloudflare.com/client/v4/accounts/%s/ai/v1" % CLOUDFLARE_ACCOUNT_ID
@@ -269,7 +269,7 @@ except (TypeError, ValueError):
 
 print("Recordings dir : " + RECORDINGS_DIR)
 print("Cloudflare account id : " + str(bool(CLOUDFLARE_ACCOUNT_ID)))
-print("Cloudflare token      : " + str(bool(CLOUDFLARE_API_TOKEN)))
+print("Cloudflare token      : " + str(bool(CLOUDFLARE_AUTH_TOKEN)))
 print("Cloudflare modele     : " + CLOUDFLARE_MODEL)
 print("Video freeze cap  : %.1fs" % FREEZE_CAP_SECONDS)
 print("Viewport          : %dx%d" % (VIEWPORT_WIDTH, VIEWPORT_HEIGHT))
@@ -342,16 +342,16 @@ def build_llm(model_config):
 # ---------------------------------------------------------------------------
 MODEL_CHAIN = []
 
-if CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID:
+if CLOUDFLARE_AUTH_TOKEN and CLOUDFLARE_ACCOUNT_ID:
     MODEL_CHAIN.append({
         "provider": "cloudflare",
         "model": CLOUDFLARE_MODEL,
-        "key": CLOUDFLARE_API_TOKEN,
+        "key": CLOUDFLARE_AUTH_TOKEN,
         "base_url": CLOUDFLARE_BASE_URL,
     })
 
 if not MODEL_CHAIN:
-    print("ERREUR : aucune cle API disponible (CLOUDFLARE_API_TOKEN/CLOUDFLARE_ACCOUNT_ID manquant). Abandon.")
+    print("ERREUR : aucune cle API disponible (CLOUDFLARE_AUTH_TOKEN/CLOUDFLARE_ACCOUNT_ID manquant). Abandon.")
     sys.exit(1)
 
 print("Chaine finale :")
