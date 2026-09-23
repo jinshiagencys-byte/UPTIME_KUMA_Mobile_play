@@ -1,128 +1,286 @@
-name: Explorbot - Exploration autonome (pipeline à part)
+name: Explorbot - Exploration autonome (Cloudflare)
 
 on:
-  workflow_dispatch:
-    inputs:
-      site_url:
-        description: "URL du site à explorer"
-        required: false
-        type: string
-        default: "https://odjafrik.com"
-      max_tests:
-        description: "Nombre de scénarios max pour ce run"
-        required: false
-        type: string
-        default: "3"
-      model_id:
-        description: "ID modèle OmniRoute (vérifié via Compatibility sur le dashboard)"
-        required: false
-        type: string
-        default: "gemini/gemini-3.1-flash-lite"
-  # Pas de schedule pour l'instant : on valide d'abord ce que sortent
-  # Researcher/Planner/Tester/Historian/Analyst avant d'automatiser.
+workflow_dispatch:
+inputs:
+site_url:
+description: "URL du site à explorer"
+required: false
+type: string
+default: "https://odjafrik.com"
+
+```
+  max_tests:
+    description: "Nombre de scénarios max pour ce run"
+    required: false
+    type: string
+    default: "3"
+
+  focus:
+    description: "Fonctionnalité à privilégier (optionnel)"
+    required: false
+    type: string
+    default: ""
+```
 
 permissions:
-  contents: read
+contents: read
 
 jobs:
-  explore:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+explore:
+runs-on: ubuntu-latest
+timeout-minutes: 30
 
-      - name: Installer Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "24"
+```
+steps:
+  - name: Checkout
+    uses: actions/checkout@v4
 
-      - name: Installer Explorbot + client OpenAI-compatible
-        run: |
-          npm i explorbot @ai-sdk/openai --save
-          npx playwright install --with-deps chromium
+  - name: Installer Node.js
+    uses: actions/setup-node@v4
+    with:
+      node-version: "24"
 
-      - name: Générer la config pour ce run
-        run: |
-          cat > explorbot.config.js << 'EOF'
-          import { createOpenAI } from '@ai-sdk/openai';
+  - name: Installer Explorbot + provider OpenAI-compatible
+    run: |
+      npm i explorbot @ai-sdk/openai --save
+      npx playwright install --with-deps chromium
 
-          // OmniRoute (déployé sur Railway) plutôt qu'un provider en direct :
-          // un seul endpoint, et le modèle réellement gratuit/dispo se choisit
-          // sur le dashboard (Test all models + Compatibility) au lieu d'être
-          // deviné puis rendu caduc à la première dépréciation.
-          const omniroute = createOpenAI({
-            apiKey: process.env.OMNIROUTE_API_KEY,
-            baseURL: process.env.OMNIROUTE_BASE_URL, // ex: https://xxx.up.railway.app/v1
-          });
+  - name: Générer la configuration Explorbot
+    run: |
+      cat > explorbot.config.js << 'EOF'
+      import { createOpenAI } from '@ai-sdk/openai';
 
-          const model = omniroute(process.env.OMNIROUTE_MODEL_ID);
+      /*
+       * Cloudflare Workers AI
+       *
+       * Endpoint OpenAI-compatible :
+       * https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/v1
+       */
 
-          export default {
-            web: {
-              url: process.env.SITE_URL,
+      const cloudflare = createOpenAI({
+        apiKey: process.env.CLOUDFLARE_AUTH_TOKEN,
+        baseURL:
+          `https://api.cloudflare.com/client/v4/accounts/` +
+          `${process.env.CLOUDFLARE_ACCOUNT_ID}/ai/v1`,
+      });
+
+      /*
+       * GLM-4.7-Flash :
+       * - raisonnement
+       * - function/tool calling
+       * - gros contexte
+       * - modèle principal Explorbot
+       */
+      const model = cloudflare('@cf/zai-org/glm-4.7-flash');
+
+      /*
+       * Explorbot utilise un modèle séparé pour analyser
+       * les captures d'écran.
+       *
+       * GLM-4.7-Flash est textuel et ne doit donc PAS être
+       * utilisé ici.
+       *
+       * Llama 4 Scout est multimodal et supporte la vision.
+       */
+      const visionModel =
+        cloudflare('@cf/meta/llama-4-scout-17b-16e-instruct');
+
+      export default {
+        web: {
+          url: process.env.SITE_URL,
+        },
+
+        ai: {
+          /*
+           * Lecture/analyse des pages
+           */
+          model,
+
+          /*
+           * Analyse des screenshots
+           */
+          visionModel,
+
+          /*
+           * Décisions de haut niveau / agentic
+           */
+          agenticModel: model,
+
+          agents: {
+            historian: {
+              framework: 'playwright',
+
+              /*
+               * Enregistre une vidéo de chaque test.
+               * Les vidéos seront dans :
+               * output/screencasts/
+               */
+              screencast: true,
             },
+          },
+        },
 
-            ai: {
-              model,
-              visionModel: model,
-              agenticModel: model,
+        playwright: {
+          browser: 'chromium',
 
-              agents: {
-                historian: {
-                  framework: 'playwright', // .spec.ts, réutilisables plus tard
-                  screencast: true,        // vidéo par test, comme l'existant
-                },
-              },
-            },
+          /*
+           * GitHub Actions = headless
+           */
+          show: false,
 
-            playwright: {
-              browser: 'chromium',
-              show: false,
-              timeout: 30000,
-              waitForNavigation: 'networkidle',
-              waitForTimeout: 2000,
-              // Nécessaire pour tourner sans souci sur un runner GitHub Actions
-              args: ['--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage'],
-            },
+          timeout: 30000,
 
-            reporter: {
-              markdown: true,  // output/reports/*.md (résumé de l'agent Analyst)
-              html: true,      // + version HTML consultable dans un navigateur
-            },
+          waitForNavigation: 'networkidle',
 
-            dirs: {
-              output: 'output',
-            },
-          };
-          EOF
+          waitForTimeout: 2000,
 
-      - name: Lancer Explorbot
-        env:
-          OMNIROUTE_API_KEY: ${{ secrets.OMNIROUTE_API_KEY }}
-          OMNIROUTE_BASE_URL: ${{ secrets.OMNIROUTE_BASE_URL }}
-          OMNIROUTE_MODEL_ID: ${{ github.event.inputs.model_id }}
-          SITE_URL: ${{ github.event.inputs.site_url }}
-        run: |
-          set -euo pipefail
-          npx explorbot explore / --max-tests "${{ github.event.inputs.max_tests }}"
+          args: [
+            '--no-sandbox',
+            '--disable-gpu',
+            '--disable-dev-shm-usage',
+          ],
+        },
 
-      - name: Afficher un résumé rapide
-        if: always()
-        run: |
-          echo "--- Rapports générés ---"
-          find output/reports -type f 2>/dev/null || echo "(aucun rapport trouvé)"
-          echo "--- Tests générés ---"
-          find output/tests -type f 2>/dev/null || echo "(aucun test généré)"
+        reporter: {
+          markdown: true,
+          html: true,
+        },
 
-      # Tout reste ici, à part : aucun appel au relay (pas de pages-report,
-      # pas de mark-crawled). C'est un pipeline d'exploration autonome
-      # consultable séparément, pas un remplacement du monitoring existant.
-      - name: Uploader les résultats (rapports, tests, screencasts)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: explorbot-output-${{ github.run_id }}
-          path: output/
-          if-no-files-found: warn
-          retention-days: 14
+        dirs: {
+          output: 'output',
+        },
+      };
+      EOF
+
+  - name: Vérifier la configuration
+    env:
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_AUTH_TOKEN: ${{ secrets.CLOUDFLARE_AUTH_TOKEN }}
+      SITE_URL: ${{ github.event.inputs.site_url }}
+    run: |
+      set -euo pipefail
+
+      test -n "$CLOUDFLARE_ACCOUNT_ID" || {
+        echo "ERREUR: CLOUDFLARE_ACCOUNT_ID est absent."
+        exit 1
+      }
+
+      test -n "$CLOUDFLARE_AUTH_TOKEN" || {
+        echo "ERREUR: CLOUDFLARE_AUTH_TOKEN est absent."
+        exit 1
+      }
+
+      test -n "$SITE_URL" || {
+        echo "ERREUR: SITE_URL est vide."
+        exit 1
+      }
+
+      echo "Cloudflare Account ID: présent"
+      echo "Cloudflare Auth Token: présent"
+      echo "Site: $SITE_URL"
+      echo "Modèle principal: @cf/zai-org/glm-4.7-flash"
+      echo "Modèle vision: @cf/meta/llama-4-scout-17b-16e-instruct"
+
+  - name: Tester l'accès Cloudflare au modèle principal
+    env:
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_AUTH_TOKEN: ${{ secrets.CLOUDFLARE_AUTH_TOKEN }}
+    run: |
+      set -euo pipefail
+
+      RESPONSE=$(curl -sS \
+        --fail-with-body \
+        --request POST \
+        --url "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/v1/chat/completions" \
+        --header "Authorization: Bearer ${CLOUDFLARE_AUTH_TOKEN}" \
+        --header "Content-Type: application/json" \
+        --data '{
+          "model": "@cf/zai-org/glm-4.7-flash",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Reply with exactly: CLOUDFLARE_OK"
+            }
+          ],
+          "max_tokens": 20
+        }')
+
+      echo "$RESPONSE"
+
+      echo "$RESPONSE" | grep -q "CLOUDFLARE_OK" || {
+        echo "ERREUR: le modèle Cloudflare n'a pas répondu comme prévu."
+        exit 1
+      }
+
+  - name: Lancer Explorbot
+    env:
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_AUTH_TOKEN: ${{ secrets.CLOUDFLARE_AUTH_TOKEN }}
+      SITE_URL: ${{ github.event.inputs.site_url }}
+    run: |
+      set -euo pipefail
+
+      if [ -n "${{ github.event.inputs.focus }}" ]; then
+        npx explorbot explore / \
+          --max-tests "${{ github.event.inputs.max_tests }}" \
+          --focus "${{ github.event.inputs.focus }}"
+      else
+        npx explorbot explore / \
+          --max-tests "${{ github.event.inputs.max_tests }}"
+      fi
+
+  - name: Afficher les résultats
+    if: always()
+    run: |
+      echo ""
+      echo "========================================"
+      echo " RAPPORTS"
+      echo "========================================"
+
+      find output/reports \
+        -type f \
+        -print 2>/dev/null || \
+        echo "(aucun rapport trouvé)"
+
+      echo ""
+      echo "========================================"
+      echo " PLANS"
+      echo "========================================"
+
+      find output/plans \
+        -type f \
+        -print 2>/dev/null || \
+        echo "(aucun plan trouvé)"
+
+      echo ""
+      echo "========================================"
+      echo " TESTS"
+      echo "========================================"
+
+      find output/tests \
+        -type f \
+        -print 2>/dev/null || \
+        echo "(aucun test trouvé)"
+
+      echo ""
+      echo "========================================"
+      echo " SCREENCASTS"
+      echo "========================================"
+
+      find output/screencasts \
+        -type f \
+        -print 2>/dev/null || \
+        echo "(aucun screencast trouvé)"
+
+  - name: Uploader rapports, tests et vidéos
+    if: always()
+    uses: actions/upload-artifact@v4
+    with:
+      name: explorbot-cloudflare-${{ github.run_id }}
+      path: |
+        output/
+        experience/
+      if-no-files-found: warn
+      retention-days: 14
+```
