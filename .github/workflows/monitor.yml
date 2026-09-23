@@ -88,7 +88,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Installer OpenBrowser-AI + ffmpeg (pour conversion finale)
+      - name: Installer OpenBrowser-AI + ffmpeg (compression preview)
         run: |
           set -euo pipefail
           pip install --quiet "openbrowser-ai[agent,video]"
@@ -148,7 +148,7 @@ jobs:
 
       - name: Préparer les dossiers
         run: |
-          mkdir -p recordings
+          mkdir -p recordings recordings-preview
 
       - name: Exécuter le monitoring (Cloudflare Workers AI)
         env:
@@ -204,13 +204,92 @@ jobs:
           curl -sS --retry 3 -X POST "$RELAY_URL/sites/$SITE_ID/mark-crawled" \
             -H "x-relay-secret: $RELAY_SECRET" -H "Content-Type: application/json" -d @status_payload.json
 
-      - name: Uploader les artifacts
+      - name: Compresser la vidéo (preview mobile)
+        if: always()
+        run: |
+          set +e
+          FOUND=$(ls recordings/*.mp4 2>/dev/null | head -n 1)
+          if [ -z "$FOUND" ]; then
+            echo "Aucune vidéo trouvée dans recordings/ — étape ignorée"
+            exit 0
+          fi
+          echo "Vidéo source : $FOUND ($(du -h "$FOUND" | cut -f1))"
+          ffmpeg -y -i "$FOUND" \
+            -vf "scale=640:-2" -c:v libx264 -crf 30 -preset veryfast \
+            -movflags +faststart -an \
+            recordings-preview/preview.mp4
+          ffmpeg -y -ss 1 -i "$FOUND" -vframes 1 \
+            recordings-preview/thumb.jpg
+          if [ -f recordings-preview/preview.mp4 ]; then
+            echo "Preview générée : $(du -h recordings-preview/preview.mp4 | cut -f1)"
+          else
+            echo "Échec de la compression ffmpeg"
+          fi
+
+      - name: Uploader vidéo + miniature vers Supabase Storage
+        if: always()
+        env:
+          SITE_ID: ${{ matrix.site.id }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
+          RELAY_URL: ${{ secrets.RELAY_URL }}
+        run: |
+          set +e
+          BUCKET="monitoring-videos"
+          TS=$(date +%s)
+          VIDEO_URL=""
+          THUMB_URL=""
+
+          if [ -f recordings-preview/preview.mp4 ]; then
+            VIDEO_PATH="${SITE_ID}/latest.mp4"
+            HTTP_CODE=$(curl -sS -o /tmp/upload_video.log -w "%{http_code}" -X POST \
+              "${SUPABASE_URL}/storage/v1/object/${BUCKET}/${VIDEO_PATH}?upsert=true" \
+              -H "Authorization: Bearer ${SUPABASE_SERVICE_KEY}" \
+              -H "Content-Type: video/mp4" \
+              --data-binary "@recordings-preview/preview.mp4")
+            echo "Upload vidéo -> HTTP $HTTP_CODE"
+            cat /tmp/upload_video.log
+            if [ "$HTTP_CODE" = "200" ]; then
+              VIDEO_URL="${SUPABASE_URL}/storage/v1/object/public/${BUCKET}/${VIDEO_PATH}?t=${TS}"
+            fi
+          fi
+
+          if [ -f recordings-preview/thumb.jpg ]; then
+            THUMB_PATH="${SITE_ID}/latest.jpg"
+            HTTP_CODE=$(curl -sS -o /tmp/upload_thumb.log -w "%{http_code}" -X POST \
+              "${SUPABASE_URL}/storage/v1/object/${BUCKET}/${THUMB_PATH}?upsert=true" \
+              -H "Authorization: Bearer ${SUPABASE_SERVICE_KEY}" \
+              -H "Content-Type: image/jpeg" \
+              --data-binary "@recordings-preview/thumb.jpg")
+            echo "Upload miniature -> HTTP $HTTP_CODE"
+            cat /tmp/upload_thumb.log
+            if [ "$HTTP_CODE" = "200" ]; then
+              THUMB_URL="${SUPABASE_URL}/storage/v1/object/public/${BUCKET}/${THUMB_PATH}?t=${TS}"
+            fi
+          fi
+
+          echo "video_url=${VIDEO_URL}"
+          echo "thumbnail_url=${THUMB_URL}"
+
+          if [ -n "$VIDEO_URL" ] || [ -n "$THUMB_URL" ]; then
+            jq -nc --arg v "$VIDEO_URL" --arg t "$THUMB_URL" \
+              '{video_url: $v, thumbnail_url: $t}' > video_payload.json
+            curl -sS --retry 3 -X POST "$RELAY_URL/sites/$SITE_ID/attach-video" \
+              -H "x-relay-secret: $RELAY_SECRET" -H "Content-Type: application/json" \
+              -d @video_payload.json
+          else
+            echo "Rien à envoyer au relay (pas de vidéo/miniature uploadée)"
+          fi
+
+      - name: Uploader les artifacts (debug/fallback)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: openbrowser-monitoring-${{ matrix.site.id }}
           path: |
             recordings/
+            recordings-preview/
             output.json
             execution.log
           if-no-files-found: warn
