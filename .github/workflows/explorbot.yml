@@ -1,4 +1,4 @@
-name: Explorbot OmniRoute
+name: Explorbot Ollama Cloud
 
 on:
   workflow_dispatch:
@@ -9,13 +9,7 @@ permissions:
 jobs:
   explorbot:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-
-    env:
-      OMNIROUTE_API_KEY: ${{ secrets.OMNIROUTE_API_KEY }}
-      # URL publique de ton OmniRoute, avec /v1 a la fin
-      # ex: https://omniroute.mondomaine.com/v1
-      OMNIROUTE_BASE_URL: ${{ secrets.OMNIROUTE_BASE_URL }}
+    timeout-minutes: 20
 
     steps:
       - name: Checkout
@@ -28,63 +22,65 @@ jobs:
 
       - name: Install Explorbot
         run: |
-          npm install explorbot @ai-sdk/openai-compatible
+          npm install explorbot ollama-ai-provider-v2
           npx playwright install --with-deps chromium
 
-      - name: Check OmniRoute secrets
+      - name: Check Ollama API key
+        env:
+          OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
         run: |
-          if [ -z "$OMNIROUTE_API_KEY" ]; then
-            echo "ERROR: OMNIROUTE_API_KEY is missing"
+          if [ -z "$OLLAMA_API_KEY" ]; then
+            echo "ERROR: OLLAMA_API_KEY is missing"
             exit 1
           fi
 
-          if [ -z "$OMNIROUTE_BASE_URL" ]; then
-            echo "ERROR: OMNIROUTE_BASE_URL is missing"
-            exit 1
-          fi
+          echo "OLLAMA_API_KEY is present"
 
-          echo "OmniRoute secrets are present"
-
-      - name: Verify OmniRoute connection
+      - name: Verify Ollama Cloud connection
+        env:
+          OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
         run: |
-          echo "Testing OmniRoute..."
+          echo "Testing Ollama Cloud..."
 
           RESPONSE=$(curl -sS \
-            "$OMNIROUTE_BASE_URL/chat/completions" \
+            https://ollama.com/api/chat \
             -H "Content-Type: application/json" \
-            -H "Authorization: Bearer $OMNIROUTE_API_KEY" \
+            -H "Authorization: Bearer $OLLAMA_API_KEY" \
             -d '{
-              "model": "cl/deepseek/deepseek-v4-flash",
+              "model": "gemma4:31b",
               "messages": [
                 {
                   "role": "user",
                   "content": "Réponds uniquement par: OK"
                 }
               ],
-              "max_tokens": 20
+              "stream": false
             }')
 
           echo "$RESPONSE"
 
           if echo "$RESPONSE" | grep -q '"error"'; then
-            echo "ERROR: OmniRoute rejected the request."
+            echo "ERROR: Ollama Cloud rejected the request."
             exit 1
           fi
 
-          echo "OmniRoute connection OK."
+          echo "Ollama Cloud connection OK."
 
       - name: Create Explorbot config
+        env:
+          OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
         run: |
           cat > explorbot.config.js <<'EOF'
-          import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
+          import { createOllama } from 'ollama-ai-provider-v2';
 
-          const omniroute = createOpenAICompatible({
-            name: 'omniroute',
-            baseURL: process.env.OMNIROUTE_BASE_URL,
-            apiKey: process.env.OMNIROUTE_API_KEY,
+          const ollamaCloud = createOllama({
+            baseURL: 'https://ollama.com/api',
+            headers: {
+              Authorization: `Bearer ${process.env.OLLAMA_API_KEY}`,
+            },
           });
 
-          const model = omniroute('cl/deepseek/deepseek-v4-flash');
+          const model = ollamaCloud('gemma4:31b');
 
           export default {
             web: {
@@ -102,13 +98,7 @@ jobs:
                 tester: { model },
                 navigator: { model },
                 pilot: { model },
-                historian: {
-                  model,
-                  screencast: {
-                    size: { width: 1280, height: 720 },
-                    quality: 95,
-                  },
-                },
+                historian: { model },
                 analyst: { model },
                 'experience-compactor': { model },
               },
@@ -135,19 +125,21 @@ jobs:
           echo "Explorbot configuration created."
 
       - name: Run Explorbot
+        env:
+          OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
         run: |
           echo "========================================"
           echo "Starting Explorbot"
-          echo "Provider: OmniRoute"
-          echo "Model: cl/deepseek/deepseek-v4-flash"
+          echo "Provider: Ollama Cloud"
+          echo "Model: gemma4:31b"
           echo "Target: https://odjafrik.com"
-          echo "Maximum tests: 7"
-          echo "Maximum duration: 900"
+          echo "Maximum tests: 3"
+          echo "Maximum duration: 300"
           echo "========================================"
 
           npx explorbot explore https://odjafrik.com \
-            --max-tests 7 \
-            --max-duration 900
+            --max-tests 3 \
+            --max-duration 300
 
       - name: Show results
         if: always()
@@ -177,7 +169,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: explorbot-omniroute-deepseek
+          name: explorbot-ollama-gemma4
           path: |
             output/
             explorbot.config.js
