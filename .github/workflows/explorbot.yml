@@ -1,165 +1,165 @@
 name: Explorbot Groq
 
 on:
-  workflow_dispatch:
+workflow_dispatch:
 
 permissions:
-  contents: read
+contents: read
 
 jobs:
-  explorbot:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+explorbot:
+runs-on: ubuntu-latest
+timeout-minutes: 20
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: npm
+```
+steps:
+  - name: Checkout
+    uses: actions/checkout@v4
 
-      - name: Install Explorbot
-        run: |
-          npm install explorbot @ai-sdk/groq
-          npx playwright install --with-deps chromium
+  - name: Setup Node.js
+    uses: actions/setup-node@v4
+    with:
+      node-version: 24
+      cache: npm
 
-      - name: Check Groq API key
-        env:
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-        run: |
-          if [ -z "$GROQ_API_KEY" ]; then
-            echo "ERROR: GROQ_API_KEY is missing"
-            exit 1
-          fi
+  - name: Install Explorbot
+    run: |
+      npm install explorbot @ai-sdk/groq
+      npx playwright install --with-deps chromium
 
-          echo "GROQ_API_KEY is present"
+  - name: Check Groq API key
+    env:
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+    run: |
+      if [ -z "$GROQ_API_KEY" ]; then
+        echo "ERROR: GROQ_API_KEY is missing"
+        exit 1
+      fi
 
-      - name: Create Explorbot config
-        env:
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-        run: |
-          cat > explorbot.config.js <<'EOF'
-          import { createGroq } from '@ai-sdk/groq';
+      echo "GROQ_API_KEY is present"
 
-          const groq = createGroq({
-            apiKey: process.env.GROQ_API_KEY,
-          });
+  - name: Create Explorbot config
+    env:
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+    run: |
+      cat > explorbot.config.js <<'EOF'
+      import { createGroq } from '@ai-sdk/groq';
 
-          export default {
-            web: {
-              url: 'https://odjafrik.com',
-            },
+      const groq = createGroq({
+        apiKey: process.env.GROQ_API_KEY,
+      });
 
-            ai: {
+      export default {
+        web: {
+          url: 'https://odjafrik.com',
+        },
+
+        ai: {
+          model: groq('openai/gpt-oss-20b'),
+          visionModel: groq('meta-llama/llama-4-scout-17b-16e-instruct'),
+
+          agents: {
+            planner: {
               model: groq('openai/gpt-oss-20b'),
-              visionModel: groq('meta-llama/llama-4-scout-17b-16e-instruct'),
-
-              agents: {
-                planner: {
-                  model: groq('openai/gpt-oss-20b'),
-                },
-
-                tester: {
-                  model: groq('openai/gpt-oss-20b'),
-                },
-
-                researcher: {
-                  model: groq('openai/gpt-oss-20b'),
-                },
-
-                navigator: {
-                  model: groq('openai/gpt-oss-20b'),
-                },
-
-                pilot: {
-                  model: groq('openai/gpt-oss-20b'),
-                },
-
-                historian: {
-                  model: groq('openai/gpt-oss-20b'),
-                },
-
-                analyst: {
-                  model: groq('openai/gpt-oss-20b'),
-                },
-
-                experience-compactor: {
-                  model: groq('openai/gpt-oss-20b'),
-                },
-              },
             },
 
-            playwright: {
-              show: false,
-
-              timeout: 30000,
-
-              waitForNavigation: 'domcontentloaded',
-
-              args: [
-                '--no-sandbox',
-                '--disable-gpu',
-                '--disable-dev-shm-usage',
-              ],
+            tester: {
+              model: groq('openai/gpt-oss-20b'),
             },
 
-            reporter: {
-              markdown: true,
-              html: true,
+            researcher: {
+              model: groq('openai/gpt-oss-20b'),
             },
 
-            dirs: {
-              output: 'output',
+            navigator: {
+              model: groq('openai/gpt-oss-20b'),
             },
-          };
-          EOF
 
-          echo "Explorbot configuration:"
-          cat explorbot.config.js
+            pilot: {
+              model: groq('openai/gpt-oss-20b'),
+            },
 
-      - name: Run Explorbot
-        env:
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-        run: |
-          echo "Starting Explorbot with Groq..."
-          echo "Model: openai/gpt-oss-20b"
-          echo "Target: https://odjafrik.com"
-          echo "Maximum tests: 3"
-          echo "Maximum duration: 10 minutes"
+            historian: {
+              model: groq('openai/gpt-oss-20b'),
+            },
 
-          npx explorbot explore / \
-            --max-tests 3 \
-            --max-duration 10
+            analyst: {
+              model: groq('openai/gpt-oss-20b'),
+            },
 
-      - name: Show generated files
-        if: always()
-        run: |
-          echo "===== OUTPUT FILES ====="
+            'experience-compactor': {
+              model: groq('openai/gpt-oss-20b'),
+            },
+          },
+        },
 
-          if [ -d output ]; then
-            find output -type f -printf '%p\n' | sort
-          else
-            echo "No output directory found."
-          fi
+        playwright: {
+          show: false,
+          timeout: 30000,
+          waitForNavigation: 'domcontentloaded',
 
-          echo ""
-          echo "===== SCREENCASTS ====="
+          args: [
+            '--no-sandbox',
+            '--disable-gpu',
+            '--disable-dev-shm-usage',
+          ],
+        },
 
-          if [ -d output/screencasts ]; then
-            find output/screencasts -type f -printf '%p\n' | sort
-          else
-            echo "No screencasts directory found."
-          fi
+        reporter: {
+          markdown: true,
+          html: true,
+        },
 
-      - name: Upload Explorbot results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: explorbot-groq-results
-          path: |
-            output/
-            explorbot.config.js
-          if-no-files-found: warn
-          retention-days: 14
+        dirs: {
+          output: 'output',
+        },
+      };
+      EOF
+
+      echo "Explorbot configuration created successfully."
+
+  - name: Run Explorbot
+    env:
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+    run: |
+      echo "Starting Explorbot with Groq..."
+      echo "Model: openai/gpt-oss-20b"
+      echo "Target: https://odjafrik.com"
+      echo "Maximum tests: 3"
+      echo "Maximum duration: 10 minutes"
+
+      npx explorbot explore / \
+        --max-tests 3 \
+        --max-duration 10
+
+  - name: Show generated files
+    if: always()
+    run: |
+      echo "===== OUTPUT FILES ====="
+
+      if [ -d output ]; then
+        find output -type f -printf '%p\n' | sort
+      else
+        echo "No output directory found."
+      fi
+
+      echo ""
+      echo "===== SCREENCASTS ====="
+
+      if [ -d output/screencasts ]; then
+        find output/screencasts -type f -printf '%p\n' | sort
+      else
+        echo "No screencasts directory found."
+      fi
+
+  - name: Upload Explorbot results
+    if: always()
+    uses: actions/upload-artifact@v4
+    with:
+      name: explorbot-groq-results
+      path: |
+        output/
+        explorbot.config.js
+      if-no-files-found: warn
+      retention-days: 14
+```
