@@ -102,7 +102,13 @@ jobs:
                 tester: { model },
                 navigator: { model },
                 pilot: { model },
-                historian: { model },
+                historian: {
+                  model,
+                  screencast: {
+                    size: { width: 1280, height: 720 },
+                    quality: 95,
+                  },
+                },
                 analyst: { model },
                 'experience-compactor': { model },
               },
