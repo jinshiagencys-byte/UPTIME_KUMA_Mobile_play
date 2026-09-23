@@ -13,9 +13,9 @@ jobs:
 
     # Pour changer de fournisseur, modifie uniquement ces 3 lignes
     env:
-      LLM_API_KEY: ${{ secrets.ATRIA_API_KEY }}
-      LLM_BASE_URL: https://api.atria-asi.ai/v1
-      LLM_MODEL: Atria-Dawn-Preview
+      LLM_API_KEY: ${{ secrets.XKIRO_API_KEY }}
+      LLM_BASE_URL: https://api.xkiro.com/v1
+      LLM_MODEL: qwen/qwen3.8-max:free
 
     steps:
       - name: Checkout
