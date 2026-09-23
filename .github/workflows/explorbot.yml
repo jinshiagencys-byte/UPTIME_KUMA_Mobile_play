@@ -28,23 +28,23 @@ jobs:
         env:
           OLLAMA_API_KEY: ${{ secrets.OLLAMA_TOKEN }}
         run: |
-          if [ -z "$OLLAMA_TOKEN" ]; then
-            echo "ERROR: OLLAMA_TOKEN is missing"
+          if [ -z "$OLLAMA_API_KEY" ]; then
+            echo "ERROR: OLLAMA_API_KEY is missing"
             exit 1
           fi
 
-          echo "OLLAMA_TOKEN is present"
+          echo "OLLAMA_API_KEY is present"
 
       - name: Verify Ollama Cloud connection
         env:
-          OLLAMA_TOKEN: ${{ secrets.OLLAMA_TOKEN }}
+          OLLAMA_API_KEY: ${{ secrets.OLLAMA_TOKEN }}
         run: |
           echo "Testing Ollama Cloud..."
 
           RESPONSE=$(curl -sS \
             https://ollama.com/api/chat \
             -H "Content-Type: application/json" \
-            -H "Authorization: Bearer $OLLAMA_TOKEN" \
+            -H "Authorization: Bearer $OLLAMA_API_KEY" \
             -d '{
               "model": "gemma4:31b",
               "messages": [
@@ -67,7 +67,7 @@ jobs:
 
       - name: Create Explorbot config
         env:
-          OLLAMA_TOKEN: ${{ secrets.OLLAMA_TOKEN }}
+          OLLAMA_API_KEY: ${{ secrets.OLLAMA_TOKEN }}
         run: |
           cat > explorbot.config.js <<'EOF'
           import { createOllama } from 'ollama-ai-provider-v2';
@@ -75,7 +75,7 @@ jobs:
           const ollamaCloud = createOllama({
             baseURL: 'https://ollama.com/api',
             headers: {
-              Authorization: `Bearer ${process.env.OLLAMA_TOKEN}`,
+              Authorization: `Bearer ${process.env.OLLAMA_API_KEY}`,
             },
           });
 
