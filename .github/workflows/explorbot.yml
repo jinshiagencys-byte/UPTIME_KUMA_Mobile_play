@@ -12,10 +12,11 @@ jobs:
     timeout-minutes: 30
 
     # Pour changer de fournisseur, modifie uniquement ces 3 lignes
+    # (LLM_BASE_URL sans slash final, LLM_MODEL sans prefixe "gemini/")
     env:
       LLM_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
       LLM_BASE_URL: https://generativelanguage.googleapis.com/v1beta/openai
-      LLM_MODEL: gemini/gemini-3.1-flash-lite
+      LLM_MODEL: gemini-3.1-flash-lite
 
     steps:
       - name: Checkout
@@ -44,7 +45,8 @@ jobs:
         run: |
           echo "Testing $LLM_MODEL (simple call)..."
 
-          RESPONSE=$(curl -sS -w "\nTemps: %{time_total}s\n" \
+          HTTP=$(curl -sS -o /tmp/resp.json \
+            -w "%{http_code} en %{time_total}s" \
             "$LLM_BASE_URL/chat/completions" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer $LLM_API_KEY" \
@@ -59,10 +61,16 @@ jobs:
               \"max_tokens\": 500
             }")
 
-          echo "$RESPONSE"
+          echo "HTTP: $HTTP"
+          cat /tmp/resp.json
+          echo ""
 
-          if echo "$RESPONSE" | grep -q '"error"'; then
-            echo "ERROR: the API rejected the request."
+          if [ "${HTTP%% *}" != "200" ]; then
+            echo "ERROR: the API did not return HTTP 200."
+            echo "Available models:"
+            curl -sS "$LLM_BASE_URL/models" \
+              -H "Authorization: Bearer $LLM_API_KEY" | head -c 3000
+            echo ""
             exit 1
           fi
 
@@ -72,7 +80,8 @@ jobs:
         run: |
           echo "Testing forced tool calling..."
 
-          RESPONSE=$(curl -sS -w "\nTemps: %{time_total}s\n" \
+          HTTP=$(curl -sS -o /tmp/resp_tool.json \
+            -w "%{http_code} en %{time_total}s" \
             "$LLM_BASE_URL/chat/completions" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer $LLM_API_KEY" \
@@ -99,11 +108,13 @@ jobs:
               ],
               \"tool_choice\": \"required\",
               \"max_tokens\": 500
-            }")
+            }") || true
 
-          echo "$RESPONSE"
+          echo "HTTP: $HTTP"
+          cat /tmp/resp_tool.json
+          echo ""
 
-          if echo "$RESPONSE" | grep -q '"tool_calls"'; then
+          if grep -q '"tool_calls"' /tmp/resp_tool.json; then
             echo "Tool calling OK."
           else
             echo "WARNING: no tool call returned, Explorbot may struggle with this model."
