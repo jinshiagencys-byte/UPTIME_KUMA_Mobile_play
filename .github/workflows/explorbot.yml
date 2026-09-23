@@ -54,7 +54,7 @@ jobs:
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer $OMNIROUTE_API_KEY" \
             -d '{
-              "model": "kr/claude-haiku-4.5",
+              "model": "cl/deepseek/deepseek-v4-flash",
               "messages": [
                 {
                   "role": "user",
@@ -84,7 +84,7 @@ jobs:
             apiKey: process.env.OMNIROUTE_API_KEY,
           });
 
-          const model = omniroute('kr/claude-haiku-4.5');
+          const model = omniroute('cl/deepseek/deepseek-v4-flash');
 
           export default {
             web: {
@@ -139,7 +139,7 @@ jobs:
           echo "========================================"
           echo "Starting Explorbot"
           echo "Provider: OmniRoute"
-          echo "Model: kr/claude-haiku-4.5"
+          echo "Model: cl/deepseek/deepseek-v4-flash"
           echo "Target: https://odjafrik.com"
           echo "Maximum tests: 7"
           echo "Maximum duration: 900"
@@ -177,7 +177,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: explorbot-omniroute-haiku
+          name: explorbot-omniroute-deepseek
           path: |
             output/
             explorbot.config.js
