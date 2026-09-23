@@ -381,6 +381,26 @@ title = await evaluate('document.title')
 print(title)
 ```
 
+REGLES DE GUILLEMETS (CRITIQUE : cause la PLUPART des erreurs de syntaxe qui te font perdre
+des etapes) :
+- Dans evaluate(), utilise TOUJOURS des guillemets DOUBLES Python autour de la chaine JS et
+  des guillemets SIMPLES a l'interieur du JS (ou l'inverse), JAMAIS le meme type des deux
+  cotes : evaluate("document.querySelector('.foo').innerText") est correct.
+  evaluate('document.querySelector(\'.foo\')...') est INTERDIT (echappement fragile,
+  cause des "unterminated string literal").
+- Si le JS a besoin de guillemets ET que la chaine Python en a deja, utilise un template
+  literal JS (backticks) pour la partie interne : evaluate("document.querySelector(`.foo`)").
+- N'utilise JAMAIS de selecteur CSS contenant un caractere special echappe (ex. classes
+  Tailwind du type ".md\\:col-span-2" ou ".hover\\:bg-red-500") : le double echappement
+  Python+JS+CSS est la cause la plus frequente d'erreur. Prefere une correspondance partielle
+  sans echappement : document.querySelectorAll('[class*="col-span-2"]') ou
+  document.querySelectorAll('[class*="product-card"]').
+- Garde chaque evaluate() COURT (une seule expression). Si tu as besoin de plusieurs etapes
+  (trouver un element, puis lire son texte), fais-le en deux appels evaluate() separes plutot
+  qu'une seule ligne JS complexe avec plusieurs niveaux de guillemets imbriques.
+- Avant d'ecrire une ligne avec plus de 2 niveaux de guillemets imbriques, REFORMULE-la pour
+  en avoir moins, meme si c'est plus verbeux.
+
 BUDGET : __MAX_STEPS__ etapes au total.
 - Etapes 1 a __TEST_STEPS__ : tester.
 - A partir de l'etape __DONE_STEP__ : appelle done() avec ce que tu as observe, meme incomplet.
