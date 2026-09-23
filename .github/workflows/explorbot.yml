@@ -1,122 +1,119 @@
 name: Explorbot OpenRouter
 
 on:
-workflow_dispatch:
+  workflow_dispatch:
 
 permissions:
-contents: read
+  contents: read
 
 jobs:
-explore:
-runs-on: ubuntu-latest
-timeout-minutes: 30
+  explore:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-```
-steps:
-  - name: Checkout
-    uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
 
-  - name: Setup Node
-    uses: actions/setup-node@v4
-    with:
-      node-version: "24"
+      - name: Install Explorbot
+        run: |
+          npm install explorbot @openrouter/ai-sdk-provider
+          npx playwright install --with-deps chromium
 
-  - name: Install Explorbot
-    run: |
-      npm install explorbot @openrouter/ai-sdk-provider
-      npx playwright install --with-deps chromium
+      - name: Check OpenRouter secret
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          set -e
 
-  - name: Check OpenRouter secret
-    env:
-      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-    run: |
-      set -e
+          if [ -z "$OPENROUTER_API_KEY" ]; then
+            echo "OPENROUTER_API_KEY is missing"
+            exit 1
+          fi
 
-      if [ -z "$OPENROUTER_API_KEY" ]; then
-        echo "OPENROUTER_API_KEY is missing"
-        exit 1
-      fi
+          echo "OpenRouter API key is present"
 
-      echo "OpenRouter API key is present"
+      - name: Create Explorbot config
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          cat > explorbot.config.js <<'EOF'
+          import { createOpenRouter } from '@openrouter/ai-sdk-provider';
 
-  - name: Create Explorbot config
-    env:
-      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-    run: |
-      cat > explorbot.config.js <<'EOF'
-      import { createOpenRouter } from '@openrouter/ai-sdk-provider';
+          const openrouter = createOpenRouter({
+            apiKey: process.env.OPENROUTER_API_KEY,
+          });
 
-      const openrouter = createOpenRouter({
-        apiKey: process.env.OPENROUTER_API_KEY,
-      });
+          export default {
+            web: {
+              url: 'https://odjafrik.com',
+            },
 
-      export default {
-        web: {
-          url: 'https://odjafrik.com',
-        },
+            ai: {
+              model: openrouter('openrouter/free'),
+              visionModel: openrouter('openrouter/free'),
+              agenticModel: openrouter('openrouter/free'),
+            },
 
-        ai: {
-          model: openrouter('openrouter/free'),
-          visionModel: openrouter('openrouter/free'),
-          agenticModel: openrouter('openrouter/free'),
-        },
+            playwright: {
+              browser: 'chromium',
+              show: false,
+              timeout: 30000,
+              waitForNavigation: 'networkidle',
+              waitForTimeout: 2000,
+              args: [
+                '--no-sandbox',
+                '--disable-gpu',
+                '--disable-dev-shm-usage',
+              ],
+            },
 
-        playwright: {
-          browser: 'chromium',
-          show: false,
-          timeout: 30000,
-          waitForNavigation: 'networkidle',
-          waitForTimeout: 2000,
-          args: [
-            '--no-sandbox',
-            '--disable-gpu',
-            '--disable-dev-shm-usage',
-          ],
-        },
+            reporter: {
+              markdown: true,
+              html: true,
+            },
 
-        reporter: {
-          markdown: true,
-          html: true,
-        },
+            dirs: {
+              output: 'output',
+            },
+          };
+          EOF
 
-        dirs: {
-          output: 'output',
-        },
-      };
-      EOF
+      - name: Check Explorbot configuration
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          set -e
 
-  - name: Check Explorbot configuration
-    env:
-      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-    run: |
-      set -e
+          echo "===== EXPLORBOT CONFIG ====="
+          npx explorbot config --json
 
-      echo "===== EXPLORBOT CONFIG ====="
-      npx explorbot config --json
+          echo "===== RECOMMENDED MODELS ====="
+          npx explorbot recommended-models --json
 
-      echo "===== RECOMMENDED MODELS ====="
-      npx explorbot recommended-models --json
+      - name: Run Explorbot
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          set -e
 
-  - name: Run Explorbot
-    env:
-      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-    run: |
-      set -e
+          npx explorbot explore / --max-tests 3
 
-      npx explorbot explore / --max-tests 3
+      - name: Show generated files
+        if: always()
+        run: |
+          echo "===== OUTPUT ====="
+          find output -type f 2>/dev/null || true
 
-  - name: Show generated files
-    if: always()
-    run: |
-      echo "===== OUTPUT ====="
-      find output -type f 2>/dev/null || true
-
-  - name: Upload Explorbot results
-    if: always()
-    uses: actions/upload-artifact@v4
-    with:
-      name: explorbot-openrouter-${{ github.run_id }}
-      path: output/
-      if-no-files-found: warn
-      retention-days: 14
-```
+      - name: Upload Explorbot results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: explorbot-openrouter-${{ github.run_id }}
+          path: output/
+          if-no-files-found: warn
+          retention-days: 14
