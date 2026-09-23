@@ -1,4 +1,4 @@
-name: Explorbot UnoRouter
+name: Explorbot Ollama Cloud
 
 on:
   workflow_dispatch:
@@ -21,70 +21,65 @@ jobs:
 
       - name: Install Explorbot
         run: |
-          npm install explorbot @ai-sdk/openai
+          npm install explorbot ollama-ai-provider-v2
           npx playwright install --with-deps chromium
 
-      - name: Show Explorbot CLI help (diagnostic)
-        run: |
-          echo "===== explorbot --help ====="
-          npx explorbot --help || true
-          echo ""
-          echo "===== explorbot explore --help ====="
-          npx explorbot explore --help || true
-
-      - name: Check UnoRouter API key
+      - name: Check Ollama API key
         env:
-          UNOROUTER_API_KEY: ${{ secrets.UNOROUTER_API_KEY }}
+          OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
         run: |
-          if [ -z "$UNOROUTER_API_KEY" ]; then
-            echo "ERROR: UNOROUTER_API_KEY is missing"
+          if [ -z "$OLLAMA_API_KEY" ]; then
+            echo "ERROR: OLLAMA_API_KEY is missing"
             exit 1
           fi
 
-          echo "UNOROUTER_API_KEY is present"
+          echo "OLLAMA_API_KEY is present"
 
-      - name: Verify UnoRouter connection
+      - name: Verify Ollama Cloud connection
         env:
-          UNOROUTER_API_KEY: ${{ secrets.UNOROUTER_API_KEY }}
+          OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
         run: |
-          echo "Testing UnoRouter..."
+          echo "Testing Ollama Cloud..."
 
           RESPONSE=$(curl -sS \
-            https://api.unorouter.com/v1/chat/completions \
+            https://ollama.com/api/chat \
             -H "Content-Type: application/json" \
-            -H "Authorization: Bearer $UNOROUTER_API_KEY" \
+            -H "Authorization: Bearer $OLLAMA_API_KEY" \
             -d '{
-              "model": "glm-5.3-flash:free",
+              "model": "gemma4:31b",
               "messages": [
                 {
                   "role": "user",
                   "content": "Réponds uniquement par: OK"
                 }
-              ]
+              ],
+              "stream": false
             }')
 
           echo "$RESPONSE"
 
           if echo "$RESPONSE" | grep -q '"error"'; then
-            echo "ERROR: UnoRouter rejected the request."
+            echo "ERROR: Ollama Cloud rejected the request."
             exit 1
           fi
 
-          echo "UnoRouter connection OK."
+          echo "Ollama Cloud connection OK."
 
       - name: Create Explorbot config
         env:
-          UNOROUTER_API_KEY: ${{ secrets.UNOROUTER_API_KEY }}
+          OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
         run: |
           cat > explorbot.config.js <<'EOF'
-          import { createOpenAI } from '@ai-sdk/openai';
+          import { createOllama } from 'ollama-ai-provider-v2';
 
-          const unorouter = createOpenAI({
-            apiKey: process.env.UNOROUTER_API_KEY,
-            baseURL: 'https://api.unorouter.com/v1',
+          const ollamaCloud = createOllama({
+            baseURL: 'https://ollama.com/api',
+            headers: {
+              Authorization: `Bearer ${process.env.OLLAMA_API_KEY}`,
+            },
           });
 
-          const model = unorouter('glm-5.3-flash:free');
+          const model = ollamaCloud('gemma4:31b');
 
           export default {
             web: {
@@ -156,20 +151,20 @@ jobs:
 
       - name: Run Explorbot
         env:
-          UNOROUTER_API_KEY: ${{ secrets.UNOROUTER_API_KEY }}
+          OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
         run: |
           echo "========================================"
           echo "Starting Explorbot"
-          echo "Provider: UnoRouter"
-          echo "Model: glm-5.3-flash:free"
+          echo "Provider: Ollama Cloud"
+          echo "Model: gemma4:31b"
           echo "Target: https://odjafrik.com"
           echo "Maximum tests: 3"
-          echo "Maximum duration: 900 (check help output above for unit)"
+          echo "Maximum duration: 300"
           echo "========================================"
 
           npx explorbot explore https://odjafrik.com \
             --max-tests 3 \
-            --max-duration 900
+            --max-duration 300
 
       - name: Show results
         if: always()
@@ -199,7 +194,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: explorbot-unorouter-glm53
+          name: explorbot-ollama-gemma4
           path: |
             output/
             explorbot.config.js
