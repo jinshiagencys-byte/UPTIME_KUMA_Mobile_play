@@ -1,146 +1,122 @@
-name: Explorbot Cloudflare
+name: Explorbot OpenRouter
 
 on:
-  workflow_dispatch:
+workflow_dispatch:
 
 permissions:
-  contents: read
+contents: read
 
 jobs:
-  explore:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+explore:
+runs-on: ubuntu-latest
+timeout-minutes: 30
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: "24"
+```
+steps:
+  - name: Checkout
+    uses: actions/checkout@v4
 
-      - name: Install Explorbot
-        run: |
-          npm install explorbot @ai-sdk/openai
-          npx playwright install --with-deps chromium
+  - name: Setup Node
+    uses: actions/setup-node@v4
+    with:
+      node-version: "24"
 
-      - name: Check Cloudflare secrets
-        env:
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          CLOUDFLARE_AUTH_TOKEN: ${{ secrets.CLOUDFLARE_AUTH_TOKEN }}
-        run: |
-          set -e
+  - name: Install Explorbot
+    run: |
+      npm install explorbot @openrouter/ai-sdk-provider
+      npx playwright install --with-deps chromium
 
-          if [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
-            echo "CLOUDFLARE_ACCOUNT_ID is missing"
-            exit 1
-          fi
+  - name: Check OpenRouter secret
+    env:
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+    run: |
+      set -e
 
-          if [ -z "$CLOUDFLARE_AUTH_TOKEN" ]; then
-            echo "CLOUDFLARE_AUTH_TOKEN is missing"
-            exit 1
-          fi
+      if [ -z "$OPENROUTER_API_KEY" ]; then
+        echo "OPENROUTER_API_KEY is missing"
+        exit 1
+      fi
 
-          echo "Cloudflare secrets are present"
+      echo "OpenRouter API key is present"
 
-      - name: Create Explorbot config
-        env:
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          CLOUDFLARE_AUTH_TOKEN: ${{ secrets.CLOUDFLARE_AUTH_TOKEN }}
-        run: |
-          cat > explorbot.config.js <<'EOF'
-          import { createOpenAI } from '@ai-sdk/openai';
+  - name: Create Explorbot config
+    env:
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+    run: |
+      cat > explorbot.config.js <<'EOF'
+      import { createOpenRouter } from '@openrouter/ai-sdk-provider';
 
-          const cloudflare = createOpenAI({
-            apiKey: process.env.CLOUDFLARE_AUTH_TOKEN,
-            baseURL: `https://api.cloudflare.com/client/v4/accounts/${process.env.CLOUDFLARE_ACCOUNT_ID}/ai/v1`,
-          });
+      const openrouter = createOpenRouter({
+        apiKey: process.env.OPENROUTER_API_KEY,
+      });
 
-          const model = cloudflare('@cf/zai-org/glm-4.7-flash');
+      export default {
+        web: {
+          url: 'https://odjafrik.com',
+        },
 
-          export default {
-            web: {
-              url: 'https://odjafrik.com',
-            },
+        ai: {
+          model: openrouter('openrouter/free'),
+          visionModel: openrouter('openrouter/free'),
+          agenticModel: openrouter('openrouter/free'),
+        },
 
-            ai: {
-              model,
-              agenticModel: model,
+        playwright: {
+          browser: 'chromium',
+          show: false,
+          timeout: 30000,
+          waitForNavigation: 'networkidle',
+          waitForTimeout: 2000,
+          args: [
+            '--no-sandbox',
+            '--disable-gpu',
+            '--disable-dev-shm-usage',
+          ],
+        },
 
-              agents: {
-                historian: {
-                  framework: 'playwright',
-                  screencast: true,
-                },
-              },
-            },
+        reporter: {
+          markdown: true,
+          html: true,
+        },
 
-            playwright: {
-              browser: 'chromium',
-              show: false,
-              timeout: 30000,
-              waitForNavigation: 'networkidle',
-              waitForTimeout: 2000,
-              args: [
-                '--no-sandbox',
-                '--disable-gpu',
-                '--disable-dev-shm-usage',
-              ],
-            },
+        dirs: {
+          output: 'output',
+        },
+      };
+      EOF
 
-            reporter: {
-              markdown: true,
-              html: true,
-            },
+  - name: Check Explorbot configuration
+    env:
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+    run: |
+      set -e
 
-            dirs: {
-              output: 'output',
-            },
-          };
-          EOF
+      echo "===== EXPLORBOT CONFIG ====="
+      npx explorbot config --json
 
-      - name: Test GLM 4.7 Flash
-        env:
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          CLOUDFLARE_AUTH_TOKEN: ${{ secrets.CLOUDFLARE_AUTH_TOKEN }}
-        run: |
-          set -e
+      echo "===== RECOMMENDED MODELS ====="
+      npx explorbot recommended-models --json
 
-          curl --fail-with-body \
-            -X POST \
-            "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/v1/chat/completions" \
-            -H "Authorization: Bearer ${CLOUDFLARE_AUTH_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d '{
-              "model": "@cf/zai-org/glm-4.7-flash",
-              "messages": [
-                {
-                  "role": "user",
-                  "content": "Say exactly CLOUDFLARE_OK"
-                }
-              ],
-              "max_tokens": 20
-            }'
+  - name: Run Explorbot
+    env:
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+    run: |
+      set -e
 
-      - name: Run Explorbot
-        env:
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          CLOUDFLARE_AUTH_TOKEN: ${{ secrets.CLOUDFLARE_AUTH_TOKEN }}
-        run: |
-          set -e
-          npx explorbot explore / --max-tests 3
+      npx explorbot explore / --max-tests 3
 
-      - name: Show generated files
-        if: always()
-        run: |
-          echo "===== OUTPUT ====="
-          find output -type f 2>/dev/null || true
+  - name: Show generated files
+    if: always()
+    run: |
+      echo "===== OUTPUT ====="
+      find output -type f 2>/dev/null || true
 
-      - name: Upload Explorbot results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: explorbot-cloudflare-${{ github.run_id }}
-          path: output/
-          if-no-files-found: warn
-          retention-days: 14
+  - name: Upload Explorbot results
+    if: always()
+    uses: actions/upload-artifact@v4
+    with:
+      name: explorbot-openrouter-${{ github.run_id }}
+      path: output/
+      if-no-files-found: warn
+      retention-days: 14
+```
