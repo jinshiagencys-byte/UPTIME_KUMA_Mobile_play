@@ -49,12 +49,12 @@ steps:
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       CLOUDFLARE_AUTH_TOKEN: ${{ secrets.CLOUDFLARE_AUTH_TOKEN }}
     run: |
-      cat > explorbot.config.js <<EOF
+      cat > explorbot.config.js <<'EOF'
       import { createOpenAI } from '@ai-sdk/openai';
 
       const cloudflare = createOpenAI({
         apiKey: process.env.CLOUDFLARE_AUTH_TOKEN,
-        baseURL: 'https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/v1',
+        baseURL: `https://api.cloudflare.com/client/v4/accounts/${process.env.CLOUDFLARE_ACCOUNT_ID}/ai/v1`,
       });
 
       const model = cloudflare('@cf/zai-org/glm-4.7-flash');
@@ -129,7 +129,6 @@ steps:
       CLOUDFLARE_AUTH_TOKEN: ${{ secrets.CLOUDFLARE_AUTH_TOKEN }}
     run: |
       set -e
-
       npx explorbot explore / --max-tests 3
 
   - name: Show generated files
@@ -146,4 +145,3 @@ steps:
       path: output/
       if-no-files-found: warn
       retention-days: 14
-```
