@@ -14,7 +14,7 @@ jobs:
     # Pour changer de fournisseur, modifie uniquement ces 3 lignes
     env:
       LLM_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-      LLM_BASE_URL: https://generativelanguage.googleapis.com/v1beta/openai/
+      LLM_BASE_URL: https://generativelanguage.googleapis.com/v1beta/openai
       LLM_MODEL: gemini/gemini-3.1-flash-lite
 
     steps:
