@@ -1,4 +1,4 @@
-name: Explorbot TokenHarbor
+name: Explorbot LLM
 
 on:
   workflow_dispatch:
@@ -11,10 +11,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
+    # Pour changer de fournisseur, modifie uniquement ces 3 lignes
     env:
-      TOKENHARBOR_API_KEY: ${{ secrets.TOKENHARBOR_API_KEY }}
-      TOKENHARBOR_BASE_URL: https://tokenharbor.ai/v1
-      TOKENHARBOR_MODEL: deepseek-v4.1-flash:free
+      LLM_API_KEY: ${{ secrets.ATRIA_API_KEY }}
+      LLM_BASE_URL: https://api.atria-asi.ai/v1
+      LLM_MODEL: Atria-Dawn-Preview
 
     steps:
       - name: Checkout
@@ -30,53 +31,53 @@ jobs:
           npm install explorbot @ai-sdk/openai-compatible
           npx playwright install --with-deps chromium
 
-      - name: Check TokenHarbor API key
+      - name: Check API key
         run: |
-          if [ -z "$TOKENHARBOR_API_KEY" ]; then
-            echo "ERROR: TOKENHARBOR_API_KEY is missing"
+          if [ -z "$LLM_API_KEY" ]; then
+            echo "ERROR: API key secret is missing"
             exit 1
           fi
 
-          echo "TOKENHARBOR_API_KEY is present"
+          echo "API key is present"
 
-      - name: Verify TokenHarbor connection
+      - name: Verify LLM connection
         run: |
-          echo "Testing TokenHarbor (simple call)..."
+          echo "Testing $LLM_MODEL (simple call)..."
 
           RESPONSE=$(curl -sS -w "\nTemps: %{time_total}s\n" \
-            "$TOKENHARBOR_BASE_URL/chat/completions" \
+            "$LLM_BASE_URL/chat/completions" \
             -H "Content-Type: application/json" \
-            -H "Authorization: Bearer $TOKENHARBOR_API_KEY" \
+            -H "Authorization: Bearer $LLM_API_KEY" \
             -d "{
-              \"model\": \"$TOKENHARBOR_MODEL\",
+              \"model\": \"$LLM_MODEL\",
               \"messages\": [
                 {
                   \"role\": \"user\",
                   \"content\": \"Réponds uniquement par: OK\"
                 }
               ],
-              \"max_tokens\": 50
+              \"max_tokens\": 500
             }")
 
           echo "$RESPONSE"
 
           if echo "$RESPONSE" | grep -q '"error"'; then
-            echo "ERROR: TokenHarbor rejected the request."
+            echo "ERROR: the API rejected the request."
             exit 1
           fi
 
-          echo "TokenHarbor connection OK."
+          echo "LLM connection OK."
 
       - name: Verify tool calling (informational)
         run: |
           echo "Testing forced tool calling..."
 
           RESPONSE=$(curl -sS -w "\nTemps: %{time_total}s\n" \
-            "$TOKENHARBOR_BASE_URL/chat/completions" \
+            "$LLM_BASE_URL/chat/completions" \
             -H "Content-Type: application/json" \
-            -H "Authorization: Bearer $TOKENHARBOR_API_KEY" \
+            -H "Authorization: Bearer $LLM_API_KEY" \
             -d "{
-              \"model\": \"$TOKENHARBOR_MODEL\",
+              \"model\": \"$LLM_MODEL\",
               \"messages\": [
                 {
                   \"role\": \"user\",
@@ -97,7 +98,7 @@ jobs:
                 }
               ],
               \"tool_choice\": \"required\",
-              \"max_tokens\": 100
+              \"max_tokens\": 500
             }")
 
           echo "$RESPONSE"
@@ -113,13 +114,13 @@ jobs:
           cat > explorbot.config.js <<'EOF'
           import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
 
-          const tokenharbor = createOpenAICompatible({
-            name: 'tokenharbor',
-            baseURL: process.env.TOKENHARBOR_BASE_URL,
-            apiKey: process.env.TOKENHARBOR_API_KEY,
+          const provider = createOpenAICompatible({
+            name: 'llm',
+            baseURL: process.env.LLM_BASE_URL,
+            apiKey: process.env.LLM_API_KEY,
           });
 
-          const model = tokenharbor(process.env.TOKENHARBOR_MODEL);
+          const model = provider(process.env.LLM_MODEL);
 
           export default {
             web: {
@@ -173,8 +174,7 @@ jobs:
         run: |
           echo "========================================"
           echo "Starting Explorbot"
-          echo "Provider: TokenHarbor"
-          echo "Model: $TOKENHARBOR_MODEL"
+          echo "Model: $LLM_MODEL"
           echo "Target: https://odjafrik.com"
           echo "Maximum tests: 3"
           echo "Maximum duration: 600"
@@ -212,7 +212,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: explorbot-tokenharbor-deepseek
+          name: explorbot-results
           path: |
             output/
             explorbot.config.js
