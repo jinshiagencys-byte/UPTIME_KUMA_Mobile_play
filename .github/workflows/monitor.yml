@@ -204,28 +204,32 @@ jobs:
           curl -sS --retry 3 -X POST "$RELAY_URL/sites/$SITE_ID/mark-crawled" \
             -H "x-relay-secret: $RELAY_SECRET" -H "Content-Type: application/json" -d @status_payload.json
 
-      - name: Compresser la vidéo (preview mobile)
-        if: always()
-        run: |
-          set +e
-          FOUND=$(ls recordings/*.mp4 2>/dev/null | head -n 1)
-          if [ -z "$FOUND" ]; then
-            echo "Aucune vidéo trouvée dans recordings/ — étape ignorée"
-            exit 0
-          fi
-          echo "Vidéo source : $FOUND ($(du -h "$FOUND" | cut -f1))"
-          ffmpeg -y -i "$FOUND" \
-            -vf "scale=640:-2" -c:v libx264 -crf 30 -preset veryfast \
-            -movflags +faststart -an \
-            recordings-preview/preview.mp4
-          ffmpeg -y -ss 1 -i "$FOUND" -vframes 1 \
-            recordings-preview/thumb.jpg
-          if [ -f recordings-preview/preview.mp4 ]; then
-            echo "Preview générée : $(du -h recordings-preview/preview.mp4 | cut -f1)"
-          else
-            echo "Échec de la compression ffmpeg"
-          fi
-
+            - name: Compresser la vidéo (preview mobile)
+              if: always()
+              run: |
+                set +e
+                FOUND=$(ls recordings/*.mp4 2>/dev/null | head -n 1)
+                if [ -z "$FOUND" ]; then
+                  echo "Aucune vidéo trouvée dans recordings/ — étape ignorée"
+                  exit 0
+                fi
+                echo "Vidéo source : $FOUND ($(du -h "$FOUND" | cut -f1))"
+                ffmpeg -y -i "$FOUND" \
+                  -vf "scale=640:-2" -c:v libx264 -crf 30 -preset veryfast \
+                  -movflags +faststart -an \
+                  recordings-preview/preview.mp4
+                ffmpeg -y -ss 1 -i "$FOUND" -frames:v 1 -update 1 \
+                  recordings-preview/thumb.jpg
+                if [ -f recordings-preview/preview.mp4 ]; then
+                  echo "Preview générée : $(du -h recordings-preview/preview.mp4 | cut -f1)"
+                else
+                  echo "Échec de la compression ffmpeg"
+                fi
+                if [ -f recordings-preview/thumb.jpg ]; then
+                  echo "Miniature générée : $(du -h recordings-preview/thumb.jpg | cut -f1)"
+                else
+                 echo "Échec de la génération de la miniature"
+                fi
       - name: Uploader vidéo + miniature vers Supabase Storage
         if: always()
         env:
