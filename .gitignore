@@ -1,0 +1,20 @@
+# Secrets locaux — NE JAMAIS committer (.env contient RELAY_SECRET / KUMA_URL)
+.env
+.env.*
+
+# Environnements Python / Node
+venv/
+.venv/
+__pycache__/
+node_modules/
+
+# Sorties de monitoring (rapports générés par les workflows)
+monitoring_reports/
+monitoring_artifacts/
+*.log
+output.json
+pages_payload.json
+status_payload.json
+video_payload.json
+recordings/
+recordings-preview/
