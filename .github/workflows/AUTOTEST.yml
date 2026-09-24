@@ -1,0 +1,233 @@
+name: AUTOTEST Monitoring - Génération + Rejeu
+
+on:
+  schedule:
+    # Rejeu toutes les 3h (Phase B, sans LLM)
+    - cron: "0 */3 * * *"
+    # Génération mensuelle, le 1er à 2h du matin (Phase A, avec LLM)
+    - cron: "0 2 1 * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Mode à forcer manuellement"
+        required: true
+        default: "run"
+        type: choice
+        options:
+          - run
+          - generate
+          - regenerate-pending
+
+env:
+  PYTHONPATH: ${{ github.workspace }}/autotest-monitoring/autotest_package
+
+jobs:
+  # ──────────────────────────────────────────
+  # Détermine si ce run est "generate", "run" ou "regenerate-pending"
+  # ──────────────────────────────────────────
+  decide-mode:
+    runs-on: ubuntu-latest
+    outputs:
+      mode: ${{ steps.pick.outputs.mode }}
+    steps:
+      - id: pick
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "mode=${{ github.event.inputs.mode }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event.schedule }}" = "0 2 1 * *" ]; then
+            echo "mode=generate" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=run" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ──────────────────────────────────────────
+  # Récupère les sites actifs depuis le relay
+  # ──────────────────────────────────────────
+  fetch-sites:
+    needs: decide-mode
+    runs-on: ubuntu-latest
+    outputs:
+      sites: ${{ steps.get.outputs.sites }}
+    steps:
+      - id: get
+        run: |
+          RAW=$(curl -sS "${{ secrets.RELAY_URL }}/active-sites")
+          echo "Réponse brute /active-sites :"
+          echo "$RAW"
+          # Adapter le .url ci-dessous si le champ réel diffère (à vérifier une fois)
+          SITES=$(echo "$RAW" | jq -c '[.[] | .url]')
+          echo "sites=$SITES" >> "$GITHUB_OUTPUT"
+
+  # ──────────────────────────────────────────
+  # PHASE A — génération (mensuelle ou manuelle), un job par site
+  # ──────────────────────────────────────────
+  generate:
+    needs: [decide-mode, fetch-sites]
+    if: needs.decide-mode.outputs.mode == 'generate'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        site: ${{ fromJson(needs.fetch-sites.outputs.sites) }}
+
+    # Fournisseur LLM utilisé pour la génération.
+    # Pour changer, modifier uniquement ces 3 lignes (pattern validé dans Explorbot LLM) :
+    env:
+      LLM_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+      LLM_BASE_URL: https://generativelanguage.googleapis.com/v1beta/openai
+      LLM_MODEL: gemini-3.1-flash-lite
+
+    steps:
+      - name: Checkout AUTOTEST-monitoring
+        uses: actions/checkout@v4
+        with:
+          repository: jinshiagencys-byte/AUTOTEST-monitoring
+          path: autotest-monitoring
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Installer les dépendances
+        run: pip install -r autotest-monitoring/autotest_package/requirements.txt
+
+      - name: Vérifier la clé LLM
+        run: |
+          if [ -z "$LLM_API_KEY" ]; then
+            echo "ERREUR : secret LLM_API_KEY manquant"
+            exit 1
+          fi
+          echo "Clé LLM présente."
+
+      - name: Vérifier la connexion LLM
+        run: |
+          HTTP=$(curl -sS -o /tmp/resp.json -w "%{http_code}" \
+            "$LLM_BASE_URL/chat/completions" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $LLM_API_KEY" \
+            -d "{\"model\": \"$LLM_MODEL\", \"messages\": [{\"role\": \"user\", \"content\": \"Réponds uniquement par: OK\"}], \"max_tokens\": 50}")
+          echo "HTTP: $HTTP"
+          cat /tmp/resp.json
+          if [ "$HTTP" != "200" ]; then
+            echo "ERREUR : le LLM n'a pas répondu 200"
+            exit 1
+          fi
+          echo "Connexion LLM OK."
+
+      - name: Restaurer le cache des artefacts de monitoring
+        uses: actions/cache@v4
+        with:
+          path: autotest-monitoring/monitoring_artifacts
+          key: monitoring-artifacts-${{ github.run_id }}
+          restore-keys: monitoring-artifacts-
+
+      - name: Générer les scripts (Phase A)
+        run: |
+          python -m autotest.monitoring generate \
+            --site "${{ matrix.site }}" --max-depth 2 \
+            --store autotest-monitoring/monitoring_artifacts
+
+      - name: Committer les artefacts générés
+        working-directory: autotest-monitoring
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add monitoring_artifacts/
+          git diff --cached --quiet || git commit -m "Régénération monitoring: ${{ matrix.site }} [skip ci]"
+          git push origin main
+
+  # ──────────────────────────────────────────
+  # PHASE A bis — traite la file "pending" (dom_changed)
+  # ──────────────────────────────────────────
+  regenerate-pending:
+    needs: decide-mode
+    if: needs.decide-mode.outputs.mode == 'regenerate-pending'
+    runs-on: ubuntu-latest
+    env:
+      LLM_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+      LLM_BASE_URL: https://generativelanguage.googleapis.com/v1beta/openai
+      LLM_MODEL: gemini-3.1-flash-lite
+    steps:
+      - name: Checkout AUTOTEST-monitoring
+        uses: actions/checkout@v4
+        with:
+          repository: jinshiagencys-byte/AUTOTEST-monitoring
+          path: autotest-monitoring
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install -r autotest-monitoring/autotest_package/requirements.txt
+
+      - name: Régénérer les pages en attente
+        run: |
+          python -m autotest.monitoring regenerate \
+            --pending --store autotest-monitoring/monitoring_artifacts
+
+      - name: Committer si changements
+        working-directory: autotest-monitoring
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add monitoring_artifacts/
+          git diff --cached --quiet || git commit -m "Régénération (file pending) [skip ci]"
+          git push origin main
+
+  # ──────────────────────────────────────────
+  # PHASE B — rejeu déterministe, zéro LLM, un job par site
+  # ──────────────────────────────────────────
+  run-monitoring:
+    needs: [decide-mode, fetch-sites]
+    if: needs.decide-mode.outputs.mode == 'run'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        site: ${{ fromJson(needs.fetch-sites.outputs.sites) }}
+    steps:
+      - name: Checkout AUTOTEST-monitoring
+        uses: actions/checkout@v4
+        with:
+          repository: jinshiagencys-byte/AUTOTEST-monitoring
+          path: autotest-monitoring
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Installer Chrome + Selenium uniquement (pas de dépendances LLM)
+        run: |
+          pip install selenium==4.15.2 requests
+          sudo apt-get update && sudo apt-get install -y chromium-browser chromium-chromedriver
+
+      - name: Rejeu (Phase B, sans LLM)
+        env:
+          MONITOR_CHROME_BINARY: /usr/bin/chromium-browser
+          MONITOR_CHROMEDRIVER: /usr/bin/chromedriver
+        run: |
+          python -m autotest.monitoring run \
+            --site "${{ matrix.site }}" --page-timeout 120 \
+            --store autotest-monitoring/monitoring_artifacts \
+            --output monitoring_reports/${{ strategy.job-index }}.json
+
+      # ⚠️ Route à confirmer avant activation réelle : remplacer
+      # /sites/report par la vraie route relay qui reçoit ce JSON
+      - name: Envoyer le rapport au relay (frontière Phase C)
+        if: always()
+        run: |
+          curl -sS -X POST "${{ secrets.RELAY_URL }}/sites/report" \
+            -H "Content-Type: application/json" \
+            --data-binary @monitoring_reports/${{ strategy.job-index }}.json
+
+      - name: Uploader le rapport comme artefact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: monitoring-report-${{ strategy.job-index }}
+          path: monitoring_reports/
