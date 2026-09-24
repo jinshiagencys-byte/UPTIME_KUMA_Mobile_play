@@ -158,7 +158,7 @@ jobs:
           REQUIREMENTS: ${{ steps.prompt.outputs.REQUIREMENTS }}
           PAGES_JSON: ${{ toJSON(matrix.site.pages) }}
           APINEX_API_KEY: ${{ secrets.APINEX_API_KEY }}
-          APINEX_BASE_URL: ${{ secrets.APINEX_BASE_URL }}
+          APINEX_BASE_URL: "https://api.apinex.bond/v1"
           APINEX_MODEL: "free/mimo-v2.6-pro"
           USE_VISION: "0"
           PYTHONUNBUFFERED: "1"
