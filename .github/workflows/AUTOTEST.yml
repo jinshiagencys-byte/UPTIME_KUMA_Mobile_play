@@ -91,14 +91,15 @@ jobs:
       LLM_MODEL: gemini-3.1-flash-lite
 
     steps:
-      # Si ce workflow est dans un autre repo que AUTOTEST-monitoring, remplacer
-      # GITHUB_TOKEN par un PAT (accès en écriture) stocké dans un secret.
+      # Ce workflow tourne dans un autre repo que AUTOTEST-monitoring : GITHUB_TOKEN
+      # ne peut pas y pousser. AUTOTEST_REPO_TOKEN = PAT fine-grained limité au repo
+      # AUTOTEST-monitoring avec la permission "Contents: Read and write".
       - name: Checkout AUTOTEST-monitoring
         uses: actions/checkout@v4
         with:
           repository: jinshiagencys-byte/AUTOTEST-monitoring
           path: autotest-monitoring
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.AUTOTEST_REPO_TOKEN }}
 
       - uses: actions/setup-python@v5
         with:
@@ -150,6 +151,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add monitoring_artifacts/
           git diff --cached --quiet || git commit -m "Régénération monitoring: ${{ matrix.site }} [skip ci]"
+          git pull --rebase origin main
           git push origin main
 
   # ──────────────────────────────────────────
@@ -169,7 +171,7 @@ jobs:
         with:
           repository: jinshiagencys-byte/AUTOTEST-monitoring
           path: autotest-monitoring
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.AUTOTEST_REPO_TOKEN }}
 
       - uses: actions/setup-python@v5
         with:
@@ -189,6 +191,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add monitoring_artifacts/
           git diff --cached --quiet || git commit -m "Régénération (file pending) [skip ci]"
+          git pull --rebase origin main
           git push origin main
 
   # ──────────────────────────────────────────
@@ -215,16 +218,20 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Installer Chrome + Selenium uniquement (pas de dépendances LLM)
+      # Chrome et ChromeDriver sont préinstallés sur ubuntu-latest (évite le Chromium snap,
+      # fragile en CI). Pas de dépendances LLM ici.
+      - name: Installer Selenium uniquement
         run: |
           pip install selenium==4.15.2 requests
-          sudo apt-get update && sudo apt-get install -y chromium-browser chromium-chromedriver
+          google-chrome --version
+          "$CHROMEWEBDRIVER/chromedriver" --version
 
       - name: Rejeu (Phase B, sans LLM)
         env:
-          MONITOR_CHROME_BINARY: /usr/bin/chromium-browser
-          MONITOR_CHROMEDRIVER: /usr/bin/chromedriver
+          MONITOR_CHROME_BINARY: /usr/bin/google-chrome
         run: |
+          mkdir -p monitoring_reports
+          export MONITOR_CHROMEDRIVER="$CHROMEWEBDRIVER/chromedriver"
           python -m autotest.monitoring run \
             --site "${{ matrix.site }}" --page-timeout 120 \
             --store autotest-monitoring/monitoring_artifacts \
@@ -235,9 +242,14 @@ jobs:
       - name: Envoyer le rapport au relay (frontière Phase C)
         if: always()
         run: |
+          F="monitoring_reports/${{ strategy.job-index }}.json"
+          if [ ! -f "$F" ]; then
+            echo "Aucun rapport à envoyer ($F absent)."
+            exit 0
+          fi
           curl -sS -X POST "${{ secrets.RELAY_URL }}/sites/report" \
             -H "Content-Type: application/json" \
-            --data-binary @monitoring_reports/${{ strategy.job-index }}.json
+            --data-binary @"$F"
 
       - name: Uploader le rapport comme artefact
         if: always()
