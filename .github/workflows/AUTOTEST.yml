@@ -42,28 +42,40 @@ jobs:
 
   # ──────────────────────────────────────────
   # Récupère les sites actifs depuis le relay
+  # /active-sites renvoie : {"success":true,"sites":[{id, client_name, site_url}, ...]}
   # ──────────────────────────────────────────
   fetch-sites:
     needs: decide-mode
     runs-on: ubuntu-latest
     outputs:
       sites: ${{ steps.get.outputs.sites }}
+      has_sites: ${{ steps.get.outputs.has_sites }}
     steps:
       - id: get
         run: |
           RAW=$(curl -sS "${{ secrets.RELAY_URL }}/active-sites")
           echo "Réponse brute /active-sites :"
           echo "$RAW"
-          # Adapter le .url ci-dessous si le champ réel diffère (à vérifier une fois)
-          SITES=$(echo "$RAW" | jq -c '[.[] | .url]')
+
+          echo "$RAW" | jq -e '.success == true' > /dev/null \
+            || { echo "ERREUR : réponse invalide du relay"; exit 1; }
+
+          SITES=$(echo "$RAW" | jq -c '[(.sites // [])[] | .site_url] | map(select(. != null and . != ""))')
           echo "sites=$SITES" >> "$GITHUB_OUTPUT"
+
+          if [ "$(echo "$SITES" | jq 'length')" -gt 0 ]; then
+            echo "has_sites=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_sites=false" >> "$GITHUB_OUTPUT"
+            echo "Aucun site à traiter : les jobs generate / run-monitoring seront ignorés."
+          fi
 
   # ──────────────────────────────────────────
   # PHASE A — génération (mensuelle ou manuelle), un job par site
   # ──────────────────────────────────────────
   generate:
     needs: [decide-mode, fetch-sites]
-    if: needs.decide-mode.outputs.mode == 'generate'
+    if: needs.decide-mode.outputs.mode == 'generate' && needs.fetch-sites.outputs.has_sites == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -79,6 +91,8 @@ jobs:
       LLM_MODEL: gemini-3.1-flash-lite
 
     steps:
+      # Si ce workflow est dans un autre repo que AUTOTEST-monitoring, remplacer
+      # GITHUB_TOKEN par un PAT (accès en écriture) stocké dans un secret.
       - name: Checkout AUTOTEST-monitoring
         uses: actions/checkout@v4
         with:
@@ -182,7 +196,7 @@ jobs:
   # ──────────────────────────────────────────
   run-monitoring:
     needs: [decide-mode, fetch-sites]
-    if: needs.decide-mode.outputs.mode == 'run'
+    if: needs.decide-mode.outputs.mode == 'run' && needs.fetch-sites.outputs.has_sites == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
