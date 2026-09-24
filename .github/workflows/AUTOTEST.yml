@@ -41,8 +41,10 @@ jobs:
           fi
 
   # ──────────────────────────────────────────
-  # Récupère les sites actifs depuis le relay
+  # Récupère les sites actifs depuis le relay.
+  # Toutes les routes du relay exigent le header x-relay-secret.
   # /active-sites renvoie : {"success":true,"sites":[{id, client_name, site_url}, ...]}
+  # (ne remonte que les sites is_active=true, crawl_acknowledged null/true, et "dus")
   # ──────────────────────────────────────────
   fetch-sites:
     needs: decide-mode
@@ -53,7 +55,8 @@ jobs:
     steps:
       - id: get
         run: |
-          RAW=$(curl -sS "${{ secrets.RELAY_URL }}/active-sites")
+          RAW=$(curl -sS -H "x-relay-secret: ${{ secrets.RELAY_SECRET }}" \
+            "${{ secrets.RELAY_URL }}/active-sites")
           echo "Réponse brute /active-sites :"
           echo "$RAW"
 
@@ -72,6 +75,10 @@ jobs:
 
   # ──────────────────────────────────────────
   # PHASE A — génération (mensuelle ou manuelle), un job par site
+  # Utilise le système de providers natif d'AUTOTEST (--provider), pas un
+  # endpoint générique : Gemini gratuit choisi, clé lue via GOOGLE_API_KEY
+  # (nom exact confirmé dans llm_wrapper.py : provider "google-gemini" →
+  # os.getenv("GOOGLE_API_KEY")).
   # ──────────────────────────────────────────
   generate:
     needs: [decide-mode, fetch-sites]
@@ -83,12 +90,8 @@ jobs:
       matrix:
         site: ${{ fromJson(needs.fetch-sites.outputs.sites) }}
 
-    # Fournisseur LLM utilisé pour la génération.
-    # Pour changer, modifier uniquement ces 3 lignes (pattern validé dans Explorbot LLM) :
     env:
-      LLM_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-      LLM_BASE_URL: https://generativelanguage.googleapis.com/v1beta/openai
-      LLM_MODEL: gemini-3.1-flash-lite
+      GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
 
     steps:
       # Ce workflow tourne dans un autre repo que AUTOTEST-monitoring : GITHUB_TOKEN
@@ -108,28 +111,13 @@ jobs:
       - name: Installer les dépendances
         run: pip install -r autotest-monitoring/autotest_package/requirements.txt
 
-      - name: Vérifier la clé LLM
+      - name: Vérifier la clé Gemini
         run: |
-          if [ -z "$LLM_API_KEY" ]; then
-            echo "ERREUR : secret LLM_API_KEY manquant"
+          if [ -z "$GOOGLE_API_KEY" ]; then
+            echo "ERREUR : secret GOOGLE_API_KEY manquant"
             exit 1
           fi
-          echo "Clé LLM présente."
-
-      - name: Vérifier la connexion LLM
-        run: |
-          HTTP=$(curl -sS -o /tmp/resp.json -w "%{http_code}" \
-            "$LLM_BASE_URL/chat/completions" \
-            -H "Content-Type: application/json" \
-            -H "Authorization: Bearer $LLM_API_KEY" \
-            -d "{\"model\": \"$LLM_MODEL\", \"messages\": [{\"role\": \"user\", \"content\": \"Réponds uniquement par: OK\"}], \"max_tokens\": 50}")
-          echo "HTTP: $HTTP"
-          cat /tmp/resp.json
-          if [ "$HTTP" != "200" ]; then
-            echo "ERREUR : le LLM n'a pas répondu 200"
-            exit 1
-          fi
-          echo "Connexion LLM OK."
+          echo "Clé Gemini présente."
 
       - name: Restaurer le cache des artefacts de monitoring
         uses: actions/cache@v4
@@ -142,6 +130,7 @@ jobs:
         run: |
           python -m autotest.monitoring generate \
             --site "${{ matrix.site }}" --max-depth 2 \
+            --provider 3 \
             --store autotest-monitoring/monitoring_artifacts
 
       - name: Committer les artefacts générés
@@ -162,9 +151,7 @@ jobs:
     if: needs.decide-mode.outputs.mode == 'regenerate-pending'
     runs-on: ubuntu-latest
     env:
-      LLM_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-      LLM_BASE_URL: https://generativelanguage.googleapis.com/v1beta/openai
-      LLM_MODEL: gemini-3.1-flash-lite
+      GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
     steps:
       - name: Checkout AUTOTEST-monitoring
         uses: actions/checkout@v4
@@ -182,7 +169,8 @@ jobs:
       - name: Régénérer les pages en attente
         run: |
           python -m autotest.monitoring regenerate \
-            --pending --store autotest-monitoring/monitoring_artifacts
+            --pending --provider 3 \
+            --store autotest-monitoring/monitoring_artifacts
 
       - name: Committer si changements
         working-directory: autotest-monitoring
@@ -218,8 +206,8 @@ jobs:
         with:
           python-version: "3.11"
 
-      # Chrome et ChromeDriver sont préinstallés sur ubuntu-latest (évite le Chromium snap,
-      # fragile en CI). Pas de dépendances LLM ici.
+      # Chrome et ChromeDriver sont préinstallés sur ubuntu-latest.
+      # Aucune dépendance LLM ici (Phase B est 100% déterministe).
       - name: Installer Selenium uniquement
         run: |
           pip install selenium==4.15.2 requests
@@ -237,8 +225,12 @@ jobs:
             --store autotest-monitoring/monitoring_artifacts \
             --output monitoring_reports/${{ strategy.job-index }}.json
 
-      # ⚠️ Route à confirmer avant activation réelle : remplacer
-      # /sites/report par la vraie route relay qui reçoit ce JSON
+      # ⚠️ Le format de sortie de `run --output` (pages avec OK/SKIP/FAIL,
+      # motif, version script, flag regenerate) ne correspond PAS forcément
+      # tel quel au schéma attendu par /sites/:id/pages-report côté relay
+      # (status UP/DOWN/ERROR/UNKNOWN, http_code, response_time_ms, note).
+      # Une transformation jq (ou un petit script Python) sera probablement
+      # nécessaire ici avant l'envoi — pas encore fait/vérifié.
       - name: Envoyer le rapport au relay (frontière Phase C)
         if: always()
         run: |
@@ -247,9 +239,13 @@ jobs:
             echo "Aucun rapport à envoyer ($F absent)."
             exit 0
           fi
-          curl -sS -X POST "${{ secrets.RELAY_URL }}/sites/report" \
-            -H "Content-Type: application/json" \
-            --data-binary @"$F"
+          # SITE_ID nécessaire pour construire la route ; à récupérer via
+          # /active-sites (id) plutôt que de deviner à partir de l'URL.
+          echo "TODO: résoudre SITE_ID pour ${{ matrix.site }} avant l'envoi."
+          # curl -sS -X POST -H "x-relay-secret: ${{ secrets.RELAY_SECRET }}" \
+          #   -H "Content-Type: application/json" \
+          #   "${{ secrets.RELAY_URL }}/sites/$SITE_ID/pages-report" \
+          #   --data-binary @"$F"
 
       - name: Uploader le rapport comme artefact
         if: always()
