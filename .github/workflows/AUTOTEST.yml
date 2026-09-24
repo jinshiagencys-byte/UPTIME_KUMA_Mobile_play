@@ -30,15 +30,46 @@ jobs:
     outputs:
       mode: ${{ steps.pick.outputs.mode }}
     steps:
+      # ⚠️ Un dispatch via API / `gh workflow run` SANS -f mode=... n'est pas
+      # bloqué par `required: true` (non appliqué hors formulaire UI) :
+      # github.event.inputs.mode vaut alors "" et AUCUN job conditionnel ne
+      # tourne (run silencieux sans erreur). On rétablit donc explicitement
+      # le défaut "run" et on échoue net si le mode est invalide.
       - id: pick
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          CRON: ${{ github.event.schedule }}
+          INPUT_MODE: ${{ inputs.mode }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "mode=${{ github.event.inputs.mode }}" >> "$GITHUB_OUTPUT"
-          elif [ "${{ github.event.schedule }}" = "0 2 1 * *" ]; then
-            echo "mode=generate" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            if [ -z "${INPUT_MODE:-}" ]; then
+              echo "::warning::Aucun input 'mode' reçu (dispatch API/CLI sans -f mode=...). Repli sur le mode par défaut : run."
+            fi
+            MODE="${INPUT_MODE:-run}"
+          elif [ "$CRON" = "0 2 1 * *" ]; then
+            MODE="generate"
           else
-            echo "mode=run" >> "$GITHUB_OUTPUT"
+            MODE="run"
           fi
+
+          case "$MODE" in
+            run|generate|regenerate-pending) ;;
+            *)
+              echo "::error::mode invalide : '$MODE' (attendu : run | generate | regenerate-pending)"
+              exit 1
+              ;;
+          esac
+
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "Mode résolu : $MODE (event=$EVENT_NAME, cron=${CRON:-aucun})"
+          {
+            echo "### decide-mode"
+            echo ""
+            echo "| event | cron | mode retenu |"
+            echo "| --- | --- | --- |"
+            echo "| $EVENT_NAME | ${CRON:-—} | \`$MODE\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # ──────────────────────────────────────────
   # Récupère les sites actifs depuis le relay.
@@ -54,24 +85,50 @@ jobs:
       has_sites: ${{ steps.get.outputs.has_sites }}
     steps:
       - id: get
+        env:
+          RELAY_URL: ${{ secrets.RELAY_URL }}
+          RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
         run: |
-          RAW=$(curl -sS -H "x-relay-secret: ${{ secrets.RELAY_SECRET }}" \
-            "${{ secrets.RELAY_URL }}/active-sites")
+          set -euo pipefail
+          if [ -z "${RELAY_URL:-}" ]; then
+            echo "::error::secret RELAY_URL manquant"
+            exit 1
+          fi
+
+          if ! RAW=$(curl -fsS --retry 3 -H "x-relay-secret: $RELAY_SECRET" \
+            "$RELAY_URL/active-sites"); then
+            echo "::error::appel $RELAY_URL/active-sites impossible (voir le message curl ci-dessus)"
+            exit 1
+          fi
           echo "Réponse brute /active-sites :"
           echo "$RAW"
 
           echo "$RAW" | jq -e '.success == true' > /dev/null \
-            || { echo "ERREUR : réponse invalide du relay"; exit 1; }
+            || { echo "::error::réponse invalide du relay"; exit 1; }
 
           SITES=$(echo "$RAW" | jq -c '[(.sites // [])[] | .site_url] | map(select(. != null and . != ""))')
           echo "sites=$SITES" >> "$GITHUB_OUTPUT"
 
-          if [ "$(echo "$SITES" | jq 'length')" -gt 0 ]; then
+          COUNT=$(echo "$SITES" | jq 'length')
+          echo "Sites exploitables (site_url non vide) renvoyés par /active-sites : $COUNT"
+
+          if [ "$COUNT" -gt 0 ]; then
             echo "has_sites=true" >> "$GITHUB_OUTPUT"
           else
             echo "has_sites=false" >> "$GITHUB_OUTPUT"
             echo "Aucun site à traiter : les jobs generate / run-monitoring seront ignorés."
+            echo "::notice::/active-sites n'a renvoyé aucun site (is_active=false, crawl non acquitté, ou site déjà crawlé donc non dû)."
           fi
+
+          {
+            echo "### fetch-sites"
+            echo ""
+            echo "\`/active-sites\` → **$COUNT** site(s) à traiter"
+            echo ""
+            echo '```json'
+            echo "$SITES"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # ──────────────────────────────────────────
   # PHASE A — génération (mensuelle ou manuelle), un job par site
@@ -202,7 +259,10 @@ jobs:
         with:
           repository: jinshiagencys-byte/AUTOTEST-monitoring
           path: autotest-monitoring
-          token: ${{ secrets.GITHUB_TOKEN }}
+          # GITHUB_TOKEN est limité à CE repo : impossible de cloner un autre
+          # dépôt avec (404). Il faut le PAT fine-grained, comme dans les jobs
+          # generate / regenerate-pending.
+          token: ${{ secrets.AUTOTEST_REPO_TOKEN }}
 
       - uses: actions/setup-python@v5
         with:
