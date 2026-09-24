@@ -1,11 +1,11 @@
 """
-OpenBrowser-AI — Monitoring fonctionnel (Cloudflare Workers AI, un seul provider).
+OpenBrowser-AI — Monitoring fonctionnel (APINEX, un seul provider).
 
-STRATEGIE (mise a jour 2026-09-23) : UN SEUL provider, Cloudflare Workers AI (endpoint
-compatible OpenAI, https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/v1),
-modele par defaut @cf/zai-org/glm-4.7-flash. Tous les autres providers (GitHub Models,
-OpenRouter/qwen, Cohere, Cline, Groq, Google, Ollama Cloud) sont retires de la chaine :
-plus de fallback, plus de logique ENABLE_FALLBACKS/ENABLE_*.
+STRATEGIE (mise a jour 2026-09-24) : UN SEUL provider, APINEX (endpoint compatible OpenAI,
+URL de base fournie par APINEX_BASE_URL), cle APINEX_API_KEY, modele par defaut
+free/mimo-v2.6-pro (surchargeable via APINEX_MODEL). Tous les autres providers
+(Cloudflare Workers AI, GitHub Models, OpenRouter/qwen, Cohere, Cline, Groq, Google,
+Ollama Cloud) sont retires de la chaine : plus de fallback, plus de logique ENABLE_*.
 
 Acquis conserves : plusieurs pages par run (PAGES_JSON, rotation), browser=BrowserSession(...) +
 await start() manuel, consignes fusionnees dans task, ChatOpenAI pour l'appel LLM,
@@ -218,20 +218,16 @@ SITE_TYPE = os.environ.get("SITE_TYPE", "generic")
 REQUIREMENTS = os.environ.get("REQUIREMENTS", "")
 PAGES_JSON = os.environ.get("PAGES_JSON", "")
 
-# Cloudflare Workers AI (seul provider desormais) : endpoint compatible OpenAI,
-# cle CLOUDFLARE_AUTH_TOKEN + compte CLOUDFLARE_ACCOUNT_ID. glm-4.7-flash par defaut.
-CLOUDFLARE_ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
-CLOUDFLARE_AUTH_TOKEN = os.environ.get("CLOUDFLARE_AUTH_TOKEN", "")
-CLOUDFLARE_MODEL = os.environ.get("CLOUDFLARE_MODEL", "@cf/zai-org/glm-4.7-flash")
-CLOUDFLARE_BASE_URL = (
-    "https://api.cloudflare.com/client/v4/accounts/%s/ai/v1" % CLOUDFLARE_ACCOUNT_ID
-    if CLOUDFLARE_ACCOUNT_ID else ""
-)
+# APINEX (seul provider) : endpoint compatible OpenAI, cle APINEX_API_KEY,
+# URL de base APINEX_BASE_URL (ex. https://.../v1), modele free/mimo-v2.6-pro par defaut.
+APINEX_API_KEY = os.environ.get("APINEX_API_KEY", "").strip()
+APINEX_BASE_URL = os.environ.get("APINEX_BASE_URL", "").strip().rstrip("/")
+APINEX_MODEL = os.environ.get("APINEX_MODEL", "free/mimo-v2.6-pro").strip()
 
 DEAD_PROVIDERS = set()  # (provider, modele) abandonnes pour ce run (quota / erreur fatale)
 MAX_PAGES_PER_RUN = int(os.environ.get("MAX_PAGES_PER_RUN", "2"))
 
-# Latence : effort de raisonnement (reserve a OpenRouter ; sans effet pour Cloudflare Workers AI)
+# Latence : effort de raisonnement (reserve a OpenRouter ; sans effet pour APINEX)
 _VALID_EFFORTS = ("minimal", "low", "medium", "high")
 REASONING_EFFORT = os.environ.get("REASONING_EFFORT", "low").strip().lower()
 if REASONING_EFFORT in ("", "off", "none", "0"):
@@ -268,9 +264,9 @@ except (TypeError, ValueError):
     _CODEAGENT_PARAMS = set()
 
 print("Recordings dir : " + RECORDINGS_DIR)
-print("Cloudflare account id : " + str(bool(CLOUDFLARE_ACCOUNT_ID)))
-print("Cloudflare token      : " + str(bool(CLOUDFLARE_AUTH_TOKEN)))
-print("Cloudflare modele     : " + CLOUDFLARE_MODEL)
+print("APINEX cle API        : " + str(bool(APINEX_API_KEY)))
+print("APINEX base URL       : " + (APINEX_BASE_URL or "MANQUANT"))
+print("APINEX modele         : " + APINEX_MODEL)
 print("Video freeze cap  : %.1fs" % FREEZE_CAP_SECONDS)
 print("Viewport          : %dx%d" % (VIEWPORT_WIDTH, VIEWPORT_HEIGHT))
 print("Reasoning effort  : " + (REASONING_EFFORT or "off"))
@@ -322,7 +318,9 @@ def reasoning_for(model_config):
 
 def build_llm(model_config):
     llm_kwargs = {}
-    if model_config["provider"] not in ("openrouter", "unorouter", "ollama", "cloudflare"):
+    # APINEX n'est volontairement PAS dans ce tuple : on n'envoie ni frequency_penalty
+    # ni max_completion_tokens a une passerelle dont on ne connait pas les parametres acceptes.
+    if model_config["provider"] not in ("openrouter", "unorouter", "ollama"):
         llm_kwargs = {"frequency_penalty": None, "max_completion_tokens": None}
     llm = ReasoningChatOpenAI(
         model=model_config["model"],
@@ -338,20 +336,20 @@ def build_llm(model_config):
 
 
 # ---------------------------------------------------------------------------
-# Chaine de modeles : Cloudflare Workers AI uniquement, aucun fallback
+# Chaine de modeles : APINEX uniquement, aucun fallback
 # ---------------------------------------------------------------------------
 MODEL_CHAIN = []
 
-if CLOUDFLARE_AUTH_TOKEN and CLOUDFLARE_ACCOUNT_ID:
+if APINEX_API_KEY and APINEX_BASE_URL:
     MODEL_CHAIN.append({
-        "provider": "cloudflare",
-        "model": CLOUDFLARE_MODEL,
-        "key": CLOUDFLARE_AUTH_TOKEN,
-        "base_url": CLOUDFLARE_BASE_URL,
+        "provider": "apinex",
+        "model": APINEX_MODEL,
+        "key": APINEX_API_KEY,
+        "base_url": APINEX_BASE_URL,
     })
 
 if not MODEL_CHAIN:
-    print("ERREUR : aucune cle API disponible (CLOUDFLARE_AUTH_TOKEN/CLOUDFLARE_ACCOUNT_ID manquant). Abandon.")
+    print("ERREUR : APINEX_API_KEY et/ou APINEX_BASE_URL manquant. Abandon.")
     sys.exit(1)
 
 print("Chaine finale :")
