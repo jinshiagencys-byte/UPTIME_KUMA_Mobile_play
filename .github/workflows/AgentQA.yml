@@ -1,20 +1,16 @@
-name: AgentQA - test manuel
+name: AgentQA - odjafrik
 
 on:
   workflow_dispatch:
     inputs:
       url:
-        description: "URL à tester"
+        description: "URL du site"
         required: true
         default: "https://odjafrik.com"
-      prompt:
-        description: "Scénario de test"
-        required: true
-        default: "Open the homepage. Verify the page title, the main heading and the main navigation are visible. Click 3 menu links and verify each page loads without an error. Report console or network errors."
       max_steps:
-        description: "Nombre max d'étapes de l'agent"
+        description: "Nombre max d'étapes par scénario"
         required: false
-        default: "20"
+        default: "25"
 
 permissions:
   contents: read
@@ -23,6 +19,45 @@ jobs:
   qa:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - name: recherche
+            prompt: >-
+              Marketplace search test. 1) On the homepage, use the TOP search bar: type "Ananas"
+              and submit. Verify at least one product card appears with a name and a price.
+              2) Go back to the homepage, scroll down and find a SECOND search bar (in the
+              page body or bottom section). Type "Tissu Wax" and submit it. Verify whether
+              results appear; if nothing happens or the page shows no results, report it as a
+              bug and say which search bar failed. 3) Open the first product from any working
+              search and verify the detail page shows name, price, image and an add-to-cart button.
+              Wait 3 seconds and re-check before reporting that products are missing or empty.
+          - name: panier
+            prompt: >-
+              Cart test, do NOT checkout or pay. 1) Open any product from the homepage.
+              2) Click the add-to-cart button and verify the cart counter or cart content
+              updates. 3) Open the cart, change the quantity to 2 and verify the total
+              changes accordingly. 4) Remove the item and verify the cart becomes empty.
+              Report any error message, undefined or NaN value, or a button that does nothing.
+          - name: authentification
+            prompt: >-
+              Authentication test, do NOT create a real account. 1) Find the login or signup
+              entry point and open it. 2) Submit the form empty and verify a clear validation
+              message appears. 3) Enter the email test@example.com with the password
+              WrongPass123 and submit. Verify a clear error message appears and that the
+              password field is masked. Report anything that fails silently or shows a raw
+              technical error.
+          - name: vendeur-et-navigation
+            prompt: >-
+              Navigation test. 1) From a product page, open the vendor page. Verify the vendor
+              name and a list of their products appear. 2) Go back to the homepage and click
+              3 different menu or category links; verify each page loads with content and no
+              error. 3) Scroll to the footer, click 2 footer links and verify they load.
+              4) In the newsletter field, enter the invalid email "abc" and submit; verify an
+              error appears. Do NOT submit a valid email. Wait for slow-loading products
+              before reporting them as missing.
 
     steps:
       - name: Installer Node.js 20
@@ -38,16 +73,15 @@ jobs:
           set -euo pipefail
           uv tool install git+https://github.com/browser-use/browser-harness
           npm install -g @alisharjeel/agentqa
-          agentqa --help || true
 
-      - name: Lancer le test AgentQA
+      - name: Lancer le scénario ${{ matrix.name }}
         env:
           QA_API_PROVIDER: openai
           QA_API_URL: https://openrouter.ai/api/v1
           QA_API_MODEL: stealth/space-bunny-alpha
           QA_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           TEST_URL: ${{ inputs.url }}
-          TEST_PROMPT: ${{ inputs.prompt }}
+          TEST_PROMPT: ${{ matrix.prompt }}
           MAX_STEPS: ${{ inputs.max_steps }}
         run: |
           mkdir -p qa-out
@@ -60,9 +94,11 @@ jobs:
 
       - name: Résumé du résultat
         if: always()
+        env:
+          SCENARIO: ${{ matrix.name }}
         run: |
           {
-            echo "## Résultat AgentQA"
+            echo "## AgentQA - $SCENARIO"
             echo ""
             if [ -f qa-out/result.json ] && jq -e . qa-out/result.json >/dev/null 2>&1; then
               echo "- ok : $(jq -r '.ok' qa-out/result.json)"
@@ -78,7 +114,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: agentqa-report
+          name: agentqa-${{ matrix.name }}
           path: qa-out/
           if-no-files-found: warn
           retention-days: 7
