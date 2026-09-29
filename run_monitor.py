@@ -1,11 +1,13 @@
 """
-OpenBrowser-AI — Monitoring fonctionnel (Cloudflare Workers AI, un seul provider).
+OpenBrowser-AI — Monitoring fonctionnel (OpenRouter principal, Cloudflare Workers AI en repli).
 
-STRATEGIE (mise a jour 2026-09-23) : UN SEUL provider, Cloudflare Workers AI (endpoint
-compatible OpenAI, https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/v1),
-modele par defaut @cf/zai-org/glm-4.7-flash. Tous les autres providers (GitHub Models,
-OpenRouter/qwen, Cohere, Cline, Groq, Google, Ollama Cloud) sont retires de la chaine :
-plus de fallback, plus de logique ENABLE_FALLBACKS/ENABLE_*.
+STRATEGIE (mise a jour 2026-09-29) : chaine de 2 providers, tous deux compatibles OpenAI :
+  1. OpenRouter (https://openrouter.ai/api/v1), modele par defaut stealth/space-bunny-alpha
+     (variables OPENROUTER_API_KEY / OPENROUTER_MODEL)
+  2. Cloudflare Workers AI (https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/v1),
+     modele par defaut @cf/zai-org/glm-4.7-flash, utilise seulement si le 1er est mort
+     (quota / erreur fatale) ou absent.
+Chaque provider est optionnel : il suffit qu'au moins une cle soit definie.
 
 Acquis conserves : plusieurs pages par run (PAGES_JSON, rotation), browser=BrowserSession(...) +
 await start() manuel, consignes fusionnees dans task, ChatOpenAI pour l'appel LLM,
@@ -218,7 +220,12 @@ SITE_TYPE = os.environ.get("SITE_TYPE", "generic")
 REQUIREMENTS = os.environ.get("REQUIREMENTS", "")
 PAGES_JSON = os.environ.get("PAGES_JSON", "")
 
-# Cloudflare Workers AI (seul provider desormais) : endpoint compatible OpenAI,
+# OpenRouter (provider principal) : endpoint compatible OpenAI.
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "stealth/space-bunny-alpha")
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+# Cloudflare Workers AI (repli) : endpoint compatible OpenAI,
 # cle CLOUDFLARE_AUTH_TOKEN + compte CLOUDFLARE_ACCOUNT_ID. glm-4.7-flash par defaut.
 CLOUDFLARE_ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
 CLOUDFLARE_AUTH_TOKEN = os.environ.get("CLOUDFLARE_AUTH_TOKEN", "")
@@ -268,6 +275,8 @@ except (TypeError, ValueError):
     _CODEAGENT_PARAMS = set()
 
 print("Recordings dir : " + RECORDINGS_DIR)
+print("OpenRouter cle        : " + str(bool(OPENROUTER_API_KEY)))
+print("OpenRouter modele     : " + OPENROUTER_MODEL)
 print("Cloudflare account id : " + str(bool(CLOUDFLARE_ACCOUNT_ID)))
 print("Cloudflare token      : " + str(bool(CLOUDFLARE_AUTH_TOKEN)))
 print("Cloudflare modele     : " + CLOUDFLARE_MODEL)
@@ -282,8 +291,7 @@ print("Timeouts : LLM %.0fs | essai %.0fs | budget total %.0fs" % (
 
 
 # ---------------------------------------------------------------------------
-# LLM — ChatOpenAI (le parametre `reasoning` extra_body reste reserve a OpenRouter ;
-# aucun provider actif dans la chaine ne le declenchera desormais)
+# LLM — ChatOpenAI (le parametre `reasoning` extra_body reste reserve a OpenRouter)
 # ---------------------------------------------------------------------------
 class ReasoningChatOpenAI(ChatOpenAI):
     """ChatOpenAI + parametre OpenRouter `reasoning` (extra_body).
@@ -338,9 +346,17 @@ def build_llm(model_config):
 
 
 # ---------------------------------------------------------------------------
-# Chaine de modeles : Cloudflare Workers AI uniquement, aucun fallback
+# Chaine de modeles : OpenRouter d'abord, Cloudflare Workers AI en repli
 # ---------------------------------------------------------------------------
 MODEL_CHAIN = []
+
+if OPENROUTER_API_KEY:
+    MODEL_CHAIN.append({
+        "provider": "openrouter",
+        "model": OPENROUTER_MODEL,
+        "key": OPENROUTER_API_KEY,
+        "base_url": OPENROUTER_BASE_URL,
+    })
 
 if CLOUDFLARE_AUTH_TOKEN and CLOUDFLARE_ACCOUNT_ID:
     MODEL_CHAIN.append({
@@ -351,7 +367,7 @@ if CLOUDFLARE_AUTH_TOKEN and CLOUDFLARE_ACCOUNT_ID:
     })
 
 if not MODEL_CHAIN:
-    print("ERREUR : aucune cle API disponible (CLOUDFLARE_AUTH_TOKEN/CLOUDFLARE_ACCOUNT_ID manquant). Abandon.")
+    print("ERREUR : aucune cle API disponible (OPENROUTER_API_KEY ou CLOUDFLARE_AUTH_TOKEN/CLOUDFLARE_ACCOUNT_ID manquant). Abandon.")
     sys.exit(1)
 
 print("Chaine finale :")
@@ -790,8 +806,8 @@ def is_quota_error(text):
 
 # ---------------------------------------------------------------------------
 # Preflight (1 token), mis en cache par modele.
-# Le parametre `reasoning` (extra_body) est reserve a OpenRouter : aucun effet ici puisque
-# reasoning_for() renvoie None pour tout provider != "openrouter".
+# Le parametre `reasoning` (extra_body) est reserve a OpenRouter : sans effet pour
+# les autres providers puisque reasoning_for() renvoie None pour tout provider != "openrouter".
 # ---------------------------------------------------------------------------
 _preflight_cache = {}
 
