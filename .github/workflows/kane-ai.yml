@@ -1,3 +1,28 @@
+name: Kane E2E tests
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fetch-sites:
+    runs-on: ubuntu-latest
+    outputs:
+      sites: ${{ steps.build.outputs.sites }}
+    steps:
+      - name: Construire la liste des sites
+        id: build
+        run: |
+          set -euo pipefail
+
+          # Exemple : remplace par ta vraie récupération.
+          # Important : sortir du JSON compact pour que `!= '[]'` fonctionne.
+          sites=$(jq -cn '[{"id":"site-exemple","url":"https://example.com","pages":[{"name":"Accueil","url":"https://example.com"},{"name":"Contact","url":"https://example.com/contact"}]}]')
+
+          printf 'sites=%s\n' "$sites" >> "$GITHUB_OUTPUT"
+
   kane-test:
     needs: fetch-sites
     if: needs.fetch-sites.outputs.sites != '[]'
