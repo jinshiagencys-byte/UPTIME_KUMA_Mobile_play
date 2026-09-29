@@ -94,12 +94,12 @@ jobs:
           else TYPE=generic; fi
           echo "Type détecté : $TYPE"
 
-          # Format : nom|url|objectif
+          # Format : nom|url|objectif   (le caractère | est interdit dans l'objectif)
           : > cases.txt
           case "$TYPE" in
             marketplace|ecommerce)
               cat >> cases.txt <<EOF
-          search|$SITE_URL|Use the search bar to search for a product. Assert that results are listed with a name and a price.
+          search|$SITE_URL|Use the search bar you see first on the page, without choosing a specific one. Type one keyword taken from a product name visible on the page, then submit once. Do not repeat the search. Ignore the suggested popular searches near the field, they are only hints and may not match any product. Wait at most 10 seconds after submitting. Then describe exactly what happened: did the URL or page change, did a results page open, did the page stay on the homepage, were product cards with name and price shown, was a no-results message shown. A keyword with no matching product is a valid result, not a loading failure. Report FAIL only if after 10 seconds nothing observable happens, an error appears, or the page stays stuck loading. If the search field does not lead to any results, say clearly which search field you used and where it is located.
           product_detail|$SITE_URL|Open a product from the homepage or a listing. Assert the detail page shows title, price, image and a buy or add-to-cart button.
           cart|$SITE_URL|Open a product and add it to the cart. Open the cart and assert the product and a total are displayed. Do NOT pay or submit any order.
           category|$SITE_URL|Open the main menu and click a category. Assert that products are listed.
@@ -140,14 +140,23 @@ jobs:
           while IFS='|' read -r NAME PURL OBJ; do
             [ -z "$NAME" ] && continue
             echo "::group::$NAME"
-            kane-cli run "$OBJ" --url "$PURL" --agent --headless --timeout 180 > "results/$NAME.log" 2>&1
+
+            OBJ_FR="$OBJ Write your final summary and all your remarks in French."
+
+            # < /dev/null : empêche kane-cli d'avaler le reste de cases.txt
+            kane-cli run "$OBJ_FR" --url "$PURL" --agent --headless --timeout 180 \
+              < /dev/null > "results/$NAME.log" 2>&1
             CODE=$?
+
             tail -n 20 "results/$NAME.log"
             echo "::endgroup::"
             [ $CODE -eq 0 ] && S=PASS || S=FAIL
-            jq -nc --arg n "$NAME" --arg s "$S" --argjson c "$CODE" \
-              '{name:$n,status:$s,exit_code:$c}' >> results/summary.jsonl
+
+            SUMMARY=$(grep '"type":"run_end"' "results/$NAME.log" | tail -1 | jq -r '.summary // ""' 2>/dev/null)
+            jq -nc --arg n "$NAME" --arg s "$S" --argjson c "$CODE" --arg r "$SUMMARY" \
+              '{name:$n,status:$s,exit_code:$c,resume:$r}' >> results/summary.jsonl
           done < cases.txt
+
           jq -s '{overall_status: (if all(.[]; .status=="PASS") then "PASS" else "FAIL" end), cases: .}' \
             results/summary.jsonl > output.json
           jq . output.json
