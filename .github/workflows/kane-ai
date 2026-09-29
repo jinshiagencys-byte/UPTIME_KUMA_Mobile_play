@@ -1,0 +1,128 @@
+  kane-test:
+    needs: fetch-sites
+    if: needs.fetch-sites.outputs.sites != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    concurrency:
+      group: kane-check-${{ matrix.site.id }}
+      cancel-in-progress: false
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        site: ${{ fromJson(needs.fetch-sites.outputs.sites) }}
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Installer Kane CLI
+        run: npm install -g @testmuai/kane-cli
+
+      - name: Login Kane
+        env:
+          LT_USERNAME: ${{ secrets.LT_USERNAME }}
+          LT_ACCESS_KEY: ${{ secrets.LT_ACCESS_KEY }}
+        run: kane-cli login --username "$LT_USERNAME" --access-key "$LT_ACCESS_KEY"
+
+      - name: Préparer les cas d'usage du site
+        env:
+          SITE_URL: ${{ matrix.site.url }}
+          PAGES_JSON: ${{ toJSON(matrix.site.pages) }}
+        run: |
+          set -euo pipefail
+          HTML=$(curl -fsSL --max-time 15 "$SITE_URL" 2>/dev/null || echo "")
+          if   echo "$HTML" | grep -qiE '(marketplace|vendeur|seller|multi-vendor|boutique)'; then TYPE=marketplace
+          elif echo "$HTML" | grep -qiE '(panier|cart|checkout|prix|price|produit|acheter)'; then TYPE=ecommerce
+          elif echo "$HTML" | grep -qiE '(login|connexion|dashboard|subscription|pricing)'; then TYPE=saas
+          elif echo "$HTML" | grep -qiE '(blog|article|post|news)'; then TYPE=blog
+          else TYPE=generic; fi
+          echo "Type détecté : $TYPE"
+
+          # Format : nom|url|objectif
+          : > cases.txt
+          case "$TYPE" in
+            marketplace|ecommerce)
+              cat >> cases.txt <<EOF
+          search|$SITE_URL|Use the search bar to search for a product. Assert that results are listed with a name and a price.
+          product_detail|$SITE_URL|Open a product from the homepage or a listing. Assert the detail page shows title, price, image and a buy or add-to-cart button.
+          cart|$SITE_URL|Open a product and add it to the cart. Open the cart and assert the product and a total are displayed. Do NOT pay or submit any order.
+          category|$SITE_URL|Open the main menu and click a category. Assert that products are listed.
+          EOF
+              ;;
+            saas)
+              cat >> cases.txt <<EOF
+          login_error|$SITE_URL|Open the login page, enter a fake email and a fake password, submit. Assert a clear error message appears and no crash.
+          pricing|$SITE_URL|Open the pricing or plans page. Assert plans and prices are visible.
+          signup_validation|$SITE_URL|Open the signup form, submit it empty. Assert validation errors are shown.
+          EOF
+              ;;
+            blog)
+              cat >> cases.txt <<EOF
+          list|$SITE_URL|Assert at least 3 articles are listed on the homepage.
+          article|$SITE_URL|Open the first article. Assert the full content, title and date load.
+          EOF
+              ;;
+            *)
+              cat >> cases.txt <<EOF
+          home|$SITE_URL|Assert the homepage loads with a real title and visible content.
+          navigation|$SITE_URL|Click the main navigation links one by one. Assert each page loads without an error page.
+          contact_validation|$SITE_URL|If a contact form exists, submit it empty and assert validation messages appear. Do not send real data.
+          EOF
+              ;;
+          esac
+
+          # Une vérification par page surveillée (5 max)
+          echo "$PAGES_JSON" | jq -r '.[:5][]? | "page_\(.name | gsub("[^A-Za-z0-9]";"_"))|\(.url)|Assert this page loads without error, the main content is visible and there are no broken images or error messages."' >> cases.txt
+
+          cat cases.txt
+
+      - name: Exécuter les cas E2E
+        run: |
+          set +e
+          mkdir -p results
+          : > results/summary.jsonl
+          while IFS='|' read -r NAME PURL OBJ; do
+            [ -z "$NAME" ] && continue
+            echo "::group::$NAME"
+            kane-cli run "$OBJ" --url "$PURL" --agent --headless --timeout 180 > "results/$NAME.log" 2>&1
+            CODE=$?
+            tail -n 20 "results/$NAME.log"
+            echo "::endgroup::"
+            [ $CODE -eq 0 ] && S=PASS || S=FAIL
+            jq -nc --arg n "$NAME" --arg s "$S" --argjson c "$CODE" \
+              '{name:$n,status:$s,exit_code:$c}' >> results/summary.jsonl
+          done < cases.txt
+          jq -s '{overall_status: (if all(.[]; .status=="PASS") then "PASS" else "FAIL" end), cases: .}' \
+            results/summary.jsonl > output.json
+          jq . output.json
+
+      - name: Envoyer le statut global
+        if: always()
+        env:
+          SITE_ID: ${{ matrix.site.id }}
+          RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
+          RELAY_URL: ${{ secrets.RELAY_URL }}
+        run: |
+          set +e
+          STATUS="ERROR"; MESSAGE="Kane CLI error"
+          if [ -f output.json ]; then
+            STATUS=$(jq -r '.overall_status' output.json)
+            MESSAGE=$(jq -c '{cases}' output.json)
+          fi
+          jq -nc --arg status "$STATUS" --arg message "$MESSAGE" \
+            '{status:$status,message:$message}' > status_payload.json
+          curl -sS --retry 3 -X POST "$RELAY_URL/sites/$SITE_ID/mark-crawled" \
+            -H "x-relay-secret: $RELAY_SECRET" -H "Content-Type: application/json" -d @status_payload.json
+
+      - name: Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kane-${{ matrix.site.id }}
+          path: |
+            results/
+            output.json
+            .testmuai/evidence/
+          if-no-files-found: warn
+          retention-days: 3
