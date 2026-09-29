@@ -1,0 +1,84 @@
+name: AgentQA - test manuel
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "URL à tester"
+        required: true
+        default: "https://odjafrik.com"
+      prompt:
+        description: "Scénario de test"
+        required: true
+        default: "Open the homepage. Verify the page title, the main heading and the main navigation are visible. Click 3 menu links and verify each page loads without an error. Report console or network errors."
+      max_steps:
+        description: "Nombre max d'étapes de l'agent"
+        required: false
+        default: "20"
+
+permissions:
+  contents: read
+
+jobs:
+  qa:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Installer Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Installer uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Installer browser-harness et AgentQA
+        run: |
+          set -euo pipefail
+          uv tool install git+https://github.com/browser-use/browser-harness
+          npm install -g @alisharjeel/agentqa
+          agentqa --help || true
+
+      - name: Lancer le test AgentQA
+        env:
+          QA_API_PROVIDER: openai
+          QA_API_URL: https://openrouter.ai/api/v1
+          QA_API_MODEL: stealth/space-bunny-alpha
+          QA_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          TEST_URL: ${{ inputs.url }}
+          TEST_PROMPT: ${{ inputs.prompt }}
+          MAX_STEPS: ${{ inputs.max_steps }}
+        run: |
+          mkdir -p qa-out
+          agentqa "$TEST_URL" "$TEST_PROMPT" \
+            --mode text \
+            --max-steps "$MAX_STEPS" \
+            --timeout 90 \
+            --output-dir qa-out \
+            --verbose > qa-out/result.json
+
+      - name: Résumé du résultat
+        if: always()
+        run: |
+          {
+            echo "## Résultat AgentQA"
+            echo ""
+            if [ -f qa-out/result.json ] && jq -e . qa-out/result.json >/dev/null 2>&1; then
+              echo "- ok : $(jq -r '.ok' qa-out/result.json)"
+              echo "- résumé : $(jq -r '.summary' qa-out/result.json)"
+              echo "- durée : $(jq -r '.durationMs' qa-out/result.json) ms"
+              echo "- erreur : $(jq -r '.error // "aucune"' qa-out/result.json)"
+            else
+              echo "Pas de result.json valide (voir les logs du step précédent)."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Sauvegarder le rapport
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agentqa-report
+          path: qa-out/
+          if-no-files-found: warn
+          retention-days: 7
