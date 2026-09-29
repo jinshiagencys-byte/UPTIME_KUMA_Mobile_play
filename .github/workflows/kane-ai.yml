@@ -2,6 +2,13 @@ name: Kane E2E tests
 
 on:
   workflow_dispatch:
+    inputs:
+      site_id:
+        description: "ID du site à tester spécifiquement (optionnel)"
+        required: false
+        type: string
+  # schedule:
+  #   - cron: "0 8,20 * * *"
 
 permissions:
   contents: read
@@ -10,18 +17,41 @@ jobs:
   fetch-sites:
     runs-on: ubuntu-latest
     outputs:
-      sites: ${{ steps.build.outputs.sites }}
+      sites: ${{ steps.get-sites.outputs.sites }}
     steps:
-      - name: Construire la liste des sites
-        id: build
+      - name: Récupérer les sites actifs
+        id: get-sites
+        env:
+          SITE_ID_INPUT: ${{ github.event.inputs.site_id }}
+          RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
+          RELAY_URL: ${{ secrets.RELAY_URL }}
+        shell: bash
         run: |
           set -euo pipefail
+          SITE_ID="${SITE_ID_INPUT:-}"
+          ALL_MONITORS=$(curl -fsS --retry 3 -H "x-relay-secret: $RELAY_SECRET" "$RELAY_URL/monitors")
 
-          # Exemple : remplace par ta vraie récupération.
-          # Important : sortir du JSON compact pour que `!= '[]'` fonctionne.
-          sites=$(jq -cn '[{"id":"site-exemple","url":"https://example.com","pages":[{"name":"Accueil","url":"https://example.com"},{"name":"Contact","url":"https://example.com/contact"}]}]')
+          if [ -n "$SITE_ID" ]; then
+            echo "Test ciblé sur $SITE_ID"
+            DETAIL=$(curl -fsS --retry 3 -H "x-relay-secret: $RELAY_SECRET" "$RELAY_URL/monitors/$SITE_ID")
+            MONITOR=$(echo "$DETAIL" | jq -c '.monitor | if .type == "http" then {id: .parent, url: .url, name: .parentName} else {id: .id, url: .url, name: .name} end')
+            if [ -z "$MONITOR" ] || [ "$MONITOR" = "null" ]; then
+              echo "sites=[]" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            PAGES=$(echo "$ALL_MONITORS" | jq -c --arg sid "$(echo "$MONITOR" | jq -r '.id')" '[.monitors[]? | select(.type == "http" and (.parent | tostring) == $sid) | {url: .url, name: .name}]')
+            SITES=$(jq -cn --argjson mon "$MONITOR" --argjson pages "$PAGES" '[{id: $mon.id, url: $mon.url, name: $mon.name, pages: $pages}]')
+          else
+            RAW=$(curl -fsS --retry 3 -H "x-relay-secret: $RELAY_SECRET" "$RELAY_URL/active-sites")
+            SITES=$(jq -cn --argjson raw "$RAW" --argjson mons "$ALL_MONITORS" '
+              [ $raw.sites[]? | {id: .id, url: .site_url} as $s
+                | $s + {pages: [ $mons.monitors[]? | select(.type == "http" and (.parent | tostring) == ($s.id | tostring)) | {url: .url, name: .name} ]} ]')
+          fi
 
-          printf 'sites=%s\n' "$sites" >> "$GITHUB_OUTPUT"
+          SITES=$(echo "$SITES" | jq -c .)
+          echo "sites=$SITES" >> "$GITHUB_OUTPUT"
+          echo "Sites à tester :"
+          echo "$SITES" | jq .
 
   kane-test:
     needs: fetch-sites
