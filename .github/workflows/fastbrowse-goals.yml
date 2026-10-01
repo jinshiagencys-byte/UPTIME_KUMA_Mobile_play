@@ -1,0 +1,289 @@
+name: Run fastbrowse goals
+
+on:
+  workflow_dispatch:
+    inputs:
+      site_id:
+        description: "sites.id (uuid)"
+        required: true
+      goal_id:
+        description: "Optional goal.id to run only one goal"
+        required: false
+        default: ""
+      max_steps:
+        description: "Maximum browser steps per goal"
+        required: false
+        default: "30"
+      dry_run:
+        description: "Do not write last_result back to Supabase"
+        type: boolean
+        default: true
+      authorize:
+        description: "Allow irreversible actions when required by the goal"
+        type: boolean
+        default: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Clone fastbrowse
+        run: |
+          git clone --depth 1 "https://github.com/agent-labs-dev/fastbrowse.git" fastbrowse
+
+      - name: Install fastbrowse dependencies
+        working-directory: fastbrowse
+        run: |
+          uv sync --all-extras
+
+      - name: Resolve site URL and goals from the project architecture
+        id: resolve
+        env:
+          SITE_ID: ${{ inputs.site_id }}
+          GOAL_ID: ${{ inputs.goal_id }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          RELAY_URL: ${{ secrets.RELAY_URL }}
+          RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -n "${SUPABASE_URL:-}" ] && [ -n "${SUPABASE_SERVICE_KEY:-}" ]; then
+            echo "Using Supabase as the source of truth."
+            QUERY="select=id,site_url"
+            SITE_JSON=$(curl -fsS -H "apikey: $SUPABASE_SERVICE_KEY" \
+              -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+              "$SUPABASE_URL/rest/v1/sites?id=eq.$SITE_ID&select=id,site_url")
+            SITE_URL=$(echo "$SITE_JSON" | python3 -c 'import sys, json; data=json.load(sys.stdin); print((data[0].get("site_url") or data[0].get("url") or "") if data else "")')
+            if [ -z "${SITE_URL:-}" ]; then
+              echo "No site_url found in Supabase for site_id=$SITE_ID"
+              exit 1
+            fi
+            echo "site_url=$SITE_URL" >> "$GITHUB_OUTPUT"
+
+            if [ -n "${GOAL_ID:-}" ]; then
+              GOALS_JSON=$(curl -fsS -H "apikey: $SUPABASE_SERVICE_KEY" \
+                -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+                "$SUPABASE_URL/rest/v1/site_goals?id=eq.$GOAL_ID&site_id=eq.$SITE_ID&status=neq.disabled&order=priority.asc&select=*")
+            else
+              GOALS_JSON=$(curl -fsS -H "apikey: $SUPABASE_SERVICE_KEY" \
+                -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
+                "$SUPABASE_URL/rest/v1/site_goals?site_id=eq.$SITE_ID&status=neq.disabled&order=priority.asc&select=*")
+            fi
+            echo "$GOALS_JSON" > goals.json
+          elif [ -n "${RELAY_URL:-}" ] && [ -n "${RELAY_SECRET:-}" ]; then
+            echo "Using relay as the source of truth."
+            curl -fsS --retry 3 -H "x-relay-secret: $RELAY_SECRET" \
+              "$RELAY_URL/sites/$SITE_ID" > site.json
+            SITE_URL=$(jq -r '.site_url // .url // empty' site.json)
+            if [ -z "${SITE_URL:-}" ]; then
+              echo "No site_url found via relay for site_id=$SITE_ID"
+              exit 1
+            fi
+            echo "site_url=$SITE_URL" >> "$GITHUB_OUTPUT"
+            echo '[]' > goals.json
+          else
+            echo "Missing SUPABASE_URL + SUPABASE_SERVICE_KEY or RELAY_URL + RELAY_SECRET"
+            exit 1
+          fi
+
+          echo "Resolved site_url: $SITE_URL"
+          echo "Goals count: $(jq 'length' goals.json 2>/dev/null || echo 0)"
+          python3 - <<'PY'
+          import json
+          p='goals.json'
+          try:
+              with open(p, 'r', encoding='utf-8') as f:
+                  data=json.load(f)
+          except Exception:
+              data=[]
+          if not isinstance(data, list):
+              data=[]
+          if not data:
+              print('No goals for this site; nothing to run.')
+          else:
+              print('Goals to execute:')
+              for goal in data[:10]:
+                  print('-', goal.get('name') or goal.get('id'))
+          PY
+
+      - name: Write fastbrowse env
+        working-directory: fastbrowse
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
+          AI_GATEWAY_API_KEY: ${{ secrets.AI_GATEWAY_API_KEY }}
+          BROWSER_USE_API_KEY: ${{ secrets.BROWSER_USE_API_KEY }}
+        run: |
+          set -euo pipefail
+          {
+            echo "OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}"
+            echo "TYPESAFE_API_KEY=${TYPESAFE_API_KEY:-}"
+            echo "AI_GATEWAY_API_KEY=${AI_GATEWAY_API_KEY:-}"
+            echo "BROWSER_USE_API_KEY=${BROWSER_USE_API_KEY:-}"
+          } > .env
+
+      - name: Start Chrome headless
+        run: |
+          set -euo pipefail
+          google-chrome --headless=new --no-sandbox --disable-gpu --disable-dev-shm-usage \
+            --remote-debugging-port=9222 --user-data-dir=/tmp/fastbrowse-chrome \
+            --disable-blink-features=AutomationControlled about:blank > /tmp/fastbrowse-chrome.log 2>&1 &
+
+          WS=""
+          for i in $(seq 1 30); do
+            WS=$(curl -fsS http://127.0.0.1:9222/json/version 2>/dev/null | python3 -c "import sys, json; print(json.load(sys.stdin).get('webSocketDebuggerUrl', ''))" || true)
+            if [ -n "$WS" ]; then
+              break
+            fi
+            sleep 1
+          done
+
+          if [ -z "$WS" ]; then
+            echo "Chrome did not start"
+            cat /tmp/fastbrowse-chrome.log || true
+            exit 1
+          fi
+
+          echo "FASTBROWSE_CDP_WS=$WS" >> "$GITHUB_ENV"
+          echo "Chrome ready: $WS"
+
+      - name: Warm up Chrome
+        run: |
+          curl -fsS -X PUT "http://127.0.0.1:9222/json/new?https://example.com" >/dev/null || true
+          sleep 5
+
+      - name: Run fastbrowse for each goal on the resolved site
+        working-directory: fastbrowse
+        env:
+          SITE_ID: ${{ inputs.site_id }}
+          SITE_URL: ${{ steps.resolve.outputs.site_url }}
+          MAX_STEPS: ${{ inputs.max_steps }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          AUTHORIZE: ${{ inputs.authorize }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ../runs
+
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          site_id = os.environ['SITE_ID']
+          site_url = os.environ['SITE_URL']
+          max_steps = os.environ.get('MAX_STEPS', '30')
+          dry_run = os.environ.get('DRY_RUN', 'true').lower() == 'true'
+          authorize = os.environ.get('AUTHORIZE', 'false').lower() == 'true'
+          goals_path = Path('../goals.json')
+          runs_dir = Path('../runs')
+          runs_dir.mkdir(parents=True, exist_ok=True)
+
+          if not goals_path.exists():
+              raise SystemExit('No goals file found for this site')
+
+          with goals_path.open('r', encoding='utf-8') as f:
+              goals = json.load(f)
+
+          if not isinstance(goals, list) or not goals:
+              print(f'No goals for site_id={site_id}; skipping.')
+              summary = {"site_id": site_id, "site_url": site_url, "site_status": "SKIPPED", "results": []}
+              (runs_dir / 'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+              raise SystemExit(0)
+
+          results = []
+          for goal in goals:
+              goal_id = goal.get('id')
+              goal_name = goal.get('name') or goal.get('goal') or f'goal-{goal_id}'
+              task = goal.get('goal') or goal.get('task') or goal.get('description')
+              if not task:
+                  print(f"Skipping goal without task: {goal_name}")
+                  continue
+
+              cmd = [
+                  'uv', 'run', 'fastbrowse', task, '--start', site_url,
+                  '--local', '--json', '--max-steps', max_steps,
+              ]
+              if authorize:
+                  cmd.append('--authorize')
+
+              print(f'\n=== RUNNING GOAL: {goal_name} ===')
+              proc = subprocess.run(cmd, capture_output=True, text=True)
+              stdout = proc.stdout.strip()
+              stderr = proc.stderr.strip()
+              combined = (stdout + ('\n' + stderr if stderr else '')).strip()
+
+              payload = None
+              if stdout:
+                  try:
+                      payload = json.loads(stdout)
+                  except json.JSONDecodeError:
+                      payload = {"raw_output": stdout, "status": "parse_error"}
+              else:
+                  payload = {"raw_output": stderr, "status": "no_stdout"}
+
+              result = {
+                  "goal_id": goal_id,
+                  "goal_name": goal_name,
+                  "status": payload.get('status') if isinstance(payload, dict) else 'unknown',
+                  "answer": payload.get('answer') if isinstance(payload, dict) else None,
+                  "raw": payload,
+                  "exit_code": proc.returncode,
+                  "stdout": stdout,
+                  "stderr": stderr,
+              }
+              results.append(result)
+
+              out_file = runs_dir / f"goal-{goal_id}.json"
+              out_file.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+
+              if not dry_run and os.environ.get('SUPABASE_URL') and os.environ.get('SUPABASE_SERVICE_KEY'):
+                  import requests
+                  url = f"{os.environ['SUPABASE_URL'].rstrip('/')}/rest/v1/site_goals"
+                  headers = {
+                      'apikey': os.environ['SUPABASE_SERVICE_KEY'],
+                      'Authorization': f"Bearer {os.environ['SUPABASE_SERVICE_KEY']}",
+                      'Content-Type': 'application/json',
+                  }
+                  requests.patch(
+                      url,
+                      headers=headers,
+                      params={'id': f'eq.{goal_id}'},
+                      json={'last_result': json.dumps(result, ensure_ascii=False)},
+                      timeout=30,
+                  )
+
+          verdicts = [r['status'] for r in results]
+          site_status = 'UP' if verdicts and all(v in ('complete', 'COMPLETE') for v in verdicts) else ('DOWN' if verdicts else 'SKIPPED')
+          summary = {"site_id": site_id, "site_url": site_url, "site_status": site_status, "results": results}
+          (runs_dir / 'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          print(json.dumps(summary, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fastbrowse-runs
+          path: runs/
+          if-no-files-found: warn
+          retention-days: 7
