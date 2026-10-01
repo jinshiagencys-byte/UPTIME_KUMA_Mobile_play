@@ -231,7 +231,7 @@ jobs:
 
               cmd = [
                   'uv', 'run', 'fastbrowse', task, '--start', site_url,
-                  '--json', '--max-steps', max_steps,
+                  '--json', '--max-steps', max_steps, '--record',
               ]
               if cdp_ws:
                   cmd.extend(['--cdp-url', cdp_ws])
