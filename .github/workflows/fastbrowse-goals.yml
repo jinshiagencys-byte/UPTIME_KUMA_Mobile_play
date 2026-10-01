@@ -136,7 +136,6 @@ jobs:
           {
             echo "TYPESAFE_API_KEY=${TYPESAFE_API_KEY:-}"
             echo "OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}"
-            echo "FASTBROWSE_LLM_MODEL=stealth/space-bunny-alpha"
             echo "FASTBROWSE_JEV_MODEL=jev-1.13-free"
           } > .env
 
