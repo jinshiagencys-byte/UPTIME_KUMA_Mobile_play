@@ -1,0 +1,81 @@
+# .github/workflows/run-goals.yml
+# Runs the goals of ONE site with jev-ultrafast, judges them, uploads the traces.
+# Manual only for now (no cron) - see the note in the chat before enabling a schedule.
+name: Run goals (jev)
+
+on:
+  workflow_dispatch:
+    inputs:
+      site_id:
+        description: "sites.id (uuid)"
+        required: true
+      dry_run:
+        description: "Do not write last_result to Supabase"
+        type: boolean
+        default: true
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Clone jev-ultrafast
+        run: git clone --depth 1 https://github.com/browser-use/jev-ultrafast.git
+
+      # Secrets: TYPESAFE_API_KEY and OPENROUTER_API_KEY. Model names / base URL are not secret.
+      - name: Write jev .env
+        working-directory: jev-ultrafast
+        run: |
+          {
+            echo "TYPESAFE_API_KEY=$TYPESAFE_API_KEY"
+            echo "TYPESAFE_MODEL=jev-1.13-free"
+            echo "TEXT_MODEL_API_KEY=$TEXT_MODEL_API_KEY"
+            echo "TEXT_MODEL_BASE_URL=https://openrouter.ai/api/v1"
+            echo "TEXT_MODEL=stealth/space-bunny-alpha"
+          } > .env
+        env:
+          TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
+          TEXT_MODEL_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+
+      - name: Install jev
+        working-directory: jev-ultrafast
+        run: uv sync
+
+      # Same setup as your local tests: Chrome with remote debugging, Browser Harness attaches via BU_CDP_WS.
+      - name: Start Chrome (headless, remote debugging)
+        run: |
+          google-chrome --headless=new --no-sandbox --disable-gpu \
+            --remote-debugging-port=9222 --user-data-dir=/tmp/jev-chrome \
+            --disable-blink-features=AutomationControlled about:blank > /tmp/chrome.log 2>&1 &
+          WS=""
+          for i in $(seq 1 30); do
+            WS=$(curl -s http://127.0.0.1:9222/json/version | python3 -c "import sys,json; print(json.load(sys.stdin)['webSocketDebuggerUrl'])" 2>/dev/null) && [ -n "$WS" ] && break
+            sleep 1
+          done
+          [ -n "$WS" ] || { echo "Chrome did not start"; cat /tmp/chrome.log; exit 1; }
+          echo "BU_CDP_WS=$WS" >> "$GITHUB_ENV"
+
+      - name: Run goals
+        working-directory: jev-ultrafast
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GOALGEN_MODEL: stealth/space-bunny-alpha
+        run: |
+          uv run --with requests --env-file .env python ../goalgen/run_goals.py \
+            --site-id "${{ inputs.site_id }}" \
+            --out-dir ../runs \
+            ${{ inputs.dry_run && '--dry-run' || '' }}
+
+      - name: Upload traces
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jev-runs
+          path: runs/
+          if-no-files-found: ignore
