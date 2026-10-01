@@ -45,9 +45,9 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y ffmpeg
           which ffmpeg && ffmpeg -version | head -1
 
-      - name: Clone fastbrowse
+      - name: Clone fastbrowse (fork)
         run: |
-          git clone --depth 1 "https://github.com/agent-labs-dev/fastbrowse.git" fastbrowse
+          git clone --depth 1 "https://github.com/jinshiagencys-byte/fastbrowse.git" fastbrowse
 
       - name: Install fastbrowse dependencies
         working-directory: fastbrowse
@@ -69,7 +69,6 @@ jobs:
 
           if [ -n "${SUPABASE_URL:-}" ] && [ -n "${SUPABASE_SERVICE_KEY:-}" ]; then
             echo "Using Supabase as the source of truth."
-            QUERY="select=id,site_url"
             SITE_JSON=$(curl -fsS -H "apikey: $SUPABASE_SERVICE_KEY" \
               -H "Authorization: Bearer $SUPABASE_SERVICE_KEY" \
               "$SUPABASE_URL/rest/v1/sites?id=eq.$SITE_ID&select=id,site_url")
@@ -136,6 +135,9 @@ jobs:
           {
             echo "TYPESAFE_API_KEY=${TYPESAFE_API_KEY:-}"
             echo "OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}"
+            # Jev via la clé OpenCode Zen (et non api.typesafe.ai)
+            echo "FASTBROWSE_JEV_SOURCE=typesafe"
+            echo "FASTBROWSE_JEV_BASE_URL=https://opencode.ai/zen"
             echo "FASTBROWSE_JEV_MODEL=jev-1.13-free"
           } > .env
 
@@ -253,7 +255,6 @@ jobs:
               proc = subprocess.run(cmd, capture_output=True, text=True)
               stdout = proc.stdout.strip()
               stderr = proc.stderr.strip()
-              combined = (stdout + ('\n' + stderr if stderr else '')).strip()
 
               payload = None
               if stdout:
