@@ -13,6 +13,11 @@ Run it from the jev-ultrafast clone, so `jev_ultrafast` and its .env are availab
   uv run --with requests --env-file .env python /path/to/goalgen/run_goals.py --site-id <uuid> --dry-run
 
 Needs: SUPABASE_URL, SUPABASE_SERVICE_KEY (or SUPABASE_SERVICE_ROLE_KEY), OPENROUTER_API_KEY.
+
+Option --record-frames : jev ecrit un JPEG par etape (jev_ultrafast/agent.py,
+prefixe <elapsed_ms:06d>) sous <out-dir>/<goal_id>/frames/. C'est la matiere
+premiere de goalgen/make_videos.py, qui re-assemble ces frames en une MP4 par goal
+en conservant le timing reel lu dans les noms de fichiers.
 """
 import argparse
 import json
@@ -65,13 +70,13 @@ def result(verdict, reason, **extra):
 # --------------------------------------------------------------------------
 # jev
 # --------------------------------------------------------------------------
-def run_agent(url, task):
+def run_agent(url, task, record_dir=None):
     """Returns (state, stop) — stop is None, 'timeout' or 'budget'."""
     from jev_ultrafast import Agent  # imported here: only available in the jev environment
 
     t0 = time.monotonic()
     stop = None
-    with Agent(url, task) as agent:
+    with Agent(url, task, record_dir=record_dir) as agent:
         try:
             for _ in agent.run():
                 if time.monotonic() - t0 > GOAL_TIMEOUT:
@@ -193,11 +198,13 @@ def evaluate(goal, st, stop):
     return result(verdict, reason, flags=flags, **extra)
 
 
-def run_goal(url, goal, out_dir):
+def run_goal(url, goal, out_dir, record=False):
     task = goal["goal"].strip() + GUARD
     t0 = time.monotonic()
+    # None tant que --record-frames n'est pas demande : Agent() n'enregistre rien.
+    frames = Path(out_dir) / goal["id"] / "frames" if record else None
     try:
-        st, stop = run_agent(url, task)
+        st, stop = run_agent(url, task, record_dir=frames)
         res = evaluate(goal, st, stop)
     except Exception as e:
         st, res = None, result("ERROR", f"{type(e).__name__}: {e}"[:300])
@@ -256,6 +263,8 @@ def main():
     ap.add_argument("--goal-id", help="run a single goal")
     ap.add_argument("--dry-run", action="store_true", help="do not write last_result to Supabase")
     ap.add_argument("--out-dir", default="runs")
+    ap.add_argument("--record-frames", action="store_true",
+                    help="save one JPEG per agent step under <out-dir>/<goal_id>/frames/")
     args = ap.parse_args()
 
     site = sb_get("sites", {"id": f"eq.{args.site_id}", "select": "id,site_url"})
@@ -274,7 +283,7 @@ def main():
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
     results = []
     for g in goals:
-        res = run_goal(url, g, args.out_dir)
+        res = run_goal(url, g, args.out_dir, record=args.record_frames)
         results.append({"goal_id": g["id"], "name": g["name"], **res})
         print(f"[{res['verdict']:5}] {g['name']} — {res['reason']} ({res['steps']} steps, {res['duration_s']}s)")
         if not args.dry_run:
