@@ -1,0 +1,33 @@
+# .github/workflows/generate-goals.yml
+name: Generate goals (new site)
+
+on:
+  workflow_dispatch:
+    inputs:
+      site_id:
+        description: "sites.id (uuid)"
+        required: true
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install crawl4ai
+        run: |
+          pip install -r goalgen/requirements.txt
+          crawl4ai-setup
+
+      - name: Generate and store goals
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GOALGEN_MODEL: stealth/space-bunny-alpha
+        run: python goalgen/generate_goals.py --site-id "${{ inputs.site_id }}"
