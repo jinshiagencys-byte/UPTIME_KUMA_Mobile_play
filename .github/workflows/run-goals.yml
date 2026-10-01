@@ -142,7 +142,24 @@ jobs:
           uv run --with requests --env-file .env python "${{ github.workspace }}/goalgen/run_goals.py" \
             --site-id "${{ inputs.site_id }}" \
             --out-dir "${{ github.workspace }}/runs" \
+            --record-frames \
             ${{ inputs.dry_run && '--dry-run' || '' }}
+
+      # Une MP4 par goal, au temps reel (make_videos.py relit l'elapsed_ms encode
+      # dans le nom de chaque frame). C'est ce qui permet de voir SUR QUELLE page
+      # l'agent a choisi BLOCKED, information absente des traces JSON.
+      - name: Assembler les videos (1 par goal)
+        if: always()
+        run: |
+          set +e
+          if ! command -v ffmpeg > /dev/null; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+          fi
+          echo "ffmpeg : $(command -v ffmpeg || echo ABSENT)"
+          python3 "${{ github.workspace }}/goalgen/make_videos.py" \
+            --runs-dir "${{ github.workspace }}/runs"
+          echo "--- videos produites ---"
+          find "${{ github.workspace }}/runs" -name '*.mp4' -exec ls -lh {} \; 2>/dev/null || true
 
       - name: Upload traces
         if: always()
