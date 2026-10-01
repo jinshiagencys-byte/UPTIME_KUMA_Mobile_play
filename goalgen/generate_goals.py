@@ -268,7 +268,8 @@ def main():
         params["id"] = f"eq.{args.goal_id}"
     goals = sb_get("site_goals", params)
     if not goals:
-        sys.exit("No goals for this site (run generate_goals.py first).")
+        print("No goals for this site yet (run generate_goals.py first) - skipped.")
+        sys.exit(0)  # not an error: a site without goals is simply not monitored by jev yet
 
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
     results = []
