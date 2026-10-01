@@ -139,6 +139,7 @@ jobs:
             echo "FASTBROWSE_JEV_SOURCE=typesafe"
             echo "FASTBROWSE_JEV_BASE_URL=https://opencode.ai/zen"
             echo "FASTBROWSE_JEV_MODEL=jev-1.13-free"
+            echo "FASTBROWSE_LLM_MODEL=stealth/space-bunny-alpha"
           } > .env
 
       - name: Start Chrome headless
