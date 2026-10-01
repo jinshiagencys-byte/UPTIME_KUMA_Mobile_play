@@ -125,12 +125,10 @@ jobs:
         working-directory: fastbrowse
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
         run: |
           set -euo pipefail
           {
             echo "OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}"
-            echo "TYPESAFE_API_KEY=${TYPESAFE_API_KEY:-}"
           } > .env
 
       - name: Start Chrome headless
@@ -177,6 +175,7 @@ jobs:
           AUTHORIZE: ${{ inputs.authorize }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          FASTBROWSE_CDP_WS: ${{ env.FASTBROWSE_CDP_WS }}
         run: |
           set -euo pipefail
           mkdir -p ../runs
@@ -188,11 +187,23 @@ jobs:
           import sys
           from pathlib import Path
 
+          def summarize_status(statuses):
+              if not statuses:
+                  return 'SKIPPED'
+              normalized = [s.lower() for s in statuses]
+              if all(s == 'complete' for s in normalized):
+                  return 'UP'
+              infra = {'error', 'unavailable', 'budget_exceeded', 'needs_input', 'observation_limit'}
+              if any(s in infra for s in normalized):
+                  return 'UNKNOWN'
+              return 'DOWN'
+
           site_id = os.environ['SITE_ID']
           site_url = os.environ['SITE_URL']
           max_steps = os.environ.get('MAX_STEPS', '30')
           dry_run = os.environ.get('DRY_RUN', 'true').lower() == 'true'
           authorize = os.environ.get('AUTHORIZE', 'false').lower() == 'true'
+          cdp_ws = os.environ.get('FASTBROWSE_CDP_WS', '').strip()
           goals_path = Path('../goals.json')
           runs_dir = Path('../runs')
           runs_dir.mkdir(parents=True, exist_ok=True)
@@ -220,8 +231,12 @@ jobs:
 
               cmd = [
                   'uv', 'run', 'fastbrowse', task, '--start', site_url,
-                  '--local', '--json', '--max-steps', max_steps,
+                  '--json', '--max-steps', max_steps,
               ]
+              if cdp_ws:
+                  cmd.extend(['--cdp-url', cdp_ws])
+              else:
+                  cmd.append('--local')
               if authorize:
                   cmd.append('--authorize')
 
@@ -255,6 +270,12 @@ jobs:
               out_file = runs_dir / f"goal-{goal_id}.json"
               out_file.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
 
+              if result.get('status') == 'error':
+                  error_text = json.dumps(payload, ensure_ascii=False)
+                  if '401' in error_text or 'cannot authenticate' in error_text.lower():
+                      print(f"Stopping after authentication failure on goal {goal_name}: {error_text}")
+                      raise SystemExit(1)
+
               if not dry_run and os.environ.get('SUPABASE_URL') and os.environ.get('SUPABASE_SERVICE_KEY'):
                   import requests
                   url = f"{os.environ['SUPABASE_URL'].rstrip('/')}/rest/v1/site_goals"
@@ -272,7 +293,7 @@ jobs:
                   )
 
           verdicts = [r['status'] for r in results]
-          site_status = 'UP' if verdicts and all(v in ('complete', 'COMPLETE') for v in verdicts) else ('DOWN' if verdicts else 'SKIPPED')
+          site_status = summarize_status(verdicts)
           summary = {"site_id": site_id, "site_url": site_url, "site_status": site_status, "results": results}
           (runs_dir / 'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
 
