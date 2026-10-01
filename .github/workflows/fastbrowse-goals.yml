@@ -126,15 +126,11 @@ jobs:
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
-          AI_GATEWAY_API_KEY: ${{ secrets.AI_GATEWAY_API_KEY }}
-          BROWSER_USE_API_KEY: ${{ secrets.BROWSER_USE_API_KEY }}
         run: |
           set -euo pipefail
           {
             echo "OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}"
             echo "TYPESAFE_API_KEY=${TYPESAFE_API_KEY:-}"
-            echo "AI_GATEWAY_API_KEY=${AI_GATEWAY_API_KEY:-}"
-            echo "BROWSER_USE_API_KEY=${BROWSER_USE_API_KEY:-}"
           } > .env
 
       - name: Start Chrome headless
@@ -146,10 +142,14 @@ jobs:
 
           WS=""
           for i in $(seq 1 30); do
-            WS=$(curl -fsS http://127.0.0.1:9222/json/version 2>/dev/null | python3 -c "import sys, json; print(json.load(sys.stdin).get('webSocketDebuggerUrl', ''))" || true)
+            BODY=$(curl -fsS http://127.0.0.1:9222/json/version 2>/dev/null || true)
+            if [ -n "$BODY" ]; then
+              WS=$(printf '%s' "$BODY" | python3 -c "import json,sys; data=json.load(sys.stdin); print(data.get('webSocketDebuggerUrl',''))" 2>/dev/null || true)
+            fi
             if [ -n "$WS" ]; then
               break
             fi
+            echo "Chrome is not ready yet; raw /json/version output: ${BODY:-<empty>}"
             sleep 1
           done
 
