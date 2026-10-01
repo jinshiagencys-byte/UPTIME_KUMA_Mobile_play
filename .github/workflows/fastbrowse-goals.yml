@@ -130,6 +130,7 @@ jobs:
         env:
           TYPESAFE_API_KEY: ${{ secrets.TYPESAFE_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.TEXT_MODEL_API_KEY }}
+          AIHUBMIX_KEY: ${{ secrets.AIHUBMIX_KEY }}
         run: |
           set -euo pipefail
           {
@@ -139,7 +140,9 @@ jobs:
             echo "FASTBROWSE_JEV_SOURCE=typesafe"
             echo "FASTBROWSE_JEV_BASE_URL=https://opencode.ai/zen"
             echo "FASTBROWSE_JEV_MODEL=jev-1.13-free"
-            echo "FASTBROWSE_LLM_MODEL=qwen/qwen3.8-27b:free"
+            echo "FASTBROWSE_LLM_BASE_URL=https://aihubmix.com/v1"
+            echo "FASTBROWSE_LLM_API_KEY=${AIHUBMIX_KEY:-}"
+            echo "FASTBROWSE_LLM_MODEL=coding-kimi-k3-free"
           } > .env
 
       - name: Start Chrome headless
