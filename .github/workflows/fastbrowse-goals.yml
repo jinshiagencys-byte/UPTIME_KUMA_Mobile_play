@@ -15,7 +15,7 @@ on:
         required: false
         default: "30"
       dry_run:
-        description: "Do not write last_result back to Supabase"
+        description: "Do not write last_result / video back to Supabase"
         type: boolean
         default: true
       authorize:
@@ -196,7 +196,14 @@ jobs:
           import os
           import subprocess
           import sys
+          import time
+          import urllib.request
+          from datetime import datetime, timezone
           from pathlib import Path
+
+          SB_URL = os.environ.get('SUPABASE_URL', '').rstrip('/')
+          SB_KEY = os.environ.get('SUPABASE_SERVICE_KEY', '')
+          BUCKET = 'monitoring-videos'
 
           def summarize_status(statuses):
               if not statuses:
@@ -208,6 +215,43 @@ jobs:
               if any(s in infra for s in normalized):
                   return 'UNKNOWN'
               return 'DOWN'
+
+          def to_mp4(src):
+              # webm -> mp4 compressé (lisible partout, y compris iOS)
+              dst = src.with_suffix('.mp4')
+              r = subprocess.run(
+                  ['ffmpeg', '-y', '-i', str(src), '-vf', 'scale=640:-2',
+                   '-c:v', 'libx264', '-crf', '30', '-preset', 'veryfast',
+                   '-pix_fmt', 'yuv420p', '-movflags', '+faststart', '-an', str(dst)],
+                  capture_output=True, text=True, timeout=180)
+              if r.returncode == 0 and dst.exists():
+                  return dst
+              print('ffmpeg failed:', r.stderr[-500:])
+              return None
+
+          def upload_video(path, dest):
+              req = urllib.request.Request(
+                  f'{SB_URL}/storage/v1/object/{BUCKET}/{dest}',
+                  data=path.read_bytes(), method='POST',
+                  headers={
+                      'apikey': SB_KEY,
+                      'Authorization': f'Bearer {SB_KEY}',
+                      'Content-Type': 'video/mp4',
+                      'x-upsert': 'true',
+                  })
+              urllib.request.urlopen(req, timeout=120).read()
+              return f'{SB_URL}/storage/v1/object/public/{BUCKET}/{dest}?t={int(time.time())}'
+
+          def patch_goal(goal_id, fields):
+              req = urllib.request.Request(
+                  f'{SB_URL}/rest/v1/site_goals?id=eq.{goal_id}',
+                  data=json.dumps(fields).encode('utf-8'), method='PATCH',
+                  headers={
+                      'apikey': SB_KEY,
+                      'Authorization': f'Bearer {SB_KEY}',
+                      'Content-Type': 'application/json',
+                  })
+              urllib.request.urlopen(req, timeout=30).read()
 
           site_id = os.environ['SITE_ID']
           site_url = os.environ['SITE_URL']
@@ -287,21 +331,26 @@ jobs:
                       print(f"Stopping after authentication failure on goal {goal_name}: {error_text}")
                       raise SystemExit(1)
 
-              if not dry_run and os.environ.get('SUPABASE_URL') and os.environ.get('SUPABASE_SERVICE_KEY'):
-                  import requests
-                  url = f"{os.environ['SUPABASE_URL'].rstrip('/')}/rest/v1/site_goals"
-                  headers = {
-                      'apikey': os.environ['SUPABASE_SERVICE_KEY'],
-                      'Authorization': f"Bearer {os.environ['SUPABASE_SERVICE_KEY']}",
-                      'Content-Type': 'application/json',
-                  }
-                  requests.patch(
-                      url,
-                      headers=headers,
-                      params={'id': f'eq.{goal_id}'},
-                      json={'last_result': json.dumps(result, ensure_ascii=False)},
-                      timeout=30,
-                  )
+              if not dry_run and SB_URL and SB_KEY:
+                  fields = {'last_result': json.dumps(result, ensure_ascii=False)}
+
+                  webm = runs_dir / f'goal-{goal_id}.webm'
+                  if webm.exists():
+                      try:
+                          mp4 = to_mp4(webm)
+                          if mp4:
+                              fields['video_url'] = upload_video(mp4, f'{site_id}/{goal_id}/latest.mp4')
+                              fields['video_updated_at'] = datetime.now(timezone.utc).isoformat()
+                              print(f"Video uploaded for {goal_name}: {fields['video_url']}")
+                      except Exception as e:
+                          print(f'Video upload failed for {goal_name}: {e}')
+                  else:
+                      print(f'No video file found for {goal_name}')
+
+                  try:
+                      patch_goal(goal_id, fields)
+                  except Exception as e:
+                      print(f'Supabase patch failed for {goal_name}: {e}')
 
           verdicts = [r['status'] for r in results]
           site_status = summarize_status(verdicts)
