@@ -41,7 +41,7 @@ Produce between 1 and __MAX_GOALS__ goals. Each goal covers one distinct use cas
 Rules for every goal:
 1. Written in __LANG__, imperative, ONE use case only, achievable in at most ~8 browser actions.
 2. Starts from the home page. Describe elements the way a human sees them (e.g. "the search bar in the header", "the Add to cart button"). Never use CSS selectors or XPath.
-3. Rely only on elements and pages that appear in the crawled data. Never invent a page, a button, or a menu entry. For a search, use a realistic term taken from the site's own content.
+3. Rely only on elements and pages that appear in the crawled data. Never invent a page, a button, or a menu entry. The goals will be replayed for months, so do NOT depend on content that rotates: no specific product name taken from the home page, no price, no promotion, no news item. Refer to stable things instead: menu entries, category names, "the first product in the list". For a search, use a generic term that matches a category or menu entry of the site (a product family), never a full product name. Bad: \"Open the product 'Tablette X 70 000 F CFA'\". Good: \"Open the first product of the list\".
 4. End with an explicit stop condition that can be observed on screen, in the form "arrête-toi quand ..." (in French) or its equivalent in the goal's language. Example: "arrête-toi quand au moins un produit est affiché".
 5. Read-only and non-destructive: never log in, create an account, pay, check out, subscribe to a newsletter, or submit a form. For a contact form, only check that it opens and its fields are visible. Adding an item to the cart is allowed; stop before checkout.
 6. success_criteria: ONE sentence describing what a human would check to say the use case works.
@@ -219,7 +219,37 @@ def parse_json(text):
     return json.loads(text[start : end + 1])
 
 
-def validate(data):
+PRICE_RE = re.compile(r"\d[\d\s.,]*\s*(?:f\s?cfa|fcfa|xof|cfa|€|eur|\$|usd)", re.I)
+QUOTE_RE = re.compile(r"[«“\"]\s*([^»”\"]+?)\s*[»”\"]")
+
+
+def allowed_texts(pages):
+    """Texts of stable UI elements (menu entries, buttons, fields) seen during the crawl."""
+    out = set()
+    for p in pages:
+        it = p["interactive"]
+        out.update(n["text"].lower() for n in it["nav_links"])
+        out.update(b["text"].lower() for b in it["buttons"])
+        for f in it["fields"]:
+            out.update((f["placeholder"].lower(), f["label"].lower()))
+    return {a for a in out if len(a) >= 3}
+
+
+def unstable_issues(g, allowed):
+    """Goals are replayed for months: no prices, no product names taken from rotating content."""
+    out = []
+    if PRICE_RE.search(g["goal"] + " " + g["success_criteria"]):
+        out.append("it mentions a price; goals must never mention prices")
+    if g["category"] in ("product_detail", "cart"):
+        for q in QUOTE_RE.findall(g["goal"]):
+            ql = q.lower()
+            if not any(ql in a or a in ql for a in allowed):
+                out.append(f"it quotes '{q}', which is not a menu entry or button; say 'the first product in the list' instead of naming a product")
+                break
+    return "; ".join(out)
+
+
+def validate(data, allowed, strict=True):
     goals = data.get("goals") if isinstance(data, dict) else None
     if not isinstance(goals, list) or not goals:
         raise ValueError("'goals' must be a non-empty list")
@@ -228,13 +258,19 @@ def validate(data):
         for k in ("name", "goal", "success_criteria"):
             if not isinstance(g.get(k), str) or not g[k].strip():
                 raise ValueError(f"goal #{i + 1} is missing a non-empty '{k}'")
-        clean.append({
+        item = {
             "name": g["name"].strip(),
             "category": str(g.get("category") or "other").strip(),
             "priority": int(g["priority"]) if str(g.get("priority", "")).isdigit() else i + 1,
             "goal": g["goal"].strip(),
             "success_criteria": g["success_criteria"].strip(),
-        })
+        }
+        issues = unstable_issues(item, allowed)
+        if issues:
+            if strict:
+                raise ValueError(f"goal #{i + 1} ({item['name']}) is not stable over time: {issues}")
+            print(f"[warn] goal #{i + 1} ({item['name']}) kept despite: {issues}", file=sys.stderr)
+        clean.append(item)
     return clean
 
 
@@ -243,11 +279,12 @@ def generate_goals(site_url, pages):
         {"role": "system", "content": system_prompt()},
         {"role": "user", "content": build_user_message(site_url, pages)},
     ]
+    allowed = allowed_texts(pages)
     last_err = None
     for attempt in range(1, LLM_ATTEMPTS + 1):
         reply = call_llm(messages)
         try:
-            return validate(parse_json(reply))
+            return validate(parse_json(reply), allowed, strict=attempt < LLM_ATTEMPTS)
         except (ValueError, json.JSONDecodeError) as e:
             last_err = e
             print(f"[llm] attempt {attempt} rejected: {e}", file=sys.stderr)
@@ -272,19 +309,25 @@ def _sb_headers():
     return {"apikey": key, "Authorization": f"Bearer {key}", "Content-Type": "application/json"}
 
 
+def _check(r):
+    if not r.ok:
+        print(f"[supabase] {r.request.method} {r.url} -> {r.status_code}: {r.text}", file=sys.stderr)
+    r.raise_for_status()
+
+
 def sb_get(table, params):
     r = requests.get(_sb_url(table), headers=_sb_headers(), params=params, timeout=30)
-    r.raise_for_status()
+    _check(r)
     return r.json()
 
 
 def save_goals(site_id, goals):
     """Regeneration replaces the previous goals of the site."""
     r = requests.delete(_sb_url("site_goals"), headers=_sb_headers(), params={"site_id": f"eq.{site_id}"}, timeout=30)
-    r.raise_for_status()
+    _check(r)
     rows = [{**g, "site_id": site_id, "status": "draft"} for g in goals]
     r = requests.post(_sb_url("site_goals"), headers=_sb_headers(), json=rows, timeout=30)
-    r.raise_for_status()
+    _check(r)
 
 
 # --------------------------------------------------------------------------
