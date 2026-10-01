@@ -266,7 +266,9 @@ def _sb_url(table):
 
 
 def _sb_headers():
-    key = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+    key = os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    if not key:
+        sys.exit("Missing SUPABASE_SERVICE_KEY (or SUPABASE_SERVICE_ROLE_KEY)")
     return {"apikey": key, "Authorization": f"Bearer {key}", "Content-Type": "application/json"}
 
 
