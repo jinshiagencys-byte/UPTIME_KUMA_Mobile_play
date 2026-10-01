@@ -48,10 +48,61 @@ jobs:
         working-directory: jev-ultrafast
         run: uv sync
 
+      # browser_harness.helpers.cdp() plafonne chaque appel CDP a 5 s (constante
+      # DEFAULT_IPC_RESPONSE_TIMEOUT_SECONDS), alors que la boucle d'attente de
+      # Browser.__init__ dans browser.py est calibree a 15 s et que le README revendique
+      # des sites reels. Sur une marketplace en CI (runner 2 vCPU, profil Chrome froid,
+      # aucun cache), Page.navigate depasse 5 s : l'agent meurt en _IPCResponseTimeout,
+      # run_goals.py renvoie un verdict ERROR, et sys.exit(2) rend le job rouge.
+      #
+      # On remonte le defaut au niveau de Browser.call : la valeur transite par **params
+      # jusqu'au parametre NOMME _response_timeout de cdp() (elle n'est donc pas rangee
+      # dans params, qui ne contient que des parametres CDP). Cela couvre aussi
+      # Runtime.evaluate, dont le snapshot DOM d'une grosse page peut depasser 5 s aussi.
+      - name: Patch timeout CDP (5s -> 45s)
+        working-directory: jev-ultrafast
+        run: |
+          set -euo pipefail
+          F="jev_ultrafast/browser.py"
+          [ -f "$F" ] || { echo "::error::Fichier absent : $F"; exit 1; }
+
+          echo "--- Browser.call avant patch ---"
+          grep -n "def call\|return cdp(method" "$F"
+
+          sed -i \
+            -e 's/^    def call(self, method, \*\*params):$/    def call(self, method, _response_timeout=45, **params):/' \
+            -e 's/^        return cdp(method, session_id=self.session, \*\*params)$/        return cdp(method, session_id=self.session, _response_timeout=_response_timeout, **params)/' \
+            "$F"
+
+          echo "--- Browser.call apres patch ---"
+          grep -n "def call\|return cdp(method" "$F"
+
+          # Garde-fou : si le fork est refactorise, on veut un job ROUGE bruyamment,
+          # pas un patch silencieux qui ne corrige plus rien.
+          grep -q 'def call(self, method, _response_timeout=45, \*\*params):' "$F" \
+            || { echo "::error::Ancre 'def call' introuvable : patch non applique."; exit 1; }
+          grep -q 'return cdp(method, session_id=self.session, _response_timeout=_response_timeout, \*\*params)' "$F" \
+            || { echo "::error::Ancre 'return cdp' introuvable : patch non applique."; exit 1; }
+
+          uv run python -m py_compile "$F" || { echo "::error::browser.py ne compile plus."; exit 1; }
+
+          # _response_timeout doit exister dans la version INSTALLEE de browser_harness.
+          # S'il n'existe pas, le parametre ajoute ci-dessus partirait dans **params et
+          # n'aurait aucun effet : on le verifie plutot que de le presumer.
+          uv run python -c 'import inspect, sys
+          from browser_harness.helpers import cdp
+          p = inspect.signature(cdp).parameters
+          if "_response_timeout" not in p:
+              sys.exit("::error::cdp() n expose pas _response_timeout : patch inoperant")
+          print("[patch] defaut cdp() =", p["_response_timeout"].default, "s -> surcharge a 45s via Browser.call")'
+
       # Same setup as the local tests: Chrome with remote debugging, Browser Harness attaches via BU_CDP_WS.
       - name: Start Chrome (headless, remote debugging)
         run: |
-          google-chrome --headless=new --no-sandbox --disable-gpu \
+          # --disable-dev-shm-usage : /dev/shm ne fait que 64 Mo sur les runners GitHub.
+          # Un renderer qui le sature se fait tuer par le kernel, ce qui fait pendre
+          # Page.navigate (et reproduit le timeout de 5 s meme apres le patch CDP).
+          google-chrome --headless=new --no-sandbox --disable-gpu --disable-dev-shm-usage \
             --remote-debugging-port=9222 --user-data-dir=/tmp/jev-chrome \
             --disable-blink-features=AutomationControlled about:blank > /tmp/chrome.log 2>&1 &
           WS=""
@@ -73,8 +124,12 @@ jobs:
           pwd
           ls -la
           ls -la goalgen || echo "goalgen/ MISSING"
-          grep -n "opencode.ai\|typesafe.ai" jev-ultrafast/jev/model.py 2>/dev/null \
-            || grep -rn "opencode.ai\|typesafe.ai" jev-ultrafast --include=model.py | head
+          # Chemin reel : jev-ultrafast/jev_ultrafast/model.py. L'ancien "jev/model.py"
+          # n'existe pas et le "||" de la version precedente masquait l'echec, donc cette
+          # etape n'affichait rien d'utile.
+          ls -la jev-ultrafast/jev_ultrafast
+          grep -n "opencode.ai\|typesafe.ai" jev-ultrafast/jev_ultrafast/model.py \
+            || echo "model.py introuvable ou endpoint attendu absent"
 
       - name: Run goals
         working-directory: jev-ultrafast
