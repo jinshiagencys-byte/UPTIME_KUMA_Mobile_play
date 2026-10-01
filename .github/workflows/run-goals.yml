@@ -1,6 +1,6 @@
 # .github/workflows/run-goals.yml
 # Runs the goals of ONE site with jev-ultrafast, judges them, uploads the traces.
-# Manual only for now (no cron) - see the note in the chat before enabling a schedule.
+# Manual only for now (no cron).
 name: Run goals (jev)
 
 on:
@@ -23,8 +23,11 @@ jobs:
 
       - uses: astral-sh/setup-uv@v5
 
-      - name: Clone jev-ultrafast
-        run: git clone --depth 1 https://github.com/browser-use/jev-ultrafast.git
+      # Clone YOUR fork of jev-ultrafast (with the patched model.py).
+      # github.repository_owner = the account that owns this repo. If your fork lives
+      # under another account, replace it by that username. The fork must be public.
+      - name: Clone jev-ultrafast (fork)
+        run: git clone --depth 1 "https://github.com/jinshiagencys-byte/jev-ultrafast.git"
 
       # Secrets: TYPESAFE_API_KEY and OPENROUTER_API_KEY. Model names / base URL are not secret.
       - name: Write jev .env
@@ -45,7 +48,7 @@ jobs:
         working-directory: jev-ultrafast
         run: uv sync
 
-      # Same setup as your local tests: Chrome with remote debugging, Browser Harness attaches via BU_CDP_WS.
+      # Same setup as the local tests: Chrome with remote debugging, Browser Harness attaches via BU_CDP_WS.
       - name: Start Chrome (headless, remote debugging)
         run: |
           google-chrome --headless=new --no-sandbox --disable-gpu \
@@ -59,6 +62,20 @@ jobs:
           [ -n "$WS" ] || { echo "Chrome did not start"; cat /tmp/chrome.log; exit 1; }
           echo "BU_CDP_WS=$WS" >> "$GITHUB_ENV"
 
+      # Page.navigate timed out after 5s on a cold first load: warm Chrome up first.
+      - name: Warm up Chrome
+        run: |
+          curl -s -X PUT "http://127.0.0.1:9222/json/new?https://example.com" > /dev/null || true
+          sleep 5
+
+      - name: Debug layout
+        run: |
+          pwd
+          ls -la
+          ls -la goalgen || echo "goalgen/ MISSING"
+          grep -n "opencode.ai\|typesafe.ai" jev-ultrafast/jev/model.py 2>/dev/null \
+            || grep -rn "opencode.ai\|typesafe.ai" jev-ultrafast --include=model.py | head
+
       - name: Run goals
         working-directory: jev-ultrafast
         env:
@@ -67,9 +84,9 @@ jobs:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           GOALGEN_MODEL: stealth/space-bunny-alpha
         run: |
-          uv run --with requests --env-file .env python ../goalgen/run_goals.py \
+          uv run --with requests --env-file .env python "${{ github.workspace }}/goalgen/run_goals.py" \
             --site-id "${{ inputs.site_id }}" \
-            --out-dir ../runs \
+            --out-dir "${{ github.workspace }}/runs" \
             ${{ inputs.dry_run && '--dry-run' || '' }}
 
       - name: Upload traces
