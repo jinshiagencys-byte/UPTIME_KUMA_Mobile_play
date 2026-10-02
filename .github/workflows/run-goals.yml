@@ -3,7 +3,7 @@
 # Manual only for now (no cron).
 name: Run goals (jev)
 
-on:
+   on:
   workflow_dispatch:
     inputs:
       site_id:
