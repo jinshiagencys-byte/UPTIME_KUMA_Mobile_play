@@ -1,4 +1,4 @@
-name: AutoSpec Playwright - Génération E2E Tests
+name: AutoSpec Playwright - Géneration E2E Tests
 
 on:
   workflow_dispatch:
