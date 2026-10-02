@@ -1,0 +1,23 @@
+name: Test Cloudflare AI Model
+
+on:
+  workflow_dispatch:
+
+jobs:
+  check-model:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Call Cloudflare Workers AI
+      env:
+        CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        CLOUDFLARE_AUTH_TOKEN: ${{ secrets.CLOUDFLARE_AUTH_TOKEN }}
+      run: |
+        echo "Interrogation de l'IA Cloudflare..."
+        
+        response=$(curl -s -X POST "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/run/@cf/meta/llama-3.1-8b-instruct" \
+          -H "Authorization: Bearer ${CLOUDFLARE_AUTH_TOKEN}" \
+          -H "Content-Type: application/json" \
+          -d '{"prompt": "Hi"}')
+          
+        echo "Réponse de l'API :"
+        echo "$response"
