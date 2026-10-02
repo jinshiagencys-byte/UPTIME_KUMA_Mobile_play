@@ -136,6 +136,11 @@ jobs:
         run: |
           pnpm build
 
+      - name: Install Playwright browsers
+        working-directory: autospec
+        run: |
+          npx playwright install --with-deps chromium
+
       - name: Créer dossier trajectories
         run: |
           mkdir -p trajectories
