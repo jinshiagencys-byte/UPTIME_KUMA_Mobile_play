@@ -113,10 +113,28 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Checkout autospec source
+        uses: actions/checkout@v4
+        with:
+          repository: zachblume/autospec
+          ref: main
+          path: autospec
+
       - name: Setup Node.js ${{ env.NODE_VERSION }}
         uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install autospec dependencies
+        working-directory: autospec
+        run: |
+          corepack enable
+          pnpm install --frozen-lockfile
+
+      - name: Build autospec
+        working-directory: autospec
+        run: |
+          pnpm build
 
       - name: Créer dossier trajectories
         run: |
@@ -146,10 +164,11 @@ jobs:
           export GOOGLE_GENERATIVE_AI_API_KEY="${GOOGLE_GENERATIVE_AI_API_KEY:-$GOOGLE_API_KEY}"
           export GOOGLE_API_KEY="${GOOGLE_API_KEY:-$GOOGLE_GENERATIVE_AI_API_KEY}"
 
-          npx --yes autospecai \
+          cd "$GITHUB_WORKSPACE/autospec"
+          node build/src/cli.js \
             --url "$TARGET_URL" \
             --model "gemini-2.5-flash" \
-            --spec_limit "$SPEC_LIMIT" 2>&1 | tee autospec.log
+            --spec_limit "$SPEC_LIMIT" 2>&1 | tee "$GITHUB_WORKSPACE/autospec.log"
 
           EXIT_CODE=$?
 
