@@ -167,15 +167,18 @@ jobs:
           echo "🎯 Cible : $TARGET_URL"
           echo "📈 Specs max : $SPEC_LIMIT"
 
-          # Décider du modèle : Cloudflare > Gemini
-          if [ -n "${CLOUDFLARE_AUTH_TOKEN:-}" ] && [ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
-            echo "✓ Using Cloudflare Workers AI: ${CLOUDFLARE_MODEL}"
-            MODEL_VALUE="${CLOUDFLARE_MODEL}"
-          elif [ -n "${GOOGLE_GENERATIVE_AI_API_KEY:-}" ] || [ -n "${GOOGLE_API_KEY:-}" ]; then
-            echo "✓ Falling back to Gemini model"
+          # Décider du modèle : utiliser Gemini (supported par ce repo)
+          # Cloudflare est utilisable mais nécessite une version modifiée du repo
+          if [ -n "${GOOGLE_GENERATIVE_AI_API_KEY:-}" ] || [ -n "${GOOGLE_API_KEY:-}" ]; then
+            echo "✓ Using Gemini model: gemini-2.5-flash"
             MODEL_VALUE="gemini-2.5-flash"
+          elif [ -n "${CLOUDFLARE_AUTH_TOKEN:-}" ] && [ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
+            echo "⚠ Cloudflare selected but not supported in this repo version"
+            echo "   Using Gemini as fallback (requires GOOGLE_GENERATIVE_AI_API_KEY)"
+            echo "ERROR: no Gemini API key provided"
+            exit 1
           else
-            echo "ERROR: aucun secret de modèle trouvé (Cloudflare ou Gemini)"
+            echo "ERROR: aucun secret de modèle trouvé (Gemini requis)"
             exit 1
           fi
 
