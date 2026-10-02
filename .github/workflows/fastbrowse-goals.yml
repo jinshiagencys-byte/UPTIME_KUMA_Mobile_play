@@ -140,12 +140,12 @@ jobs:
             echo "FASTBROWSE_JEV_SOURCE=typesafe"
             echo "FASTBROWSE_JEV_BASE_URL=https://opencode.ai/zen"
             echo "FASTBROWSE_JEV_MODEL=jev-1.13-free"
-            echo "FASTBROWSE_LLM_BASE_URL=https://aihubmix.com/v1"
-            echo "LLM_BASE_URL=https://aihubmix.com/v1"
-            echo "FASTBROWSE_LLM_API_KEY=${AIHUBMIX_KEY:-}"
-            echo "LLM_API_KEY=${AIHUBMIX_KEY:-}"
-            echo "FASTBROWSE_LLM_MODEL=coding-kimi-k3-free"
-            echo "LLM_MODEL=coding-kimi-k3-free"
+            echo "FASTBROWSE_LLM_BASE_URL=https://openrouter.ai/api/v1"
+            echo "LLM_BASE_URL=https://openrouter.ai/api/v1"
+            echo "FASTBROWSE_LLM_API_KEY=${OPENROUTER_API_KEY:-}"
+            echo "LLM_API_KEY=${OPENROUTER_API_KEY:-}"
+            echo "FASTBROWSE_LLM_MODEL=anthropic/claude-3.5-haiku"
+            echo "LLM_MODEL=anthropic/claude-3.5-haiku"
           } > .env
           sed -E 's/(KEY=).*/\1***/; s/(MODEL=).*/\1***/' .env
 
