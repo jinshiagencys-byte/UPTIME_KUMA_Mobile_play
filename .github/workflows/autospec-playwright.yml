@@ -1,4 +1,4 @@
-name: AutoSpec Playwright - Géneration E2E Tests
+name: AutoSpec Playwright - Génération E2E Tests
 
 on:
   workflow_dispatch:
@@ -26,7 +26,8 @@ permissions:
 
 env:
   NODE_VERSION: "22"
-  GOOGLE_GENERATIVE_AI_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+  GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+  GOOGLE_GENERATIVE_AI_API_KEY: ${{ secrets.GOOGLE_GENERATIVE_AI_API_KEY }}
 
 jobs:
   # ============================================================
@@ -117,15 +118,6 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: latest
-
-      - name: Installer autospecai
-        run: |
-          pnpm add -g autospecai
-
       - name: Créer dossier trajectories
         run: |
           mkdir -p trajectories
@@ -137,27 +129,36 @@ jobs:
           SITE_ID: ${{ needs.resolve-url.outputs.site_id }}
           SITE_NAME: ${{ needs.resolve-url.outputs.site_name }}
           SPEC_LIMIT: ${{ github.event.inputs.spec_limit || '10' }}
-          GOOGLE_GENERATIVE_AI_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          GOOGLE_GENERATIVE_AI_API_KEY: ${{ secrets.GOOGLE_GENERATIVE_AI_API_KEY }}
         shell: bash
         run: |
           set +e  # Continuer même en cas d'erreur
-          
+
           echo "🎯 Cible : $TARGET_URL"
           echo "📈 Specs max : $SPEC_LIMIT"
-          
-          npx autospecai \
+
+          if [ -z "${GOOGLE_GENERATIVE_AI_API_KEY:-}" ] && [ -z "${GOOGLE_API_KEY:-}" ]; then
+            echo "ERROR: aucun secret Gemini trouvé (GOOGLE_API_KEY ou GOOGLE_GENERATIVE_AI_API_KEY)"
+            exit 1
+          fi
+
+          export GOOGLE_GENERATIVE_AI_API_KEY="${GOOGLE_GENERATIVE_AI_API_KEY:-$GOOGLE_API_KEY}"
+          export GOOGLE_API_KEY="${GOOGLE_API_KEY:-$GOOGLE_GENERATIVE_AI_API_KEY}"
+
+          npx --yes autospecai \
             --url "$TARGET_URL" \
             --model "gemini-2.5-flash" \
             --spec_limit "$SPEC_LIMIT" 2>&1 | tee autospec.log
-          
+
           EXIT_CODE=$?
-          
+
           if [ $EXIT_CODE -eq 0 ]; then
             echo "✓ AutoSpec exécuté avec succès"
           else
             echo "⚠ AutoSpec terminé avec code $EXIT_CODE"
           fi
-          
+
           echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
 
       - name: Compter les spec files générés
