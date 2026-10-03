@@ -1,26 +1,21 @@
-name: Test OpenCode AI Models
+name: Test Ollama Cloud Models
 
 on:
   workflow_dispatch:
 
 jobs:
-  check-model:
+  list-models:
     runs-on: ubuntu-latest
     steps:
-    - name: Installer OpenCode
+    - name: Get Ollama Cloud Models
+      env:
+        OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
       run: |
-        npm install -g opencode-ai
-        opencode --version
-
-    - name: Lister les modèles disponibles
-      run: opencode models
-
-    - name: Call Big Pickle
-      run: |
-        echo "Interrogation du modèle Big Pickle..."
-        opencode run -m opencode/big-pickle "Hello! Qui es-tu ?"
-
-    - name: Call Space Bunny
-      run: |
-        echo "Interrogation du modèle Space Bunny Free..."
-        opencode run -m opencode/space-bunny-free "Hello Space Bunny!"
+        echo "Récupération des modèles disponibles sur Ollama Cloud..."
+        
+        response=$(curl -s -X GET "https://ollama.com/api/tags" \
+          -H "Authorization: Bearer ${OLLAMA_API_KEY}" \
+          -H "Content-Type: application/json")
+          
+        echo "Réponse de l'API :"
+        echo "$response"
