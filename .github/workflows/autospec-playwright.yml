@@ -30,7 +30,7 @@ env:
   GOOGLE_GENERATIVE_AI_API_KEY: ${{ secrets.GOOGLE_GENERATIVE_AI_API_KEY }}
   CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
   CLOUDFLARE_AUTH_TOKEN: ${{ secrets.CLOUDFLARE_AUTH_TOKEN }}
-  CLOUDFLARE_MODEL: "@cf/meta/llama-3.1-8b-instruct"
+  CLOUDFLARE_MODEL: "@cf/meta/llama-3.1-8b-fast-v2"
 
 jobs:
   # ============================================================
@@ -159,7 +159,7 @@ jobs:
           GOOGLE_GENERATIVE_AI_API_KEY: ${{ secrets.GOOGLE_GENERATIVE_AI_API_KEY }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_AUTH_TOKEN: ${{ secrets.CLOUDFLARE_AUTH_TOKEN }}
-          CLOUDFLARE_MODEL: "@cf/meta/llama-3.1-8b-instruct"
+          CLOUDFLARE_MODEL: "@cf/meta/llama-3.1-8b-fast-v2"
         shell: bash
         run: |
           set +e  # Continuer même en cas d'erreur
@@ -183,7 +183,7 @@ jobs:
           export GOOGLE_API_KEY="${GOOGLE_API_KEY:-$GOOGLE_GENERATIVE_AI_API_KEY}"
           export CLOUDFLARE_AUTH_TOKEN="${CLOUDFLARE_AUTH_TOKEN:-}"
           export CLOUDFLARE_ACCOUNT_ID="${CLOUDFLARE_ACCOUNT_ID:-}"
-          export CLOUDFLARE_MODEL="${CLOUDFLARE_MODEL:-@cf/meta/llama-3.1-8b-instruct}"
+          export CLOUDFLARE_MODEL="${CLOUDFLARE_MODEL:-@cf/meta/llama-3.1-8b-fast-v2}"
 
           cd "$GITHUB_WORKSPACE/autospec"
           node build/src/cli.js \
