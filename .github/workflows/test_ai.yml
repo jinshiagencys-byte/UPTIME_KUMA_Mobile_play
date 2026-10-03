@@ -13,7 +13,7 @@ jobs:
       run: |
         echo "Interrogation du modèle Big Pickle..."
         
-        response=$(curl -s -X POST "https://models.dev" \
+        response=$(curl -s -X POST "https://opencode.ai" \
           -H "Authorization: Bearer ${OPENCODE_API_KEY}" \
           -H "Content-Type: application/json" \
           -d '{
@@ -26,6 +26,11 @@ jobs:
             ]
           }')
           
+        if [ -z "$response" ]; then
+          echo "Erreur : L'API n'a renvoyé aucune réponse."
+          exit 1
+        fi
+        
         echo "Réponse brute de l'API :"
         echo "$response"
         
@@ -38,7 +43,7 @@ jobs:
       run: |
         echo "Interrogation du modèle Space Bunny Free..."
         
-        response=$(curl -s -X POST "https://models.dev" \
+        response=$(curl -s -X POST "https://opencode.ai" \
           -H "Authorization: Bearer ${OPENCODE_API_KEY}" \
           -H "Content-Type: application/json" \
           -d '{
@@ -51,6 +56,11 @@ jobs:
             ]
           }')
           
+        if [ -z "$response" ]; then
+          echo "Erreur : L'API n'a renvoyé aucune réponse."
+          exit 1
+        fi
+        
         echo "Réponse brute de l'API :"
         echo "$response"
         
