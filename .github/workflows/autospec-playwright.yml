@@ -163,6 +163,7 @@ jobs:
         shell: bash
         run: |
           set +e  # Continuer même en cas d'erreur
+          set -o pipefail
 
           echo "🎯 Cible : $TARGET_URL"
           echo "📈 Specs max : $SPEC_LIMIT"
