@@ -13,7 +13,7 @@ jobs:
       run: |
         echo "Interrogation du modèle Big Pickle..."
         
-        response=$(curl -s -X POST "https://opencode.ai" \
+        response=$(curl -s -X POST "https://models.dev" \
           -H "Authorization: Bearer ${OPENCODE_API_KEY}" \
           -H "Content-Type: application/json" \
           -d '{
@@ -26,8 +26,11 @@ jobs:
             ]
           }')
           
-        echo "Réponse du modèle Big Pickle :"
+        echo "Réponse brute de l'API :"
         echo "$response"
+        
+        echo "Texte extrait :"
+        echo "$response" | jq -r '.choices[0].message.content'
 
     - name: Call OpenCode Space Bunny
       env:
@@ -35,7 +38,7 @@ jobs:
       run: |
         echo "Interrogation du modèle Space Bunny Free..."
         
-        response=$(curl -s -X POST "https://opencode.ai" \
+        response=$(curl -s -X POST "https://models.dev" \
           -H "Authorization: Bearer ${OPENCODE_API_KEY}" \
           -H "Content-Type: application/json" \
           -d '{
@@ -48,5 +51,8 @@ jobs:
             ]
           }')
           
-        echo "Réponse du modèle Space Bunny :"
+        echo "Réponse brute de l'API :"
         echo "$response"
+        
+        echo "Texte extrait :"
+        echo "$response" | jq -r '.choices[0].message.content'
