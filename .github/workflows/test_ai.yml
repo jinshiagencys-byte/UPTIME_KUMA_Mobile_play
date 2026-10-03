@@ -6,63 +6,54 @@ on:
 jobs:
   check-model:
     runs-on: ubuntu-latest
+    env:
+      OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+      API_URL: https://opencode.ai/zen/v1/chat/completions
     steps:
     - name: Call OpenCode Big Pickle
-      env:
-        OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
       run: |
         echo "Interrogation du modèle Big Pickle..."
-        
-        response=$(curl -s -X POST "https://opencode.ai" \
+
+        http_code=$(curl -s -o response.json -w "%{http_code}" -X POST "$API_URL" \
           -H "Authorization: Bearer ${OPENCODE_API_KEY}" \
           -H "Content-Type: application/json" \
           -d '{
             "model": "big-pickle",
-            "messages": [
-              {
-                "role": "user",
-                "content": "Hello! Qui es-tu ?"
-              }
-            ]
+            "messages": [{"role": "user", "content": "Hello! Qui es-tu ?"}]
           }')
-          
-        if [ -z "$response" ]; then
-          echo "Erreur : L'API n'a renvoyé aucune réponse."
+
+        echo "HTTP status : $http_code"
+        echo "Réponse brute :"
+        head -c 2000 response.json
+        echo
+
+        if [ "$http_code" -ne 200 ]; then
+          echo "Erreur : statut HTTP $http_code"
           exit 1
         fi
-        
-        echo "Réponse brute de l'API :"
-        echo "$response"
-        
+
         echo "Texte extrait :"
-        echo "$response" | jq -r '.choices[0].message.content'
+        jq -r '.choices[0].message.content' response.json
 
     - name: Call OpenCode Space Bunny
-      env:
-        OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
       run: |
         echo "Interrogation du modèle Space Bunny Free..."
-        
-        response=$(curl -s -X POST "https://opencode.ai" \
+
+        http_code=$(curl -s -o response.json -w "%{http_code}" -X POST "$API_URL" \
           -H "Authorization: Bearer ${OPENCODE_API_KEY}" \
           -H "Content-Type: application/json" \
           -d '{
             "model": "space-bunny-free",
-            "messages": [
-              {
-                "role": "user",
-                "content": "Hello Space Bunny!"
-              }
-            ]
+            "messages": [{"role": "user", "content": "Hello Space Bunny!"}]
           }')
-          
-        if [ -z "$response" ]; then
-          echo "Erreur : L'API n'a renvoyé aucune réponse."
+
+        echo "HTTP status : $http_code"
+        head -c 2000 response.json
+        echo
+
+        if [ "$http_code" -ne 200 ]; then
+          echo "Erreur : statut HTTP $http_code"
           exit 1
         fi
-        
-        echo "Réponse brute de l'API :"
-        echo "$response"
-        
-        echo "Texte extrait :"
-        echo "$response" | jq -r '.choices[0].message.content'
+
+        jq -r '.choices[0].message.content' response.json
