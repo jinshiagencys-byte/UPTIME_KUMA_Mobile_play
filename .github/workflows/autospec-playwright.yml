@@ -12,6 +12,15 @@ on:
           - opencode:big-pickle
           - opencode:nemotron-3-ultra-free
           - gemini-2.5-flash
+      plan_model:
+        description: "Modèle de planification (optionnel, défaut=--model)"
+        required: false
+        type: choice
+        options:
+          - ""
+          - gemini-2.5-flash
+          - gemini-3.1-flash-lite
+          - cloudflare
       url:
         description: "URL cible à tester (optionnel, sinon récupère du relay)"
         required: false
@@ -35,6 +44,7 @@ permissions:
 
 env:
   NODE_VERSION: "22"
+  SPEC_CONCURRENCY: "3"
   GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
   GOOGLE_GENERATIVE_AI_API_KEY: ${{ secrets.GOOGLE_GENERATIVE_AI_API_KEY }}
   CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -168,6 +178,7 @@ jobs:
           SITE_NAME: ${{ needs.resolve-url.outputs.site_name }}
           SPEC_LIMIT: ${{ github.event.inputs.spec_limit || '10' }}
           FORCE_MODEL: ${{ github.event.inputs.model || '' }}
+          PLAN_MODEL_INPUT: ${{ github.event.inputs.plan_model || '' }}
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           GOOGLE_GENERATIVE_AI_API_KEY: ${{ secrets.GOOGLE_GENERATIVE_AI_API_KEY }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -181,22 +192,31 @@ jobs:
           echo "🎯 Cible : $TARGET_URL"
           echo "📈 Specs max : $SPEC_LIMIT"
 
+          # Valeur utilisée pour la planification (peut être gratuite ou cloudflare)
           if [ -n "${FORCE_MODEL:-}" ]; then
-            echo "✓ Forced model override: ${FORCE_MODEL}"
-            MODEL_VALUE="${FORCE_MODEL}"
+            echo "✓ Forced plan model override: ${FORCE_MODEL}"
+            PLAN_MODEL_VALUE="${FORCE_MODEL}"
           elif [ -n "${CLOUDFLARE_AUTH_TOKEN:-}" ] && [ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
-            echo "✓ Using Cloudflare model: ${CLOUDFLARE_MODEL}"
-            MODEL_VALUE="${CLOUDFLARE_MODEL}"
+            echo "✓ Using Cloudflare model for planning: ${CLOUDFLARE_MODEL}"
+            PLAN_MODEL_VALUE="${CLOUDFLARE_MODEL}"
           elif command -v opencode >/dev/null 2>&1; then
-            echo "✓ Falling back to OpenCode free model"
-            MODEL_VALUE="${OPENCODE_MODEL:-big-pickle}"
+            echo "✓ Falling back to OpenCode free model for planning"
+            PLAN_MODEL_VALUE="${OPENCODE_MODEL:-big-pickle}"
           elif [ -n "${GOOGLE_GENERATIVE_AI_API_KEY:-}" ] || [ -n "${GOOGLE_API_KEY:-}" ]; then
-            echo "✓ Falling back to Gemini model"
-            MODEL_VALUE="gemini-2.5-flash"
+            echo "✓ Falling back to Gemini model for planning"
+            PLAN_MODEL_VALUE="gemini-2.5-flash"
           else
             echo "ERROR: aucun secret de modèle trouvé"
             exit 1
           fi
+
+          # L'exécution nécessite un modèle compatible tool calling ; on force Gemini.
+          if [ -z "${GOOGLE_GENERATIVE_AI_API_KEY:-}" ] && [ -z "${GOOGLE_API_KEY:-}" ]; then
+            echo "ERROR: GOOGLE_GENERATIVE_AI_API_KEY requis pour l'exécution des specs"
+            exit 1
+          fi
+
+          EXECUTION_MODEL="gemini-2.5-flash"
 
           export GOOGLE_GENERATIVE_AI_API_KEY="${GOOGLE_GENERATIVE_AI_API_KEY:-$GOOGLE_API_KEY}"
           export GOOGLE_API_KEY="${GOOGLE_API_KEY:-$GOOGLE_GENERATIVE_AI_API_KEY}"
@@ -205,11 +225,16 @@ jobs:
           export CLOUDFLARE_MODEL="${CLOUDFLARE_MODEL:-@cf/zai-org/glm-4.7-flash}"
           export OPENCODE_MODEL="${OPENCODE_MODEL:-big-pickle}"
 
+          AUTOSPEC_ARGS="--url '$TARGET_URL' --model '$EXECUTION_MODEL' --spec_limit '$SPEC_LIMIT' --trajectories-path '$GITHUB_WORKSPACE/trajectories'"
+
+          if [ -n "${PLAN_MODEL_INPUT:-}" ]; then
+            AUTOSPEC_ARGS="$AUTOSPEC_ARGS --plan_model '$PLAN_MODEL_INPUT'"
+          else
+            AUTOSPEC_ARGS="$AUTOSPEC_ARGS --plan_model '$PLAN_MODEL_VALUE'"
+          fi
+
           cd "$GITHUB_WORKSPACE/autospec"
-          node build/src/cli.js \
-            --url "$TARGET_URL" \
-            --model "$MODEL_VALUE" \
-            --spec_limit "$SPEC_LIMIT" 2>&1 | tee "$GITHUB_WORKSPACE/autospec.log"
+          eval "node build/src/cli.js $AUTOSPEC_ARGS" 2>&1 | tee "$GITHUB_WORKSPACE/autospec.log"
 
           EXIT_CODE=$?
 
@@ -225,9 +250,10 @@ jobs:
         id: count
         shell: bash
         run: |
-          SPEC_COUNT=$(find trajectories -name "*.spec.js" 2>/dev/null | wc -l)
-          VIDEO_COUNT=$(find trajectories -name "*.webm" 2>/dev/null | wc -l)
-          SCREENSHOT_COUNT=$(find trajectories -name "*.png" 2>/dev/null | wc -l)
+          TRAJ_PATH="${GITHUB_WORKSPACE}/trajectories"
+          SPEC_COUNT=$(find "$TRAJ_PATH" -name "*.spec.js" 2>/dev/null | wc -l)
+          VIDEO_COUNT=$(find "$TRAJ_PATH" -name "*.webm" 2>/dev/null | wc -l)
+          SCREENSHOT_COUNT=$(find "$TRAJ_PATH" -name "*.png" 2>/dev/null | wc -l)
           
           echo "spec_count=$SPEC_COUNT" >> "$GITHUB_OUTPUT"
           echo "video_count=$VIDEO_COUNT" >> "$GITHUB_OUTPUT"
@@ -244,7 +270,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: autospec-trajectories-${{ needs.resolve-url.outputs.site_id }}
-          path: trajectories/
+          path: ${{ github.workspace }}/trajectories/
           retention-days: 30
           if-no-files-found: ignore
 
