@@ -3,6 +3,15 @@ name: AutoSpec Playwright - Génération E2E Tests
 on:
   workflow_dispatch:
     inputs:
+      model:
+        description: "Modèle forcé : cloudflare, opencode:big-pickle, opencode:nemotron-3-ultra-free, gemini-2.5-flash"
+        required: false
+        type: choice
+        options:
+          - cloudflare
+          - opencode:big-pickle
+          - opencode:nemotron-3-ultra-free
+          - gemini-2.5-flash
       url:
         description: "URL cible à tester (optionnel, sinon récupère du relay)"
         required: false
@@ -134,6 +143,9 @@ jobs:
           corepack enable
           pnpm install --frozen-lockfile
 
+      - name: Install OpenCode CLI
+        run: npm install -g opencode-ai
+
       - name: Build autospec
         working-directory: autospec
         run: |
@@ -155,6 +167,7 @@ jobs:
           SITE_ID: ${{ needs.resolve-url.outputs.site_id }}
           SITE_NAME: ${{ needs.resolve-url.outputs.site_name }}
           SPEC_LIMIT: ${{ github.event.inputs.spec_limit || '10' }}
+          FORCE_MODEL: ${{ github.event.inputs.model || '' }}
           GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
           GOOGLE_GENERATIVE_AI_API_KEY: ${{ secrets.GOOGLE_GENERATIVE_AI_API_KEY }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -168,10 +181,15 @@ jobs:
           echo "🎯 Cible : $TARGET_URL"
           echo "📈 Specs max : $SPEC_LIMIT"
 
-          # Cloudflare first: verified working endpoint and model
-          if [ -n "${CLOUDFLARE_AUTH_TOKEN:-}" ] && [ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
+          if [ -n "${FORCE_MODEL:-}" ]; then
+            echo "✓ Forced model override: ${FORCE_MODEL}"
+            MODEL_VALUE="${FORCE_MODEL}"
+          elif [ -n "${CLOUDFLARE_AUTH_TOKEN:-}" ] && [ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
             echo "✓ Using Cloudflare model: ${CLOUDFLARE_MODEL}"
             MODEL_VALUE="${CLOUDFLARE_MODEL}"
+          elif command -v opencode >/dev/null 2>&1; then
+            echo "✓ Falling back to OpenCode free model"
+            MODEL_VALUE="${OPENCODE_MODEL:-big-pickle}"
           elif [ -n "${GOOGLE_GENERATIVE_AI_API_KEY:-}" ] || [ -n "${GOOGLE_API_KEY:-}" ]; then
             echo "✓ Falling back to Gemini model"
             MODEL_VALUE="gemini-2.5-flash"
@@ -185,6 +203,7 @@ jobs:
           export CLOUDFLARE_AUTH_TOKEN="${CLOUDFLARE_AUTH_TOKEN:-}"
           export CLOUDFLARE_ACCOUNT_ID="${CLOUDFLARE_ACCOUNT_ID:-}"
           export CLOUDFLARE_MODEL="${CLOUDFLARE_MODEL:-@cf/zai-org/glm-4.7-flash}"
+          export OPENCODE_MODEL="${OPENCODE_MODEL:-big-pickle}"
 
           cd "$GITHUB_WORKSPACE/autospec"
           node build/src/cli.js \
