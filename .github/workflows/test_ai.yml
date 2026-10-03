@@ -1,21 +1,36 @@
-name: Test Ollama Cloud Models
+name: Check Ollama Models & Tool Support
 
 on:
   workflow_dispatch:
 
 jobs:
-  list-models:
+  check-tools:
     runs-on: ubuntu-latest
     steps:
-    - name: Get Ollama Cloud Models
+    - name: Audit models capabilities
       env:
         OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
       run: |
-        echo "Récupération des modèles disponibles sur Ollama Cloud..."
+        echo "Étape 1 : Récupération de la liste des modèles..."
+        # Récupération de la liste (selon le format de l'API Cloud d'Ollama)
+        models_response=$(curl -s -X GET "https://ollama.com/v1/models" \
+          -H "Authorization: Bearer ${OLLAMA_API_KEY}")
         
-        response=$(curl -s -X GET "https://ollama.com/api/tags" \
+        echo "Brut models response: $models_response"
+
+        echo -e "\n----------------------------------------"
+        echo "Étape 2 : Vérification des capacités (tools) via /api/show..."
+        
+        # Exemple de boucle ou test direct sur un modèle connu de votre liste
+        # (Vous pouvez adapter l'extraction JSON selon les IDs retournés)
+        
+        # Test ciblé par exemple sur un modèle Cloud courant :
+        MODEL_TEST="qwen3:cloud" # Remplacez ou automatisez selon vos modèles trouvés
+        
+        show_response=$(curl -s -X POST "https://ollama.com/api/show" \
           -H "Authorization: Bearer ${OLLAMA_API_KEY}" \
-          -H "Content-Type: application/json")
+          -H "Content-Type: application/json" \
+          -d "{\"name\": \"$MODEL_TEST\"}")
           
-        echo "Réponse de l'API :"
-        echo "$response"
+        echo "Détails pour $MODEL_TEST :"
+        echo "$show_response"
