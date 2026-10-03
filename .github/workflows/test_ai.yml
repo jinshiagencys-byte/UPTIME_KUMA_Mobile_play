@@ -1,36 +1,41 @@
-name: Check Ollama Models & Tool Support
+name: Check All Ollama Models Tool Support
 
 on:
   workflow_dispatch:
 
 jobs:
-  check-tools:
+  audit-tools:
     runs-on: ubuntu-latest
     steps:
-    - name: Audit models capabilities
+    - name: Scan models for tool support
       env:
         OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
       run: |
         echo "Étape 1 : Récupération de la liste des modèles..."
-        # Récupération de la liste (selon le format de l'API Cloud d'Ollama)
-        models_response=$(curl -s -X GET "https://ollama.com/v1/models" \
+        response=$(curl -s -X GET "https://ollama.com/v1/models" \
           -H "Authorization: Bearer ${OLLAMA_API_KEY}")
         
-        echo "Brut models response: $models_response"
-
+        # Extraction des IDs avec jq
+        model_ids=$(echo "$response" | jq -r '.data[].id')
+        
         echo -e "\n----------------------------------------"
-        echo "Étape 2 : Vérification des capacités (tools) via /api/show..."
+        echo "Étape 2 : Analyse des capacités (tools) pour chaque modèle..."
         
-        # Exemple de boucle ou test direct sur un modèle connu de votre liste
-        # (Vous pouvez adapter l'extraction JSON selon les IDs retournés)
-        
-        # Test ciblé par exemple sur un modèle Cloud courant :
-        MODEL_TEST="qwen3:cloud" # Remplacez ou automatisez selon vos modèles trouvés
-        
-        show_response=$(curl -s -X POST "https://ollama.com/api/show" \
-          -H "Authorization: Bearer ${OLLAMA_API_KEY}" \
-          -H "Content-Type: application/json" \
-          -d "{\"name\": \"$MODEL_TEST\"}")
+        for model in $model_ids; do
+          echo "Vérification de : $model"
           
-        echo "Détails pour $MODEL_TEST :"
-        echo "$show_response"
+          show_response=$(curl -s -X POST "https://ollama.com/api/show" \
+            -H "Authorization: Bearer ${OLLAMA_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d "{\"name\": \"$model\"}")
+            
+          # Vérifie si le champ 'capabilities' contient 'tools'
+          has_tools=$(echo "$show_response" | jq '.capabilities // [] | index("tools")')
+          
+          if [ "$has_tools" != "null" ]; then
+            echo "✅ [SUPPORTÉ] Le modèle $model supporte les tools !"
+          else
+            echo "❌ [NON SUPPORTÉ ou Inconnu] $model"
+          fi
+          echo "----------------------------------------"
+        done
