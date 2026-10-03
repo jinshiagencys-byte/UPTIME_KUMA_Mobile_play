@@ -6,54 +6,21 @@ on:
 jobs:
   check-model:
     runs-on: ubuntu-latest
-    env:
-      OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
-      API_URL: https://opencode.ai/zen/v1/chat/completions
     steps:
-    - name: Call OpenCode Big Pickle
+    - name: Installer OpenCode
+      run: |
+        npm install -g opencode-ai
+        opencode --version
+
+    - name: Lister les modèles disponibles
+      run: opencode models
+
+    - name: Call Big Pickle
       run: |
         echo "Interrogation du modèle Big Pickle..."
+        opencode run -m opencode/big-pickle "Hello! Qui es-tu ?"
 
-        http_code=$(curl -s -o response.json -w "%{http_code}" -X POST "$API_URL" \
-          -H "Authorization: Bearer ${OPENCODE_API_KEY}" \
-          -H "Content-Type: application/json" \
-          -d '{
-            "model": "big-pickle",
-            "messages": [{"role": "user", "content": "Hello! Qui es-tu ?"}]
-          }')
-
-        echo "HTTP status : $http_code"
-        echo "Réponse brute :"
-        head -c 2000 response.json
-        echo
-
-        if [ "$http_code" -ne 200 ]; then
-          echo "Erreur : statut HTTP $http_code"
-          exit 1
-        fi
-
-        echo "Texte extrait :"
-        jq -r '.choices[0].message.content' response.json
-
-    - name: Call OpenCode Space Bunny
+    - name: Call Space Bunny
       run: |
         echo "Interrogation du modèle Space Bunny Free..."
-
-        http_code=$(curl -s -o response.json -w "%{http_code}" -X POST "$API_URL" \
-          -H "Authorization: Bearer ${OPENCODE_API_KEY}" \
-          -H "Content-Type: application/json" \
-          -d '{
-            "model": "space-bunny-free",
-            "messages": [{"role": "user", "content": "Hello Space Bunny!"}]
-          }')
-
-        echo "HTTP status : $http_code"
-        head -c 2000 response.json
-        echo
-
-        if [ "$http_code" -ne 200 ]; then
-          echo "Erreur : statut HTTP $http_code"
-          exit 1
-        fi
-
-        jq -r '.choices[0].message.content' response.json
+        opencode run -m opencode/space-bunny-free "Hello Space Bunny!"
