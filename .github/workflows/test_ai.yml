@@ -1,4 +1,4 @@
-name: Test Cloudflare AI Model
+name: Test Cloudflare and OpenCode AI Models
 
 on:
   workflow_dispatch:
@@ -14,10 +14,54 @@ jobs:
       run: |
         echo "Interrogation de l'IA Cloudflare..."
         
-        response=$(curl -s -X POST "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/run/@cf/meta/llama-3.1-8b-instruct" \
+        response=$(curl -s -X POST "https://cloudflare.com{CLOUDFLARE_ACCOUNT_ID}/ai/run/@cf/meta/llama-3.1-8b-instruct" \
           -H "Authorization: Bearer ${CLOUDFLARE_AUTH_TOKEN}" \
           -H "Content-Type: application/json" \
           -d '{"prompt": "Hi"}')
           
-        echo "Réponse de l'API :"
+        echo "Réponse de l'API Cloudflare :"
+        echo "$response"
+
+    - name: Call OpenCode Big Pickle
+      env:
+        OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+      run: |
+        echo "Interrogation du modèle Big Pickle..."
+        
+        response=$(curl -s -X POST "https://opencode.ai/zen/v1/chat/completions" \
+          -H "Authorization: Bearer ${OPENCODE_API_KEY}" \
+          -H "Content-Type: application/json" \
+          -d '{
+            "model": "big-pickle",
+            "messages": [
+              {
+                "role": "user",
+                "content": "Hello! Qui es-tu ?"
+              }
+            ]
+          }')
+          
+        echo "Réponse du modèle Big Pickle :"
+        echo "$response"
+
+    - name: Call OpenCode Space Bunny
+      env:
+        OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+      run: |
+        echo "Interrogation du modèle Space Bunny Free..."
+        
+        response=$(curl -s -X POST "https://opencode.ai/zen/v1/chat/completions" \
+          -H "Authorization: Bearer ${OPENCODE_API_KEY}" \
+          -H "Content-Type: application/json" \
+          -d '{
+            "model": "space-bunny-free",
+            "messages": [
+              {
+                "role": "user",
+                "content": "Hello Space Bunny!"
+              }
+            ]
+          }')
+          
+        echo "Réponse du modèle Space Bunny :"
         echo "$response"
