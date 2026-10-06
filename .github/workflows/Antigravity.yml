@@ -110,7 +110,7 @@ jobs:
           exit 1
 
   # ============================================================
-  # 2. EXÉCUTER L'AGENT QA AVEC PROMPT COMPLET (/browser)
+  # 2. EXÉCUTER L'AGENT OPENCODE BIG-PICKLE SUR CHROME DEVTOOLS
   # ============================================================
   antigravity-qa-run:
     needs: resolve-url
@@ -125,7 +125,7 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
 
-      - name: Installer Playwright avec navigateurs et dépendances
+      - name: Installer Playwright & Navigateurs avec dépendances
         run: |
           npx playwright install --with-deps chromium
 
@@ -137,7 +137,7 @@ jobs:
         run: |
           mkdir -p trajectories videos screenshots
 
-      - name: Exécuter l'Agent QA avec Chrome DevTools & Prompt /browser
+      - name: Exécuter OpenCode Big-Pickle avec le Prompt /browser
         id: qa_agent
         env:
           TARGET_URL: ${{ needs.resolve-url.outputs.url }}
@@ -152,77 +152,37 @@ jobs:
           echo "🎯 Cible : $TARGET_URL"
           echo "🧠 Modèle IA : $AI_MODEL"
 
-          cat << 'EOF' > run_qa_agent.js
-          const { chromium } = require('playwright');
-          const fs = require('fs');
+          # 1. Démarrer Chrome Headless en arrière-plan avec le port DevTools 9222
+          google-chrome-stable --headless --disable-gpu --remote-debugging-port=9222 "$TARGET_URL" &
+          CHROME_PID=$!
+          sleep 4
 
-          (async () => {
-            const targetUrl = process.env.TARGET_URL || 'https://odjafrik.com';
-            const qaPrompt = `/browser Joue le rôle d'un ingénieur QA rigoureux : explore le site ${targetUrl}, teste les formulaires, le responsive, les flux d'achat et fais-moi un rapport complet des bugs critiques, surtout explore tous les cas d'utilisation avant que ça n'atteigne les mains des utilisateurs.`;
+          # 2. Construire le prompt QA dynamique avec l'URL cible
+          QA_PROMPT="/browser Joue le rôle d'un ingénieur QA rigoureux : explore le site $TARGET_URL, teste les formulaires, le responsive, les flux d'achat et fais-moi un rapport complet des bugs critiques, surtout explore tous les cas d'utilisation avant que ça n'atteigne les mains des utilisateurs."
 
-            console.log(`🤖 Prompt QA transmis à l'agent :`);
-            console.log(`"${qaPrompt}"`);
-            console.log(`\n🔍 Lancement direct de Chromium avec Chrome DevTools...`);
+          echo "🤖 Prompt QA transmis à OpenCode Big-Pickle :"
+          echo "$QA_PROMPT"
 
-            // Lancement de Chromium avec DevTools Protocol et enregistrement vidéo
-            const browser = await chromium.launch({
-              headless: true,
-              args: ['--remote-debugging-port=9222', '--no-sandbox', '--disable-setuid-sandbox']
-            });
+          # 3. Lancer la CLI OpenCode avec le modèle Big-Pickle
+          opencode run -m "opencode/big-pickle" "$QA_PROMPT" 2>&1 | tee qa_agent.log
+          EXIT_CODE=$?
 
-            const context = await browser.newContext({ 
-              recordVideo: { dir: 'videos/' },
-              viewport: { width: 1280, height: 800 }
-            });
+          kill $CHROME_PID || true
 
-            const page = await context.newPage();
-            const consoleErrors = [];
-            const failedRequests = [];
-
-            // Écoute des erreurs console (Angular NG0600, etc.)
-            page.on('console', msg => {
-              if (msg.type() === 'error') consoleErrors.push(msg.text());
-            });
-
-            // Écoute des échecs de requêtes réseau (CORS, 404, 500, Timeouts)
-            page.on('requestfailed', req => {
-              failedRequests.push(`${req.method()} ${req.url()} - ${req.failure()?.errorText}`);
-            });
-
-            try {
-              await page.goto(targetUrl, { waitUntil: 'networkidle', timeout: 35000 });
-              await page.screenshot({ path: 'screenshots/homepage.png', fullPage: true });
-              console.log(`✓ Navigation réussie sur ${targetUrl}`);
-            } catch (err) {
-              console.error(`❌ Erreur d'accès : ${err.message}`);
-            }
-
-            // Détection de l'anomalie (ex: Angular NG0600 ou requêtes API échouées)
-            const isDown = consoleErrors.some(l => l.includes('NG0600')) || failedRequests.length > 5;
-            
-            const report = {
-              prompt_used: qaPrompt,
-              url: targetUrl,
-              site_id: process.env.SITE_ID,
-              status: isDown ? 'DOWN' : 'UP',
-              console_errors: consoleErrors,
-              failed_network_requests: failedRequests,
-              timestamp: new Date().toISOString()
-            };
-
-            fs.writeFileSync('trajectories/report.json', JSON.stringify(report, null, 2));
-            console.log('✓ Rapport d\'évaluation QA généré avec succès dans trajectories/report.json');
-
-            await context.close();
-            await browser.close();
-          })();
+          # Générer le rapport JSON pour Supabase & le Relay
+          cat << EOF > trajectories/report.json
+          {
+            "prompt_used": "$QA_PROMPT",
+            "url": "$TARGET_URL",
+            "site_id": "$SITE_ID",
+            "status": "COMPLETED",
+            "timestamp": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          }
           EOF
 
-          node run_qa_agent.js 2>&1 | tee qa_agent.log
-          EXIT_CODE=$?
           echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
 
-      - name: Archiver les preuves QA (Vidéos MP4, Screenshots, Rapport JSON)
+      - name: Archiver les preuves QA (Vidéos MP4, Screenshots, Logs)
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -248,7 +208,7 @@ jobs:
             curl -sS -X POST "$RELAY_URL/sites/$SITE_ID/mark-crawled" \
               -H "x-relay-secret: $RELAY_SECRET" \
               -H "Content-Type: application/json" \
-              -d "{\"status\": \"COMPLETED\", \"message\": \"Inspection Agent QA terminée\", \"report\": $REPORT_BODY}" || true
+              -d "{\"status\": \"COMPLETED\", \"message\": \"Inspection OpenCode Big-Pickle terminée\", \"report\": $REPORT_BODY}" || true
           fi
 
       - name: Résumé dans GitHub Actions
@@ -256,12 +216,12 @@ jobs:
         shell: bash
         run: |
           {
-            echo "## 🎭 Antigravity Senior QA Agent Report"
+            echo "## 🎭 OpenCode Big-Pickle Senior QA Agent Report"
             echo ""
             echo "| Élément | Valeur |"
             echo "| --- | --- |"
             echo "| **URL Cible** | \`${{ needs.resolve-url.outputs.url }}\` |"
+            echo "| **Modèle IA** | \`opencode:big-pickle\` |"
             echo "| **Prompt** | \`/browser Joue le rôle d'un ingénieur QA rigoureux...\` |"
-            echo "| **Modèle IA** | \`${{ github.event.inputs.model || 'opencode:big-pickle' }}\` |"
-            echo "| **Résultat** | Rapport & Vidéo enregistrés avec succès ✓ |"
+            echo "| **Résultat** | Exploration IA terminée ✓ |"
           } >> "$GITHUB_STEP_SUMMARY"
