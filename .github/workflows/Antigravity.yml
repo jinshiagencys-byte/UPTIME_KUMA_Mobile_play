@@ -129,15 +129,15 @@ jobs:
         run: |
           npx playwright install --with-deps chromium
 
-      - name: Installer OpenCode CLI & Antigravity Runner
+      - name: Installer OpenCode CLI
         run: |
-          npm install -g opencode-ai @google/antigravity-cli || true
+          npm install -g opencode-ai || true
 
       - name: Dossiers de preuves (trajectories, videos, screenshots)
         run: |
           mkdir -p trajectories videos screenshots
 
-      - name: Exécuter l'Agent QA avec le Prompt /browser & Big-Pickle
+      - name: Exécuter l'Agent QA avec Chrome DevTools & Prompt /browser
         id: qa_agent
         env:
           TARGET_URL: ${{ needs.resolve-url.outputs.url }}
@@ -152,42 +152,39 @@ jobs:
           echo "🎯 Cible : $TARGET_URL"
           echo "🧠 Modèle IA : $AI_MODEL"
 
-          # Démarrer Chrome Headless en arrière-plan avec le port DevTools 9222
-          google-chrome-stable --headless --disable-gpu --remote-debugging-port=9222 "$TARGET_URL" &
-          CHROME_PID=$!
-          sleep 3
-
-          # Génération du script de lancement de l'Agent QA avec le prompt exact
           cat << 'EOF' > run_qa_agent.js
           const { chromium } = require('playwright');
           const fs = require('fs');
 
           (async () => {
-            const targetUrl = process.env.TARGET_URL || 'https://markhorusbj.com';
-            
-            // Le prompt QA exact demandé avec l'instruction /browser
+            const targetUrl = process.env.TARGET_URL || 'https://odjafrik.com';
             const qaPrompt = `/browser Joue le rôle d'un ingénieur QA rigoureux : explore le site ${targetUrl}, teste les formulaires, le responsive, les flux d'achat et fais-moi un rapport complet des bugs critiques, surtout explore tous les cas d'utilisation avant que ça n'atteigne les mains des utilisateurs.`;
 
-            console.log(`🤖 Prompt transmis à l'Agent QA :`);
+            console.log(`🤖 Prompt QA transmis à l'agent :`);
             console.log(`"${qaPrompt}"`);
-            console.log(`\n🔍 Connexion à Chrome DevTools sur ${targetUrl}...`);
+            console.log(`\n🔍 Lancement direct de Chromium avec Chrome DevTools...`);
 
-            const browser = await chromium.connectOverCDP('http://localhost:9222');
+            // Lancement de Chromium avec DevTools Protocol et enregistrement vidéo
+            const browser = await chromium.launch({
+              headless: true,
+              args: ['--remote-debugging-port=9222', '--no-sandbox', '--disable-setuid-sandbox']
+            });
+
             const context = await browser.newContext({ 
               recordVideo: { dir: 'videos/' },
               viewport: { width: 1280, height: 800 }
             });
-            const page = await context.newPage();
 
+            const page = await context.newPage();
             const consoleErrors = [];
             const failedRequests = [];
 
-            // Écoute de la console (Erreurs JS, Angular, React)
+            // Écoute des erreurs console (Angular NG0600, etc.)
             page.on('console', msg => {
               if (msg.type() === 'error') consoleErrors.push(msg.text());
             });
 
-            // Écoute du réseau (404, 500, CORS, Timeouts API)
+            // Écoute des échecs de requêtes réseau (CORS, 404, 500, Timeouts)
             page.on('requestfailed', req => {
               failedRequests.push(`${req.method()} ${req.url()} - ${req.failure()?.errorText}`);
             });
@@ -200,7 +197,7 @@ jobs:
               console.error(`❌ Erreur d'accès : ${err.message}`);
             }
 
-            // Détection des anomalies critiques
+            // Détection de l'anomalie (ex: Angular NG0600 ou requêtes API échouées)
             const isDown = consoleErrors.some(l => l.includes('NG0600')) || failedRequests.length > 5;
             
             const report = {
@@ -223,8 +220,6 @@ jobs:
 
           node run_qa_agent.js 2>&1 | tee qa_agent.log
           EXIT_CODE=$?
-
-          kill $CHROME_PID || true
           echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
 
       - name: Archiver les preuves QA (Vidéos MP4, Screenshots, Rapport JSON)
@@ -268,5 +263,5 @@ jobs:
             echo "| **URL Cible** | \`${{ needs.resolve-url.outputs.url }}\` |"
             echo "| **Prompt** | \`/browser Joue le rôle d'un ingénieur QA rigoureux...\` |"
             echo "| **Modèle IA** | \`${{ github.event.inputs.model || 'opencode:big-pickle' }}\` |"
-            echo "| **Résultat** | Rapport & Vidéo enregistrés ✓ |"
+            echo "| **Résultat** | Rapport & Vidéo enregistrés avec succès ✓ |"
           } >> "$GITHUB_STEP_SUMMARY"
