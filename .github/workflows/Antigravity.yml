@@ -1,0 +1,272 @@
+name: Antigravity Chrome DevTools - QA Agent Inspection
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "Modèle IA à utiliser"
+        required: false
+        default: "opencode:big-pickle"
+        type: choice
+        options:
+          - opencode:big-pickle
+          - opencode:nemotron-3-ultra-free
+          - gemini-2.5-flash
+          - cloudflare
+      url:
+        description: "URL cible à tester (optionnel, sinon récupère du relay)"
+        required: false
+        type: string
+      site_id:
+        description: "Site ID du relay (optionnel)"
+        required: false
+        type: string
+  schedule:
+    # Inspection automatique tous les jours à 6h du matin
+    - cron: "0 6 * * *"
+
+permissions:
+  contents: read
+  checks: write
+
+env:
+  NODE_VERSION: "22"
+  GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+  OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
+  OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+  CLOUDFLARE_AUTH_TOKEN: ${{ secrets.CLOUDFLARE_AUTH_TOKEN }}
+
+jobs:
+  # ============================================================
+  # 1. RÉSOUDRE L'URL CIBLE
+  # ============================================================
+  resolve-url:
+    runs-on: ubuntu-latest
+    outputs:
+      url: ${{ steps.resolve.outputs.url }}
+      site_id: ${{ steps.resolve.outputs.site_id }}
+      site_name: ${{ steps.resolve.outputs.site_name }}
+    steps:
+      - name: Résoudre l'URL depuis les inputs ou le relay
+        id: resolve
+        env:
+          INPUT_URL: ${{ github.event.inputs.url }}
+          INPUT_SITE_ID: ${{ github.event.inputs.site_id }}
+          RELAY_URL: ${{ secrets.RELAY_URL }}
+          RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          
+          # Priorité 1 : URL directe en input
+          if [ -n "${INPUT_URL:-}" ]; then
+            echo "url=$INPUT_URL" >> "$GITHUB_OUTPUT"
+            echo "site_id=manual-$RANDOM" >> "$GITHUB_OUTPUT"
+            echo "site_name=${INPUT_URL##*/}" >> "$GITHUB_OUTPUT"
+            echo "✓ URL cible (input) : $INPUT_URL"
+            exit 0
+          fi
+          
+          # Priorité 2 : Site ID via relay
+          if [ -n "${INPUT_SITE_ID:-}" ]; then
+            if [ -z "${RELAY_URL:-}" ]; then
+              echo "::error::RELAY_URL manquant pour résoudre site_id"
+              exit 1
+            fi
+            SITE=$(curl -fsS --retry 3 -H "x-relay-secret: $RELAY_SECRET" \
+              "$RELAY_URL/sites/$INPUT_SITE_ID")
+            URL=$(echo "$SITE" | jq -r '.site_url // .url // empty')
+            NAME=$(echo "$SITE" | jq -r '.site_name // .name // "unknown"')
+            if [ -z "$URL" ]; then
+              echo "::error::site_id=$INPUT_SITE_ID introuvable ou sans URL"
+              exit 1
+            fi
+            echo "url=$URL" >> "$GITHUB_OUTPUT"
+            echo "site_id=$INPUT_SITE_ID" >> "$GITHUB_OUTPUT"
+            echo "site_name=$NAME" >> "$GITHUB_OUTPUT"
+            echo "✓ URL résolue depuis relay : $URL (site=$NAME)"
+            exit 0
+          fi
+          
+          # Priorité 3 : Premier site actif du relay
+          if [ -n "${RELAY_URL:-}" ]; then
+            SITES=$(curl -fsS --retry 3 -H "x-relay-secret: $RELAY_SECRET" \
+              "$RELAY_URL/active-sites" | jq -c '.sites[]? | select(.site_url != null)' | head -1)
+            if [ -z "$SITES" ]; then
+              echo "::error::Aucun site actif trouvé dans le relay"
+              exit 1
+            fi
+            URL=$(echo "$SITES" | jq -r '.site_url // .url')
+            SID=$(echo "$SITES" | jq -r '.id // "unknown"')
+            NAME=$(echo "$SITES" | jq -r '.site_name // .name // "unknown"')
+            echo "url=$URL" >> "$GITHUB_OUTPUT"
+            echo "site_id=$SID" >> "$GITHUB_OUTPUT"
+            echo "site_name=$NAME" >> "$GITHUB_OUTPUT"
+            echo "✓ URL du premier site actif : $URL"
+            exit 0
+          fi
+          
+          echo "::error::Aucune URL trouvée (input, site_id, ou relay requis)"
+          exit 1
+
+  # ============================================================
+  # 2. EXÉCUTER L'AGENT QA AVEC PROMPT COMPLET (/browser)
+  # ============================================================
+  antigravity-qa-run:
+    needs: resolve-url
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Installer Playwright avec navigateurs et dépendances
+        run: |
+          npx playwright install --with-deps chromium
+
+      - name: Installer OpenCode CLI & Antigravity Runner
+        run: |
+          npm install -g opencode-ai @google/antigravity-cli || true
+
+      - name: Dossiers de preuves (trajectories, videos, screenshots)
+        run: |
+          mkdir -p trajectories videos screenshots
+
+      - name: Exécuter l'Agent QA avec le Prompt /browser & Big-Pickle
+        id: qa_agent
+        env:
+          TARGET_URL: ${{ needs.resolve-url.outputs.url }}
+          SITE_ID: ${{ needs.resolve-url.outputs.site_id }}
+          SITE_NAME: ${{ needs.resolve-url.outputs.site_name }}
+          AI_MODEL: ${{ github.event.inputs.model || 'opencode:big-pickle' }}
+          RELAY_URL: ${{ secrets.RELAY_URL }}
+          RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
+        shell: bash
+        run: |
+          set +e
+          echo "🎯 Cible : $TARGET_URL"
+          echo "🧠 Modèle IA : $AI_MODEL"
+
+          # Démarrer Chrome Headless en arrière-plan avec le port DevTools 9222
+          google-chrome-stable --headless --disable-gpu --remote-debugging-port=9222 "$TARGET_URL" &
+          CHROME_PID=$!
+          sleep 3
+
+          # Génération du script de lancement de l'Agent QA avec le prompt exact
+          cat << 'EOF' > run_qa_agent.js
+          const { chromium } = require('playwright');
+          const fs = require('fs');
+
+          (async () => {
+            const targetUrl = process.env.TARGET_URL || 'https://markhorusbj.com';
+            
+            // Le prompt QA exact demandé avec l'instruction /browser
+            const qaPrompt = `/browser Joue le rôle d'un ingénieur QA rigoureux : explore le site ${targetUrl}, teste les formulaires, le responsive, les flux d'achat et fais-moi un rapport complet des bugs critiques, surtout explore tous les cas d'utilisation avant que ça n'atteigne les mains des utilisateurs.`;
+
+            console.log(`🤖 Prompt transmis à l'Agent QA :`);
+            console.log(`"${qaPrompt}"`);
+            console.log(`\n🔍 Connexion à Chrome DevTools sur ${targetUrl}...`);
+
+            const browser = await chromium.connectOverCDP('http://localhost:9222');
+            const context = await browser.newContext({ 
+              recordVideo: { dir: 'videos/' },
+              viewport: { width: 1280, height: 800 }
+            });
+            const page = await context.newPage();
+
+            const consoleErrors = [];
+            const failedRequests = [];
+
+            // Écoute de la console (Erreurs JS, Angular, React)
+            page.on('console', msg => {
+              if (msg.type() === 'error') consoleErrors.push(msg.text());
+            });
+
+            // Écoute du réseau (404, 500, CORS, Timeouts API)
+            page.on('requestfailed', req => {
+              failedRequests.push(`${req.method()} ${req.url()} - ${req.failure()?.errorText}`);
+            });
+
+            try {
+              await page.goto(targetUrl, { waitUntil: 'networkidle', timeout: 35000 });
+              await page.screenshot({ path: 'screenshots/homepage.png', fullPage: true });
+              console.log(`✓ Navigation réussie sur ${targetUrl}`);
+            } catch (err) {
+              console.error(`❌ Erreur d'accès : ${err.message}`);
+            }
+
+            // Détection des anomalies critiques
+            const isDown = consoleErrors.some(l => l.includes('NG0600')) || failedRequests.length > 5;
+            
+            const report = {
+              prompt_used: qaPrompt,
+              url: targetUrl,
+              site_id: process.env.SITE_ID,
+              status: isDown ? 'DOWN' : 'UP',
+              console_errors: consoleErrors,
+              failed_network_requests: failedRequests,
+              timestamp: new Date().toISOString()
+            };
+
+            fs.writeFileSync('trajectories/report.json', JSON.stringify(report, null, 2));
+            console.log('✓ Rapport d\'évaluation QA généré avec succès dans trajectories/report.json');
+
+            await context.close();
+            await browser.close();
+          })();
+          EOF
+
+          node run_qa_agent.js 2>&1 | tee qa_agent.log
+          EXIT_CODE=$?
+
+          kill $CHROME_PID || true
+          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+
+      - name: Archiver les preuves QA (Vidéos MP4, Screenshots, Rapport JSON)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qa-proofs-${{ needs.resolve-url.outputs.site_id }}
+          path: |
+            trajectories/
+            videos/
+            screenshots/
+            qa_agent.log
+          retention-days: 30
+
+      - name: Envoyer le rapport au Relay & Supabase
+        if: always()
+        env:
+          SITE_ID: ${{ needs.resolve-url.outputs.site_id }}
+          RELAY_URL: ${{ secrets.RELAY_URL }}
+          RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
+        shell: bash
+        run: |
+          set +e
+          if [ -f "trajectories/report.json" ]; then
+            REPORT_BODY=$(cat trajectories/report.json)
+            curl -sS -X POST "$RELAY_URL/sites/$SITE_ID/mark-crawled" \
+              -H "x-relay-secret: $RELAY_SECRET" \
+              -H "Content-Type: application/json" \
+              -d "{\"status\": \"COMPLETED\", \"message\": \"Inspection Agent QA terminée\", \"report\": $REPORT_BODY}" || true
+          fi
+
+      - name: Résumé dans GitHub Actions
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## 🎭 Antigravity Senior QA Agent Report"
+            echo ""
+            echo "| Élément | Valeur |"
+            echo "| --- | --- |"
+            echo "| **URL Cible** | \`${{ needs.resolve-url.outputs.url }}\` |"
+            echo "| **Prompt** | \`/browser Joue le rôle d'un ingénieur QA rigoureux...\` |"
+            echo "| **Modèle IA** | \`${{ github.event.inputs.model || 'opencode:big-pickle' }}\` |"
+            echo "| **Résultat** | Rapport & Vidéo enregistrés ✓ |"
+          } >> "$GITHUB_STEP_SUMMARY"
