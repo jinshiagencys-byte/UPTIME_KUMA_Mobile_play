@@ -127,6 +127,7 @@ jobs:
 
       - name: Installer Playwright & Navigateurs avec dépendances
         run: |
+          npm install --no-save playwright
           npx playwright install --with-deps chromium
 
       - name: Installer OpenCode CLI
@@ -137,6 +138,14 @@ jobs:
         run: |
           mkdir -p trajectories videos screenshots
 
+      - name: Enregistrer une navigation QA en vidéo
+        id: qa_video
+        continue-on-error: true
+        env:
+          TARGET_URL: ${{ needs.resolve-url.outputs.url }}
+          VIDEO_DIR: videos
+        run: node scripts/record-qa-video.js
+
       - name: Exécuter OpenCode Big-Pickle avec le Prompt /browser
         id: qa_agent
         env:
@@ -144,18 +153,26 @@ jobs:
           SITE_ID: ${{ needs.resolve-url.outputs.site_id }}
           SITE_NAME: ${{ needs.resolve-url.outputs.site_name }}
           AI_MODEL: ${{ github.event.inputs.model || 'opencode:big-pickle' }}
-          RELAY_URL: ${{ secrets.RELAY_URL }}
-          RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         shell: bash
         run: |
           set +e
+          set -o pipefail
           echo "🎯 Cible : $TARGET_URL"
           echo "🧠 Modèle IA : $AI_MODEL"
 
           # 1. Démarrer Chrome Headless en arrière-plan avec le port DevTools 9222
           google-chrome-stable --headless --disable-gpu --remote-debugging-port=9222 "$TARGET_URL" &
           CHROME_PID=$!
+          cleanup_chrome() {
+            kill "$CHROME_PID" 2>/dev/null || true
+            wait "$CHROME_PID" 2>/dev/null || true
+          }
+          trap cleanup_chrome EXIT
           sleep 4
+          STARTED_AT="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
 
           # 2. Construire le prompt QA dynamique avec l'URL cible
           QA_PROMPT="/browser Tu es un ingénieur QA senior avec des notions de cybersécurité.
@@ -185,24 +202,44 @@ jobs:
 
           # 3. Lancer la CLI OpenCode avec le modèle Big-Pickle
           opencode run -m "opencode/big-pickle" "$QA_PROMPT" 2>&1 | tee qa_agent.log
-          EXIT_CODE=$?
+          EXIT_CODE=${PIPESTATUS[0]}
+          set -e
 
-          kill $CHROME_PID || true
+          cleanup_chrome
+          trap - EXIT
+          FINISHED_AT="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          STATUS="FAILED"
+          if [ "$EXIT_CODE" -eq 0 ]; then
+            STATUS="COMPLETED"
+          fi
 
-          # Générer le rapport JSON pour Supabase & le Relay
-          cat << EOF > trajectories/report.json
-          {
-            "prompt_used": "$QA_PROMPT",
-            "url": "$TARGET_URL",
-            "site_id": "$SITE_ID",
-            "status": "COMPLETED",
-            "timestamp": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          }
-          EOF
+          # Conserver le résultat réel du modèle dans un JSON correctement échappé.
+          tail -c 200000 qa_agent.log > trajectories/agent_output.txt
+          jq -n \
+            --arg prompt "$QA_PROMPT" \
+            --arg url "$TARGET_URL" \
+            --arg site_id "$SITE_ID" \
+            --arg status "$STATUS" \
+            --arg started_at "$STARTED_AT" \
+            --arg finished_at "$FINISHED_AT" \
+            --argjson exit_code "$EXIT_CODE" \
+            --rawfile report_text trajectories/agent_output.txt \
+            '{
+              prompt_used: $prompt,
+              url: $url,
+              site_id: $site_id,
+              status: $status,
+              exit_code: $exit_code,
+              started_at: $started_at,
+              finished_at: $finished_at,
+              report_text: $report_text
+            }' > trajectories/report.json
 
           echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+          exit "$EXIT_CODE"
 
-      - name: Archiver les preuves QA (Vidéos MP4, Screenshots, Logs)
+      - name: Archiver les preuves QA (Vidéo WebM, Screenshots, Logs)
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -216,25 +253,58 @@ jobs:
 
       - name: Envoyer le rapport au Relay & Supabase
         if: always()
+        continue-on-error: false
         env:
           SITE_ID: ${{ needs.resolve-url.outputs.site_id }}
           RELAY_URL: ${{ secrets.RELAY_URL }}
           RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         shell: bash
         run: |
-          set +e
-          if [ -f "trajectories/report.json" ]; then
-            REPORT_BODY=$(cat trajectories/report.json)
-            curl -sS -X POST "$RELAY_URL/sites/$SITE_ID/mark-crawled" \
-              -H "x-relay-secret: $RELAY_SECRET" \
-              -H "Content-Type: application/json" \
-              -d "{\"status\": \"COMPLETED\", \"message\": \"Inspection OpenCode Big-Pickle terminée\", \"report\": $REPORT_BODY}" || true
+          set -euo pipefail
+
+          if [[ ! "$SITE_ID" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]]; then
+            echo "Rapport non envoyé au Relay : cet essai manuel n’est pas associé à un site Supabase."
+            exit 0
           fi
+          if [ ! -f "trajectories/report.json" ]; then
+            echo "::error::Le rapport QA n’a pas été généré."
+            exit 1
+          fi
+          if [ -z "${RELAY_URL:-}" ] || [ -z "${RELAY_SECRET:-}" ]; then
+            echo "::error::RELAY_URL ou RELAY_SECRET n’est pas configuré."
+            exit 1
+          fi
+
+          jq -n \
+            --slurpfile report trajectories/report.json \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg run_url "https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            '{
+              status: $report[0].status,
+              report: $report[0],
+              github_run_id: ($run_id | tonumber),
+              github_run_attempt: ($run_attempt | tonumber),
+              github_run_url: $run_url
+            }' > trajectories/relay-payload.json
+
+          curl --fail-with-body --show-error --silent --max-time 30 \
+            -X POST "$RELAY_URL/sites/$SITE_ID/mark-crawled" \
+            -H "x-relay-secret: $RELAY_SECRET" \
+            -H "Content-Type: application/json" \
+            --data-binary @trajectories/relay-payload.json
 
       - name: Résumé dans GitHub Actions
         if: always()
         shell: bash
         run: |
+          STATUS="INCOMPLET"
+          if [ -f "trajectories/report.json" ]; then
+            STATUS="$(jq -r '.status' trajectories/report.json)"
+          fi
           {
             echo "## 🎭 OpenCode Big-Pickle Senior QA Agent Report"
             echo ""
@@ -243,5 +313,10 @@ jobs:
             echo "| **URL Cible** | \`${{ needs.resolve-url.outputs.url }}\` |"
             echo "| **Modèle IA** | \`opencode:big-pickle\` |"
             echo "| **Prompt** | \`/browser Tu es un ingénieur QA senior avec des notions de cybersécurité...\` |"
-            echo "| **Résultat** | Exploration IA terminée ✓ |"
+            echo "| **Résultat** | \`$STATUS\` |"
+            if [ -f "videos/qa-navigation.webm" ]; then
+              echo "| **Vidéo** | Enregistrée dans l’artifact QA (WebM) |"
+            else
+              echo "| **Vidéo** | Non disponible — consulter les logs de l’étape vidéo |"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
