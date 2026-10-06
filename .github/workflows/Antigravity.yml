@@ -158,7 +158,27 @@ jobs:
           sleep 4
 
           # 2. Construire le prompt QA dynamique avec l'URL cible
-          QA_PROMPT="/browser Joue le rôle d'un ingénieur QA rigoureux : explore le site $TARGET_URL, teste les formulaires, le responsive, les flux d'achat et fais-moi un rapport complet des bugs critiques, surtout explore tous les cas d'utilisation avant que ça n'atteigne les mains des utilisateurs."
+          QA_PROMPT="/browser Tu es un ingénieur QA senior avec des notions de cybersécurité.
+
+          Sur le site $TARGET_URL, réalise une inspection en deux volets :
+
+          **1. QA fonctionnelle (principal)**
+          - Explorer la navigation, les catégories et les fiches produits
+          - Tester les formulaires (contact, newsletter, compte, devis)
+          - Vérifier le panier et le flux de commande (checkout)
+          - Tester le responsive et l'accessibilité de base
+
+          **2. Surface de sécurité (secondaire — vue d'ensemble uniquement, ne pas aller en profondeur)**
+          - Vérifier si des endpoints API sensibles sont accessibles sans authentification (HTTP 200 inattendu)
+          - Contrôler les en-têtes de sécurité HTTP (HSTS, X-Frame-Options, Content-Security-Policy)
+          - Vérifier que les routes protégées (orders, profil, dashboard vendeur) renvoient bien 401/403 sans session
+          - Vérifier l'absence d'informations sensibles dans le HTML source (tokens, clés, stack traces)
+          - Ne pas effectuer de fuzzing, d'injection ni d'attaque active
+
+          Une fois l'exploration terminée, rédige immédiatement un rapport structuré avec les sections suivantes :
+          - Bugs UX / fonctionnels
+          - Anomalies de sécurité
+          - Recommandations prioritaires"
 
           echo "🤖 Prompt QA transmis à OpenCode Big-Pickle :"
           echo "$QA_PROMPT"
@@ -222,6 +242,6 @@ jobs:
             echo "| --- | --- |"
             echo "| **URL Cible** | \`${{ needs.resolve-url.outputs.url }}\` |"
             echo "| **Modèle IA** | \`opencode:big-pickle\` |"
-            echo "| **Prompt** | \`/browser Joue le rôle d'un ingénieur QA rigoureux...\` |"
+            echo "| **Prompt** | \`/browser Tu es un ingénieur QA senior avec des notions de cybersécurité...\` |"
             echo "| **Résultat** | Exploration IA terminée ✓ |"
           } >> "$GITHUB_STEP_SUMMARY"
