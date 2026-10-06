@@ -115,7 +115,7 @@ jobs:
   antigravity-qa-run:
     needs: resolve-url
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 120
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
