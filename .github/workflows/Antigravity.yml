@@ -57,7 +57,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          
+
           # Priorité 1 : URL directe en input
           if [ -n "${INPUT_URL:-}" ]; then
             echo "url=$INPUT_URL" >> "$GITHUB_OUTPUT"
@@ -66,7 +66,7 @@ jobs:
             echo "✓ URL cible (input) : $INPUT_URL"
             exit 0
           fi
-          
+
           # Priorité 2 : Site ID via relay
           if [ -n "${INPUT_SITE_ID:-}" ]; then
             if [ -z "${RELAY_URL:-}" ]; then
@@ -87,7 +87,7 @@ jobs:
             echo "✓ URL résolue depuis relay : $URL (site=$NAME)"
             exit 0
           fi
-          
+
           # Priorité 3 : Premier site actif du relay
           if [ -n "${RELAY_URL:-}" ]; then
             SITES=$(curl -fsS --retry 3 -H "x-relay-secret: $RELAY_SECRET" \
@@ -105,17 +105,17 @@ jobs:
             echo "✓ URL du premier site actif : $URL"
             exit 0
           fi
-          
+
           echo "::error::Aucune URL trouvée (input, site_id, ou relay requis)"
           exit 1
 
   # ============================================================
-  # 2. EXÉCUTER L'AGENT OPENCODE BIG-PICKLE SUR CHROME DEVTOOLS
+  # 2. EXÉCUTER L'AGENT QA SUR CHROME DEVTOOLS (PLAN DE TEST + SORTIE JSON)
   # ============================================================
   antigravity-qa-run:
     needs: resolve-url
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 20
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -127,119 +127,199 @@ jobs:
 
       - name: Installer Playwright & Navigateurs avec dépendances
         run: |
-          npm install --no-save playwright
           npx playwright install --with-deps chromium
 
       - name: Installer OpenCode CLI
         run: |
-          npm install -g opencode-ai || true
+          npm install -g opencode-ai
 
       - name: Dossiers de preuves (trajectories, videos, screenshots)
         run: |
           mkdir -p trajectories videos screenshots
 
-      - name: Enregistrer une navigation QA en vidéo
-        id: qa_video
-        continue-on-error: true
-        env:
-          TARGET_URL: ${{ needs.resolve-url.outputs.url }}
-          VIDEO_DIR: videos
-        run: node scripts/record-qa-video.js
-
-      - name: Exécuter OpenCode Big-Pickle avec le Prompt /browser
+      # ----------------------------------------------------------
+      # L'agent reçoit un PLAN DE TEST et doit écrire qa_result.json
+      # ----------------------------------------------------------
+      - name: Exécuter l'agent QA (plan de test + sortie structurée)
         id: qa_agent
         env:
           TARGET_URL: ${{ needs.resolve-url.outputs.url }}
           SITE_ID: ${{ needs.resolve-url.outputs.site_id }}
           SITE_NAME: ${{ needs.resolve-url.outputs.site_name }}
           AI_MODEL: ${{ github.event.inputs.model || 'opencode:big-pickle' }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
         shell: bash
         run: |
           set +e
-          set -o pipefail
+          rm -f qa_result.json qa_agent.log
           echo "🎯 Cible : $TARGET_URL"
           echo "🧠 Modèle IA : $AI_MODEL"
 
-          # 1. Démarrer Chrome Headless en arrière-plan avec le port DevTools 9222
-          google-chrome-stable --headless --disable-gpu --remote-debugging-port=9222 "$TARGET_URL" &
+          # 1. Chrome headless avec le port DevTools 9222
+          google-chrome-stable --headless --no-sandbox --disable-gpu \
+            --user-data-dir=/tmp/chrome-qa --remote-debugging-port=9222 "$TARGET_URL" &
           CHROME_PID=$!
-          cleanup_chrome() {
-            kill "$CHROME_PID" 2>/dev/null || true
-            wait "$CHROME_PID" 2>/dev/null || true
-          }
-          trap cleanup_chrome EXIT
           sleep 4
-          STARTED_AT="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
 
-          # 2. Construire le prompt QA dynamique avec l'URL cible
-          QA_PROMPT="/browser Tu es un ingénieur QA senior avec des notions de cybersécurité.
+          # 2. Correspondance du modèle choisi vers l'identifiant opencode
+          case "$AI_MODEL" in
+            opencode:*) OC_MODEL="opencode/${AI_MODEL#opencode:}" ;;
+            gemini-*)   OC_MODEL="google/${AI_MODEL}" ;;
+            *)
+              echo "::warning::Modèle '$AI_MODEL' non pris en charge par opencode, repli sur opencode/big-pickle"
+              OC_MODEL="opencode/big-pickle"
+              ;;
+          esac
+          export GOOGLE_GENERATIVE_AI_API_KEY="${GOOGLE_API_KEY:-}"
+          echo "oc_model=$OC_MODEL" >> "$GITHUB_OUTPUT"
+          echo "🔧 Modèle opencode : $OC_MODEL"
 
-          Sur le site $TARGET_URL, réalise une inspection en deux volets :
+          # 3. Prompt : plan de test + règles + schéma de sortie
+          cat > qa_prompt.txt << 'PROMPT_EOF'
+          /browser Tu es un ingénieur QA senior. Tu EXÉCUTES un plan de test, tu n'improvises pas.
+          SITE : __TARGET_URL__
 
-          **1. QA fonctionnelle (principal)**
-          - Explorer la navigation, les catégories et les fiches produits
-          - Tester les formulaires (contact, newsletter, compte, devis)
-          - Vérifier le panier et le flux de commande (checkout)
-          - Tester le responsive et l'accessibilité de base
+          RÈGLES
+          - Exécute chaque cas, étape par étape, dans l'ordre.
+          - Pour chaque étape, note ce que tu as réellement fait (actual) et un statut :
+              passed  = observé conforme à l'attendu
+              failed  = observé différent de l'attendu
+              blocked = étape impossible à exécuter (étape précédente en échec, page inaccessible, HTTP 429)
+              skipped = la fonctionnalité n'existe pas sur ce site (ce n'est PAS un échec)
+          - Un HTTP 429 n'est JAMAIS un bug du site : marque l'étape blocked, patiente, réessaie une seule fois.
+          - Toute étape failed exige une preuve : URL, code HTTP, extrait de console ou de requête réseau,
+            nom de capture (enregistre-la dans screenshots/ sous le nom TC-XXX-stepN.png).
+          - Ne contourne jamais un blocage : ne change pas les valeurs pour que ça passe. Si ça échoue, ça échoue.
+          - N'invente rien. Si tu n'as pas vérifié, mets blocked ou skipped.
+          - Sécurité : lecture seule, aucun fuzzing, aucune injection, aucune attaque active.
+            Au maximum 1 message de contact (préfixé QA-TEST) et 1 inscription newsletter de test,
+            à lister dans side_effects. Ne termine jamais un paiement, ne crée aucun compte.
 
-          **2. Surface de sécurité (secondaire — vue d'ensemble uniquement, ne pas aller en profondeur)**
-          - Vérifier si des endpoints API sensibles sont accessibles sans authentification (HTTP 200 inattendu)
-          - Contrôler les en-têtes de sécurité HTTP (HSTS, X-Frame-Options, Content-Security-Policy)
-          - Vérifier que les routes protégées (orders, profil, dashboard vendeur) renvoient bien 401/403 sans session
-          - Vérifier l'absence d'informations sensibles dans le HTML source (tokens, clés, stack traces)
-          - Ne pas effectuer de fuzzing, d'injection ni d'attaque active
+          PLAN DE TEST (format : action | résultat attendu)
 
-          Une fois l'exploration terminée, rédige immédiatement un rapport structuré avec les sections suivantes :
-          - Bugs UX / fonctionnels
-          - Anomalies de sécurité
-          - Recommandations prioritaires"
+          TC-001 [functional] Chargement et navigation
+            1. Ouvrir l'accueil | page chargée, contenu principal visible, aucune erreur console bloquante
+            2. Cliquer sur 3 liens du menu principal | chaque lien mène à une page valide (pas d'écran vide)
+            3. Ouvrir une URL inexistante (/page-qui-nexiste-pas) | vraie page 404 avec statut HTTP 404
 
-          echo "🤖 Prompt QA transmis à OpenCode Big-Pickle :"
-          echo "$QA_PROMPT"
+          TC-002 [functional] Parcours panier et commande (skipped si le site ne vend rien)
+            1. Ouvrir une fiche produit | fiche affichée sans erreur
+            2. Ajouter au panier | badge ou panier mis à jour (quantité 1)
+            3. Ouvrir le panier | récapitulatif cohérent (sous-total, total)
+            4. Démarrer la commande, étape adresse | champs utilisables par un client réel (listes ou libellés clairs, aucun identifiant technique à saisir)
 
-          # 3. Lancer la CLI OpenCode avec le modèle Big-Pickle
-          opencode run -m "opencode/big-pickle" "$QA_PROMPT" 2>&1 | tee qa_agent.log
+          TC-003 [functional] Formulaires
+            1. Formulaire de contact avec un e-mail invalide | message d'erreur visible
+            2. Formulaire de contact valide, une seule fois | confirmation visible
+            3. Newsletter avec qa-test@example.com | retour visuel visible
+
+          TC-004 [functional] Accès direct aux pages d'authentification
+            1. Ouvrir directement /auth/login (ou /login) par URL | HTTP 200 et formulaire visible
+            2. Rafraîchir la page (F5) | même page, aucune erreur 5xx
+
+          TC-005 [accessibility] Mobile et accessibilité de base
+            1. Viewport 375x812, ouvrir l'accueil | aucun scroll horizontal, navigation mobile accessible
+            2. Contrôler boutons et liens sans texte | chacun a un nom accessible
+
+          TC-006 [security] Routes protégées sans session
+            1. Identifier 2 à 3 routes protégées (profil, commandes, dashboard, admin) via les liens et les requêtes réseau | routes identifiées
+            2. Les appeler sans session | 401, 403 ou redirection vers la connexion, jamais 200 avec des données
+
+          TC-007 [security] En-têtes HTTP
+            1. Lire les en-têtes de la page d'accueil | présence de HSTS, CSP, X-Frame-Options (ou frame-ancestors), X-Content-Type-Options, Referrer-Policy
+
+          TC-008 [security] Fuite d'informations
+            1. Inspecter le HTML source et les bundles JS | aucun token, clé secrète ni stack trace
+            2. Ouvrir une URL d'API inexistante | aucun message de debug du framework visible
+
+          Tu peux ajouter des cas TC-1xx découverts pendant l'exploration (mets "discovered": true).
+
+          SORTIE : écris UNIQUEMENT le fichier qa_result.json à la racine du dossier de travail,
+          sans texte autour, au format suivant :
+          {
+            "test_cases": [{
+              "id": "TC-001", "title": "", "category": "functional|security|accessibility|seo",
+              "discovered": false,
+              "status": "passed|failed|blocked",
+              "severity": "P0|P1|P2|null",
+              "steps": [{
+                "n": 1, "action": "", "precondition": "", "expected": "", "actual": "",
+                "status": "passed|failed|blocked|skipped",
+                "evidence": {"url": "", "http_status": null, "console": "", "network": "", "screenshot": ""}
+              }]
+            }],
+            "side_effects": [],
+            "summary": {"passed": 0, "failed": 0, "blocked": 0}
+          }
+          Statut du cas = failed si au moins une étape failed, sinon blocked si au moins une étape blocked, sinon passed.
+          PROMPT_EOF
+
+          QA_PROMPT=$(cat qa_prompt.txt)
+          QA_PROMPT="${QA_PROMPT//__TARGET_URL__/$TARGET_URL}"
+          printf '%s' "$QA_PROMPT" > trajectories/qa_prompt.txt
+          echo "🤖 Prompt QA transmis ($(printf '%s' "$QA_PROMPT" | wc -c) caractères)"
+
+          # 4. Lancer l'agent
+          opencode run -m "$OC_MODEL" "$QA_PROMPT" 2>&1 | tee qa_agent.log
           EXIT_CODE=${PIPESTATUS[0]}
-          set -e
 
-          cleanup_chrome
-          trap - EXIT
-          FINISHED_AT="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-          STATUS="FAILED"
-          if [ "$EXIT_CODE" -eq 0 ]; then
-            STATUS="COMPLETED"
+          kill $CHROME_PID 2>/dev/null || true
+          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+
+      # ----------------------------------------------------------
+      # Valider le JSON de l'agent et recalculer les statuts nous-mêmes
+      # ----------------------------------------------------------
+      - name: Valider et normaliser le rapport structuré
+        id: report
+        if: always()
+        shell: bash
+        run: |
+          set +e
+
+          # Repli : si l'agent n'a pas écrit le fichier, extraire le dernier JSON du log
+          [ -s qa_result.json ] || python3 - <<'PY'
+          import json
+          txt = open("qa_agent.log", encoding="utf-8", errors="ignore").read()
+          dec = json.JSONDecoder()
+          best = None
+          for i, ch in enumerate(txt):
+              if ch == "{":
+                  try:
+                      obj, _ = dec.raw_decode(txt[i:])
+                  except ValueError:
+                      continue
+                  if isinstance(obj, dict) and "test_cases" in obj:
+                      best = obj
+          if best:
+              json.dump(best, open("qa_result.json", "w"), ensure_ascii=False)
+          PY
+
+          if jq -e '(.test_cases | type == "array") and (.test_cases | length > 0)' qa_result.json >/dev/null 2>&1; then
+            cp qa_result.json trajectories/qa_result.raw.json
+            # Statut de chaque cas et résumé recalculés depuis les étapes (on ne fait pas confiance au LLM)
+            jq '
+              .test_cases |= map(
+                .steps = (.steps // [])
+                | .status = (
+                    if (.steps | length) == 0 then "blocked"
+                    elif any(.steps[]; .status == "failed") then "failed"
+                    elif any(.steps[]; .status == "blocked") then "blocked"
+                    else "passed" end)
+              )
+              | .side_effects = (.side_effects // [])
+              | .summary = {
+                  passed:  ([.test_cases[] | select(.status == "passed")]  | length),
+                  failed:  ([.test_cases[] | select(.status == "failed")]  | length),
+                  blocked: ([.test_cases[] | select(.status == "blocked")] | length)
+                }
+            ' qa_result.json > trajectories/qa_result.json
+            echo "valid=true" >> "$GITHUB_OUTPUT"
+            jq -r '.summary | "✓ \(.passed) passed, \(.failed) failed, \(.blocked) blocked"' trajectories/qa_result.json
+          else
+            echo "valid=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::qa_result.json absent ou invalide : voir qa_agent.log"
           fi
 
-          # Conserver le résultat réel du modèle dans un JSON correctement échappé.
-          tail -c 200000 qa_agent.log > trajectories/agent_output.txt
-          jq -n \
-            --arg prompt "$QA_PROMPT" \
-            --arg url "$TARGET_URL" \
-            --arg site_id "$SITE_ID" \
-            --arg status "$STATUS" \
-            --arg started_at "$STARTED_AT" \
-            --arg finished_at "$FINISHED_AT" \
-            --argjson exit_code "$EXIT_CODE" \
-            --rawfile report_text trajectories/agent_output.txt \
-            '{
-              prompt_used: $prompt,
-              url: $url,
-              site_id: $site_id,
-              status: $status,
-              exit_code: $exit_code,
-              started_at: $started_at,
-              finished_at: $finished_at,
-              report_text: $report_text
-            }' > trajectories/report.json
-
-          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
-          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
-          exit "$EXIT_CODE"
-
-      - name: Archiver les preuves QA (Vidéo WebM, Screenshots, Logs)
+      - name: Archiver les preuves QA (rapport JSON, screenshots, logs)
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -249,74 +329,96 @@ jobs:
             videos/
             screenshots/
             qa_agent.log
+            qa_result.json
           retention-days: 30
 
       - name: Envoyer le rapport au Relay & Supabase
         if: always()
-        continue-on-error: false
         env:
           SITE_ID: ${{ needs.resolve-url.outputs.site_id }}
+          TARGET_URL: ${{ needs.resolve-url.outputs.url }}
+          AI_MODEL: ${{ github.event.inputs.model || 'opencode:big-pickle' }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           RELAY_URL: ${{ secrets.RELAY_URL }}
           RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
+          REPORT_VALID: ${{ steps.report.outputs.valid }}
         shell: bash
         run: |
-          set -euo pipefail
-
-          if [[ ! "$SITE_ID" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]]; then
-            echo "Rapport non envoyé au Relay : cet essai manuel n’est pas associé à un site Supabase."
+          set +e
+          if [ -z "${RELAY_URL:-}" ]; then
+            echo "RELAY_URL absent, envoi ignoré"
             exit 0
           fi
-          if [ ! -f "trajectories/report.json" ]; then
-            echo "::error::Le rapport QA n’a pas été généré."
-            exit 1
-          fi
-          if [ -z "${RELAY_URL:-}" ] || [ -z "${RELAY_SECRET:-}" ]; then
-            echo "::error::RELAY_URL ou RELAY_SECRET n’est pas configuré."
-            exit 1
+          case "$SITE_ID" in
+            manual-*)
+              echo "Lancement manuel par URL (site_id=$SITE_ID) : pas d'envoi au relay"
+              exit 0
+              ;;
+          esac
+
+          TS=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+          if [ "$REPORT_VALID" = "true" ]; then
+            PAYLOAD=$(jq -n \
+              --slurpfile r trajectories/qa_result.json \
+              --arg url "$TARGET_URL" --arg site_id "$SITE_ID" --arg model "$AI_MODEL" \
+              --arg run_url "$RUN_URL" --arg ts "$TS" \
+              '{status: "COMPLETED",
+                message: "Inspection QA terminée",
+                report: ($r[0] + {url: $url, site_id: $site_id, model: $model, run_url: $run_url, timestamp: $ts})}')
+          else
+            PAYLOAD=$(jq -n \
+              --arg url "$TARGET_URL" --arg site_id "$SITE_ID" --arg model "$AI_MODEL" \
+              --arg run_url "$RUN_URL" --arg ts "$TS" \
+              '{status: "ERROR",
+                message: "Rapport QA absent ou invalide",
+                report: {url: $url, site_id: $site_id, model: $model, run_url: $run_url, timestamp: $ts}}')
           fi
 
-          jq -n \
-            --slurpfile report trajectories/report.json \
-            --arg run_id "$GITHUB_RUN_ID" \
-            --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
-            --arg run_url "https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
-            '{
-              status: $report[0].status,
-              report: $report[0],
-              github_run_id: ($run_id | tonumber),
-              github_run_attempt: ($run_attempt | tonumber),
-              github_run_url: $run_url
-            }' > trajectories/relay-payload.json
-
-          curl --fail-with-body --show-error --silent --max-time 30 \
-            -X POST "$RELAY_URL/sites/$SITE_ID/mark-crawled" \
+          curl -sS -X POST "$RELAY_URL/sites/$SITE_ID/mark-crawled" \
             -H "x-relay-secret: $RELAY_SECRET" \
             -H "Content-Type: application/json" \
-            --data-binary @trajectories/relay-payload.json
+            -d "$PAYLOAD" || true
 
       - name: Résumé dans GitHub Actions
         if: always()
+        env:
+          TARGET_URL: ${{ needs.resolve-url.outputs.url }}
+          AI_MODEL: ${{ github.event.inputs.model || 'opencode:big-pickle' }}
+          REPORT_VALID: ${{ steps.report.outputs.valid }}
         shell: bash
         run: |
-          STATUS="INCOMPLET"
-          if [ -f "trajectories/report.json" ]; then
-            STATUS="$(jq -r '.status' trajectories/report.json)"
-          fi
           {
-            echo "## 🎭 OpenCode Big-Pickle Senior QA Agent Report"
+            echo "## 🎭 Rapport QA structuré"
             echo ""
             echo "| Élément | Valeur |"
             echo "| --- | --- |"
-            echo "| **URL Cible** | \`${{ needs.resolve-url.outputs.url }}\` |"
-            echo "| **Modèle IA** | \`opencode:big-pickle\` |"
-            echo "| **Prompt** | \`/browser Tu es un ingénieur QA senior avec des notions de cybersécurité...\` |"
-            echo "| **Résultat** | \`$STATUS\` |"
-            if [ -f "videos/qa-navigation.webm" ]; then
-              echo "| **Vidéo** | Enregistrée dans l’artifact QA (WebM) |"
+            echo "| **URL cible** | \`$TARGET_URL\` |"
+            echo "| **Modèle IA** | \`$AI_MODEL\` |"
+
+            if [ "$REPORT_VALID" = "true" ]; then
+              jq -r '"| **Résultat** | ✅ \(.summary.passed) passed · ❌ \(.summary.failed) failed · ⏸️ \(.summary.blocked) blocked |"' trajectories/qa_result.json
+              echo ""
+              echo "### Cas de test"
+              echo ""
+              jq -r '
+                "| Cas | Titre | Catégorie | Statut | Sévérité |",
+                "| --- | --- | --- | --- | --- |",
+                (.test_cases[] |
+                  "| \(.id // "-") | \((.title // "") | gsub("\\|"; "/")) | \(.category // "-") | \(if .status == "passed" then "✅ passed" elif .status == "failed" then "❌ failed" else "⏸️ blocked" end) | \(.severity // "-") |")
+              ' trajectories/qa_result.json
+              echo ""
+              echo "### Étapes en échec"
+              echo ""
+              jq -r '
+                [.test_cases[] | . as $c | .steps[]? | select(.status == "failed")
+                  | "- **\($c.id) · étape \(.n)** : \(.action // "") → attendu : \(.expected // "") ; obtenu : \(.actual // "")"]
+                | if length == 0 then "Aucune." else .[] end
+              ' trajectories/qa_result.json
+              echo ""
+              echo "### Effets de bord à nettoyer"
+              echo ""
+              jq -r 'if (.side_effects | length) == 0 then "Aucun." else .side_effects[] | "- \(.)" end' trajectories/qa_result.json
             else
-              echo "| **Vidéo** | Non disponible — consulter les logs de l’étape vidéo |"
+              echo "| **Résultat** | ⚠️ rapport absent ou invalide (voir qa_agent.log) |"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
