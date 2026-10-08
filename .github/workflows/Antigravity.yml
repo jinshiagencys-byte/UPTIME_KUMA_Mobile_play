@@ -11,6 +11,7 @@ on:
         options:
           - opencode:big-pickle
           - opencode:nemotron-3-ultra-free
+          - opencode:fledge-alpha-free
           - gemini-2.5-flash
           - cloudflare
       url:
@@ -115,7 +116,7 @@ jobs:
   antigravity-qa-run:
     needs: resolve-url
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 120
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
