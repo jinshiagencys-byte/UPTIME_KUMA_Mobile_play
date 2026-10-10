@@ -424,6 +424,8 @@ jobs:
           TARGET_URL: ${{ needs.resolve-url.outputs.url }}
           AI_MODEL: ${{ github.event.inputs.model || 'opencode:big-pickle' }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
           RELAY_URL: ${{ secrets.RELAY_URL }}
           RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
           REPORT_VALID: ${{ steps.report.outputs.valid }}
@@ -447,22 +449,32 @@ jobs:
               --slurpfile r trajectories/qa_result.json \
               --arg url "$TARGET_URL" --arg site_id "$SITE_ID" --arg model "$AI_MODEL" \
               --arg run_url "$RUN_URL" --arg ts "$TS" \
+              --argjson run_id "$RUN_ID" --argjson run_attempt "$RUN_ATTEMPT" \
               '{status: "COMPLETED",
+                github_run_id: $run_id,
+                github_run_attempt: $run_attempt,
+                github_run_url: $run_url,
                 message: "Inspection QA terminée",
                 report: ($r[0] + {url: $url, site_id: $site_id, model: $model, run_url: $run_url, timestamp: $ts})}')
           else
             PAYLOAD=$(jq -n \
               --arg url "$TARGET_URL" --arg site_id "$SITE_ID" --arg model "$AI_MODEL" \
               --arg run_url "$RUN_URL" --arg ts "$TS" \
-              '{status: "ERROR",
+              --argjson run_id "$RUN_ID" --argjson run_attempt "$RUN_ATTEMPT" \
+              '{status: "FAILED",
+                github_run_id: $run_id,
+                github_run_attempt: $run_attempt,
+                github_run_url: $run_url,
                 message: "Rapport QA absent ou invalide",
                 report: {url: $url, site_id: $site_id, model: $model, run_url: $run_url, timestamp: $ts}}')
           fi
 
-          curl -sS -X POST "$RELAY_URL/sites/$SITE_ID/mark-crawled" \
+          HTTP=$(curl -sS -o /tmp/relay_resp.txt -w "%{http_code}" -X POST "$RELAY_URL/sites/$SITE_ID/mark-crawled" \
             -H "x-relay-secret: $RELAY_SECRET" \
             -H "Content-Type: application/json" \
-            -d "$PAYLOAD" || true
+            -d "$PAYLOAD")
+          echo "Relay mark-crawled : HTTP $HTTP"
+          cat /tmp/relay_resp.txt
 
       - name: Résumé dans GitHub Actions
         if: always()
