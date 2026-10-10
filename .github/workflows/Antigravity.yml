@@ -140,6 +140,8 @@ jobs:
 
       # ----------------------------------------------------------
       # Un seul agent explore, planifie, exécute et audite avant d'écrire qa_result.json.
+      # Changements : (1) opencode.json branche le MCP chrome-devtools sur Chrome :9222,
+      # (2) attente active de Chrome, (3) prompt : outils navigateur obligatoires + écriture progressive.
       # ----------------------------------------------------------
       - name: Exécuter l'agent QA (plan de test + sortie structurée)
         id: qa_agent
@@ -159,9 +161,35 @@ jobs:
           google-chrome-stable --headless --no-sandbox --disable-gpu \
             --user-data-dir=/tmp/chrome-qa --remote-debugging-port=9222 "$TARGET_URL" &
           CHROME_PID=$!
-          sleep 4
 
-          # 2. Correspondance du modèle choisi vers l'identifiant opencode
+          # Attente active : Chrome doit répondre sur 9222 avant de lancer l'agent
+          for i in $(seq 1 30); do
+            curl -fs http://127.0.0.1:9222/json/version >/dev/null && break
+            sleep 1
+          done
+          if curl -fs http://127.0.0.1:9222/json/version >/dev/null; then
+            echo "✓ Chrome DevTools prêt sur :9222"
+          else
+            echo "::warning::Chrome ne répond pas sur 9222 après 30 s"
+          fi
+
+          # 2. Brancher opencode sur ce Chrome via le MCP chrome-devtools
+          cat > opencode.json << 'EOF'
+          {
+            "$schema": "https://opencode.ai/config.json",
+            "mcp": {
+              "chrome-devtools": {
+                "type": "local",
+                "command": ["npx", "-y", "chrome-devtools-mcp@latest", "--browserUrl", "http://127.0.0.1:9222"],
+                "enabled": true
+              }
+            }
+          }
+          EOF
+          echo "🔌 MCP configurés :"
+          opencode mcp list 2>&1 | head -20 || true
+
+          # 3. Correspondance du modèle choisi vers l'identifiant opencode
           case "$AI_MODEL" in
             opencode:*) OC_MODEL="opencode/${AI_MODEL#opencode:}" ;;
             gemini-*)   OC_MODEL="google/${AI_MODEL}" ;;
@@ -174,19 +202,33 @@ jobs:
           echo "oc_model=$OC_MODEL" >> "$GITHUB_OUTPUT"
           echo "🔧 Modèle opencode : $OC_MODEL"
 
-          # 3. Prompt : plan de test + règles + schéma de sortie
+          # 4. Prompt : plan de test + règles + schéma de sortie
           cat > qa_prompt.txt << 'PROMPT_EOF'
-          /browser Tu es un ingénieur QA senior. Tu explores le site, construis un plan adapté, exécutes les vérifications et produis un rapport vérifiable. Tu es le seul agent du run : organise ton travail en phases et ne prétends pas qu'un autre agent a confirmé tes constats.
+          Tu es un ingénieur QA senior. Tu explores le site, construis un plan adapté, exécutes les vérifications et produis un rapport vérifiable. Tu es le seul agent du run : organise ton travail en phases et ne prétends pas qu'un autre agent a confirmé tes constats.
           SITE : __TARGET_URL__
+
+          OUTILS (OBLIGATOIRE)
+          - Pour tester, utilise les outils du MCP chrome-devtools : naviguer, cliquer, saisir, lire la Console et le Network, prendre des captures, changer la taille du viewport.
+          - Interdit : grep, curl, lecture de main.js ou des HTML prérendus COMME PREUVE D'UN TEST. Ces commandes ne servent qu'en complément (par exemple lire les en-têtes HTTP pour TC-007).
+          - Si les outils chrome-devtools ne répondent pas ou n'existent pas, ne bascule pas sur grep/curl : marque les étapes concernées blocked avec actual = "outils navigateur indisponibles" et termine en écrivant le rapport.
+          - Ne lis jamais .env ni aucun fichier de secrets. N'écris aucun secret ou jeton dans le rapport.
 
           MÉTHODE
           1. EXPLORATION : inspecte la page d'entrée, sa navigation, les fonctionnalités réellement visibles et les routes atteignables. Note les zones inaccessibles et les limites de l'environnement. N'infère pas qu'une fonctionnalité existe uniquement depuis son nom.
-          2. PLAN : adapte les cas prédéfinis à ce site, écarte ceux qui ne s'appliquent pas et ajoute les scénarios importants découverts. Avant d'exécuter, regroupe les scénarios qui testent le même comportement afin d'éviter les répétitions. Ne supprime pas des observations différentes sous prétexte qu'elles peuvent avoir une cause commune.
+          2. PLAN : adapte les cas prédéfinis à ce site, écarte ceux qui ne s'appliquent pas et ajoute les scénarios importants découverts. Avant d'exécuter, regroupe les scénarios qui testent le même comportement afin d'éviter les répétitions. Ne supprime pas des observations différentes sous prétexte qu'elles peuvent avoir une cause commune. Une fois le plan arrêté, il est figé : ne modifie plus les étapes, ni leurs attendus, pour les faire coller à ce que tu observes.
           3. EXÉCUTION : exécute les étapes dans l'ordre, observe le résultat après chaque action et consigne immédiatement les preuves.
           4. AUTO-AUDIT : relis tous les cas. Vérifie que chaque statut correspond aux observations, que chaque échec a une preuve directe, que les blocages ne sont pas présentés comme des défauts confirmés et que les effets de bord éventuels sont listés.
           5. RAPPORT : écris le JSON demandé. Le rapport décrit ce qui a été vérifié pendant ce run et ne prétend jamais à une couverture exhaustive.
 
+          ÉCRITURE PROGRESSIVE (OBLIGATOIRE)
+          - Dès que le plan est arrêté, écris qa_result.json avec TOUS les cas et TOUTES les étapes. Les étapes pas encore exécutées ont status "blocked" et actual "non exécuté".
+          - Après CHAQUE cas terminé, réécris qa_result.json en entier avec les résultats à jour. Ne garde pas tes résultats pour la fin : si tu es interrompu, le fichier doit déjà être valide.
+          - Le fichier doit toujours être du JSON valide, avec tous les champs du schéma remplis (chaînes vides autorisées dans evidence, http_status à null si inconnu).
+          - Si le temps ou les étapes manquent, arrête de tester, laisse les cas restants "blocked" avec actual "temps épuisé" et termine.
+
           RÈGLES D'EXÉCUTION
+          - Exécute chaque étape exactement comme écrite. N'adapte pas les valeurs (dates, textes, montants), ne contourne pas un blocage, ne choisis pas une autre option "qui marche" : si l'étape est impossible telle quelle, marque blocked et explique pourquoi.
+          - Une action exécutée sans effet (clic sans réaction, recherche sans résultat) doit être rapportée dans actual ("action exécutée, rien ne s'est passé") et l'étape est failed si l'attendu n'est pas atteint.
           - Pour chaque étape, note ce que tu as réellement observé (actual) et un statut :
               passed  = observé conforme à l'attendu
               failed  = observé différent de l'attendu
@@ -261,6 +303,7 @@ jobs:
             "summary": {"passed": 0, "failed": 0, "blocked": 0}
           }
           Le workflow recalculera les statuts de cas et le résumé. Pour chaque étape, renseigne tous les champs du schéma ; actual doit décrire une observation ou la raison du blocage/skip. Pour une étape failed, renseigne une preuve vérifiable dans evidence (http_status, console, network ou screenshot). N'inclus dans side_effects que les écritures réellement effectuées.
+          Termine par un seul message : "qa_result.json écrit".
           PROMPT_EOF
 
           QA_PROMPT=$(cat qa_prompt.txt)
@@ -268,7 +311,7 @@ jobs:
           printf '%s' "$QA_PROMPT" > trajectories/qa_prompt.txt
           echo "🤖 Prompt QA transmis ($(printf '%s' "$QA_PROMPT" | wc -c) caractères)"
 
-          # 4. Lancer l'agent
+          # 5. Lancer l'agent
           opencode run -m "$OC_MODEL" "$QA_PROMPT" 2>&1 | tee qa_agent.log
           EXIT_CODE=${PIPESTATUS[0]}
 
