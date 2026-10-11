@@ -60,10 +60,27 @@ jobs:
           set -euo pipefail
 
           # Priorité 1 : URL directe en input
+          # FIX : on cherche d'abord cette URL dans /active-sites pour retrouver
+          # le vrai site_id (sinon "manual-XXXX" => aucun envoi au relay).
           if [ -n "${INPUT_URL:-}" ]; then
+            SID="manual-$RANDOM"
+            NAME="${INPUT_URL##*/}"
+            if [ -n "${RELAY_URL:-}" ]; then
+              MATCH=$(curl -fsS --retry 3 -H "x-relay-secret: $RELAY_SECRET" \
+                "$RELAY_URL/active-sites" | jq -c --arg u "${INPUT_URL%/}" \
+                '[.sites[]? | select((.site_url // "") | rtrimstr("/") == $u)]
+                 | if length == 1 then .[0] else empty end' || true)
+              if [ -n "$MATCH" ]; then
+                SID=$(echo "$MATCH" | jq -r '.id | tostring')
+                NAME=$(echo "$MATCH" | jq -r '.client_name // .site_name // "unknown"')
+                echo "✓ URL reconnue dans le relay : site_id=$SID (site=$NAME)"
+              else
+                echo "ℹ️ URL absente (ou ambiguë) dans /active-sites : site_id manuel, pas d'envoi au relay"
+              fi
+            fi
             echo "url=$INPUT_URL" >> "$GITHUB_OUTPUT"
-            echo "site_id=manual-$RANDOM" >> "$GITHUB_OUTPUT"
-            echo "site_name=${INPUT_URL##*/}" >> "$GITHUB_OUTPUT"
+            echo "site_id=$SID" >> "$GITHUB_OUTPUT"
+            echo "site_name=$NAME" >> "$GITHUB_OUTPUT"
             echo "✓ URL cible (input) : $INPUT_URL"
             exit 0
           fi
@@ -74,18 +91,25 @@ jobs:
               echo "::error::RELAY_URL manquant pour résoudre site_id"
               exit 1
             fi
-            SITE=$(curl -fsS --retry 3 -H "x-relay-secret: $RELAY_SECRET" \
-              "$RELAY_URL/sites/$INPUT_SITE_ID")
-            URL=$(echo "$SITE" | jq -r '.site_url // .url // empty')
-            NAME=$(echo "$SITE" | jq -r '.site_name // .name // "unknown"')
-            if [ -z "$URL" ]; then
-              echo "::error::site_id=$INPUT_SITE_ID introuvable ou sans URL"
+            SITES=$(curl -fsS --retry 3 -H "x-relay-secret: $RELAY_SECRET" \
+              "$RELAY_URL/active-sites")
+            SITE=$(echo "$SITES" | jq -c --arg id "$INPUT_SITE_ID" \
+              '[.sites[]? | select((.id | tostring) == $id)] | if length == 1 then .[0] else empty end')
+            if [ -z "$SITE" ]; then
+              echo "::error::site_id=$INPUT_SITE_ID absent ou ambigu dans /active-sites"
+              exit 1
+            fi
+            URL=$(echo "$SITE" | jq -r '.site_url // empty')
+            NAME=$(echo "$SITE" | jq -r '.client_name // "unknown"')
+            SITE_ID=$(echo "$SITE" | jq -r '.id | tostring')
+            if [ -z "$URL" ] || [ "$URL" = "null" ]; then
+              echo "::error::site_id=$INPUT_SITE_ID trouvé sans URL dans /active-sites"
               exit 1
             fi
             echo "url=$URL" >> "$GITHUB_OUTPUT"
-            echo "site_id=$INPUT_SITE_ID" >> "$GITHUB_OUTPUT"
+            echo "site_id=$SITE_ID" >> "$GITHUB_OUTPUT"
             echo "site_name=$NAME" >> "$GITHUB_OUTPUT"
-            echo "✓ URL résolue depuis relay : $URL (site=$NAME)"
+            echo "✓ Site résolu depuis /active-sites : $URL (site=$NAME, id=$SITE_ID)"
             exit 0
           fi
 
@@ -346,6 +370,31 @@ jobs:
               json.dump(best, open("qa_result.json", "w"), ensure_ascii=False)
           PY
 
+          # FIX : compléter les champs que les modèles gratuits oublient souvent
+          # (discovered, precondition, evidence.*, http_status en string...)
+          # avant la validation stricte. Si le JSON est illisible, le fichier reste intact.
+          if [ -s qa_result.json ]; then
+            jq '
+              .side_effects //= []
+              | .test_cases |= map(
+                  .discovered //= false
+                | .severity //= null
+                | .steps = ((.steps // []) | map(
+                    .precondition //= ""
+                  | .evidence //= {}
+                  | .evidence.url //= ""
+                  | .evidence.console //= ""
+                  | .evidence.network //= ""
+                  | .evidence.screenshot //= ""
+                  | .evidence.http_status |= (if type == "string" then (tonumber? // null) else . end)
+                  | .actual |= (if . == null or . == "" then "non renseigné" else . end)
+                  ))
+                )
+            ' qa_result.json > /tmp/qa_fixed.json \
+              && mv /tmp/qa_fixed.json qa_result.json \
+              || echo "::warning::Normalisation du JSON impossible (JSON illisible ?)"
+          fi
+
           if jq -e '
             (.test_cases | type == "array" and length > 0)
             and (.side_effects | type == "array")
@@ -443,11 +492,34 @@ jobs:
               ;;
           esac
 
+          ACTIVE_SITES=$(curl -fsS --retry 3 -H "x-relay-secret: $RELAY_SECRET" \
+            "$RELAY_URL/active-sites") || {
+            echo "::error::Impossible de récupérer /active-sites pour vérifier l'ID du site"
+            exit 1
+          }
+          REPORT_SITE_ID=$(echo "$ACTIVE_SITES" | jq -r \
+            --arg id "$SITE_ID" --arg url "$TARGET_URL" \
+            '[.sites[]? | select((.id | tostring) == $id)] as $id_matches
+             | if ($id_matches | length) == 1 then $id_matches[0].id
+               else [.sites[]? | select(.site_url == $url)] as $url_matches
+               | if ($url_matches | length) == 1 then $url_matches[0].id else empty end
+               end | tostring') || {
+            echo "::error::Impossible de résoudre l'ID du site depuis /active-sites"
+            exit 1
+          }
+          if [ -z "$REPORT_SITE_ID" ] || [ "$REPORT_SITE_ID" = "null" ]; then
+            echo "::error::Aucun site unique correspondant à site_id=$SITE_ID ou à l'URL $TARGET_URL dans /active-sites"
+            exit 1
+          fi
+          if [ "$REPORT_SITE_ID" != "$SITE_ID" ]; then
+            echo "::warning::ID du site réconcilié depuis /active-sites : $SITE_ID → $REPORT_SITE_ID"
+          fi
+
           TS=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
           if [ "$REPORT_VALID" = "true" ]; then
             PAYLOAD=$(jq -n \
               --slurpfile r trajectories/qa_result.json \
-              --arg url "$TARGET_URL" --arg site_id "$SITE_ID" --arg model "$AI_MODEL" \
+              --arg url "$TARGET_URL" --arg site_id "$REPORT_SITE_ID" --arg model "$AI_MODEL" \
               --arg run_url "$RUN_URL" --arg ts "$TS" \
               --argjson run_id "$RUN_ID" --argjson run_attempt "$RUN_ATTEMPT" \
               '{status: "COMPLETED",
@@ -458,7 +530,7 @@ jobs:
                 report: ($r[0] + {url: $url, site_id: $site_id, model: $model, run_url: $run_url, timestamp: $ts})}')
           else
             PAYLOAD=$(jq -n \
-              --arg url "$TARGET_URL" --arg site_id "$SITE_ID" --arg model "$AI_MODEL" \
+              --arg url "$TARGET_URL" --arg site_id "$REPORT_SITE_ID" --arg model "$AI_MODEL" \
               --arg run_url "$RUN_URL" --arg ts "$TS" \
               --argjson run_id "$RUN_ID" --argjson run_attempt "$RUN_ATTEMPT" \
               '{status: "FAILED",
@@ -469,12 +541,23 @@ jobs:
                 report: {url: $url, site_id: $site_id, model: $model, run_url: $run_url, timestamp: $ts}}')
           fi
 
-          HTTP=$(curl -sS -o /tmp/relay_resp.txt -w "%{http_code}" -X POST "$RELAY_URL/sites/$SITE_ID/mark-crawled" \
+          HTTP=$(curl -sS -o /tmp/relay_resp.txt -w "%{http_code}" -X POST "$RELAY_URL/sites/$REPORT_SITE_ID/mark-crawled" \
             -H "x-relay-secret: $RELAY_SECRET" \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD")
           echo "Relay mark-crawled : HTTP $HTTP"
-          cat /tmp/relay_resp.txt
+          cat /tmp/relay_resp.txt; echo
+
+          # FIX : contrôles repris de send_qa_report.sh
+          if [ "$HTTP" != "200" ]; then
+            echo "::error::Échec de l'envoi au relay (HTTP $HTTP)"
+            exit 1
+          fi
+          if ! jq -e '.report.id' /tmp/relay_resp.txt >/dev/null 2>&1; then
+            echo "::warning::Réponse sans report.id : le relay n'a pas écrit dans crawl_reports (ancienne version déployée ?)"
+          else
+            echo "✓ Rapport enregistré dans crawl_reports (id $(jq -r '.report.id' /tmp/relay_resp.txt))"
+          fi
 
       - name: Résumé dans GitHub Actions
         if: always()
