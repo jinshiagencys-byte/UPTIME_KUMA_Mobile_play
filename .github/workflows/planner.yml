@@ -84,7 +84,6 @@ jobs:
           fi
 
       - name: Prepare browser and prompt
-        id: prompt
         env:
           TARGET_URL: ${{ inputs.target_url }}
           SITE_TYPE: ${{ inputs.site_type }}
@@ -95,7 +94,13 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p screenshots
-          google-chrome-stable --headless --no-sandbox --disable-gpu \
+          CHROME_BIN="$(find "$HOME/.cache/ms-playwright" -type f -name chrome -perm /111 -print -quit)"
+          if [ -z "$CHROME_BIN" ]; then
+            echo "::error::Chromium installé par Playwright est introuvable"
+            find "$HOME/.cache/ms-playwright" -maxdepth 3 -type f -name 'chrome*' -print || true
+            exit 1
+          fi
+          "$CHROME_BIN" --headless --no-sandbox --disable-gpu \
             --user-data-dir=/tmp/chrome-planner --remote-debugging-port=9222 "$TARGET_URL" \
             > chrome.log 2>&1 &
           CHROME_PID=$!
@@ -106,10 +111,11 @@ jobs:
             fi
             sleep 1
           done
-          curl -fsS http://127.0.0.1:9222/json/version >/dev/null || {
-            echo "::error::Chrome DevTools n'est pas prêt"
+          if ! curl -fsS http://127.0.0.1:9222/json/version >/dev/null; then
+            echo "::error::Chrome DevTools ne démarre pas avec le Chromium Playwright installé"
+            sed -n '1,100p' chrome.log
             exit 1
-          }
+          fi
 
           cat > opencode.json <<'EOF'
           {
@@ -124,26 +130,84 @@ jobs:
           }
           EOF
 
+          cat > qa_prompt.txt <<'PROMPT'
+          Tu es un planificateur QA senior. Explore le site cible avec les outils Chrome DevTools MCP pour préparer des cas réutilisables compatibles avec TestDino. Cette étape est une exploration et une préparation de cas, PAS un Test Run : Antigravity exécutera les cas plus tard.
+
+          RÈGLES AUTONOMES
+          - Les seuls paramètres et instructions disponibles sont ceux contenus dans ce prompt. Ne lis aucun autre fichier du dépôt et ne suppose pas la présence d'agents, skills, scripts ou configurations voisins.
+          - Utilise les outils Chrome DevTools MCP pour naviguer et inspecter l'interface, l'arbre d'accessibilité, la console et le réseau. `evaluate_script` est strictement en lecture seule. Ne contourne pas les échecs en manipulant le DOM ou en appelant directement les API.
+          - Respecte le budget et reste sur le site cible. Ne prétends pas avoir testé/exécuté un cas : aucun `actual`, statut `passed`/`failed`/`blocked` par cas/étape ni métadonnée de run.
+          - En mode `read_only`, ne soumets aucun formulaire et ne modifie aucun état. Les parcours interactifs non explorés restent uniquement dans `metadata.playbook_coverage` avec `status: "not_reached"`, `test_case: null` et `reason: "interactions_disabled"`.
+          - En mode `full`, les interactions de découverte autorisées peuvent être explorées avec des données QA synthétiques. N'effectue jamais d'achat, paiement réel/finalisé ni action destructive. Arrête-toi avant toute confirmation d'achat.
+          - N'utilise jamais de données personnelles réelles et ne lis aucun secret. En cas de blocage ou d'échec rencontré pendant l'exploration, consigne le constat dans `observations`; ne le présente pas comme un résultat d'exécution du cas.
+          - Organise les cas en suites fonctionnelles TestDino (ex. `Navigation`, `Catalogue & Filtres`, `Recherche`, `Authentification`). Pour un site e-commerce/marketplace, examine en priorité recherche, catalogue, fiche produit, panier, connexion et checkout. Les pages isolées/non reliées vont dans `Exploratory testing`.
+          - Un cas décrit une intention exécutable par Antigravity. Réutilise les valeurs observées uniquement dans `snapshot`/`observations`; écris des attendus normaux, invariants et vérifiables.
+          - Écris uniquement `qa_plan.json` à la racine. Aucun Markdown, aucun autre fichier et aucun rejeu.
+
+          SCHÉMA OBLIGATOIRE
           {
-            cat .github/agents/web-test-planner.agent.md
-            printf '\n\n'
-            cat .agents/skills/web-test-planner/SKILL.md
-            if [ "$SITE_TYPE" = "ecommerce" ] || [ "$SITE_TYPE" = "marketplace" ]; then
-              printf '\n\n'
-              cat .agents/skills/playbook-ecommerce/SKILL.md
-            fi
-            printf '\n\nPARAMÈTRES DU RUN (JSON, source de vérité):\n'
-            jq -n \
-              --arg target_url "$TARGET_URL" \
-              --arg site_type "$SITE_TYPE" \
-              --arg interactions_mode "$INTERACTIONS_MODE" \
-              --argjson max_depth "$MAX_DEPTH" \
-              --argjson max_pages "$MAX_PAGES" \
-              '{target_url:$target_url,site_type:$site_type,
-                interactions_mode:$interactions_mode,
-                budget:{max_depth:$max_depth,max_pages:$max_pages}}'
-            printf '\nÉcris uniquement qa_plan.json à la racine selon ce schéma et ces paramètres.\n'
-          } > qa_prompt.txt
+            "metadata": {
+              "target_url": "URL cible exacte",
+              "site_type": "type fourni",
+              "interactions_mode": "read_only ou full fourni",
+              "budget": {
+                "max_depth": 2,
+                "max_pages": 10,
+                "explored_pages_count": 0
+              },
+              "playbook_coverage": [
+                {"id": "identifiant du parcours", "status": "found_ok|found_ok_with_issues|partial|found_broken|absent|not_reached", "test_case": "TC-001 ou null"}
+              ],
+              "generated_at": "date ISO 8601"
+            },
+            "test_cases": [
+              {
+                "id": "TC-001",
+                "title": "Intention claire du cas",
+                "suite": "Suite TestDino",
+                "status": "draft",
+                "priority": "critical|high|medium|low",
+                "tags": ["@ui"],
+                "description": "Description concise de ce que le cas vérifiera.",
+                "source": "explored ou playbook",
+                "entry_url": "URL de départ",
+                "coverage_status": "found_ok|found_ok_with_issues|partial|found_broken",
+                "preconditions": ["Précondition exploitable"],
+                "steps": [
+                  {
+                    "id": "S1",
+                    "action": "Action qu'Antigravity devra effectuer",
+                    "expected": "Résultat normal attendu",
+                    "snapshot": {"optional_observed_value": "valeur"}
+                  }
+                ],
+                "postconditions": "État final attendu après exécution.",
+                "observations": [
+                  {"page_url": "URL observée", "severity": "info|minor|major|critical", "message": "Constat d'exploration"}
+                ]
+              }
+            ]
+          }
+
+          RÈGLES DE DONNÉES
+          - Les cas sont des brouillons TestDino : `status` doit être `draft`. Ce statut désigne le cycle de vie du cas, jamais un résultat.
+          - Chaque cas doit avoir au moins une étape avec des `id` consécutifs (`S1`, `S2`, ...), `action` et `expected` non vides.
+          - `coverage_status` et `playbook_coverage.status` décrivent la couverture d'exploration uniquement. Ils ne sont jamais des résultats de run.
+          - `found_ok` ne peut pas inclure d'observation `major` ou `critical`. Toute observation a une sévérité.
+          - N'émets pas de cas avec `coverage_status: not_reached`/`absent`, ni sans étapes. Indique ces parcours dans `playbook_coverage` avec `test_case: null`.
+          - Les listes `tags`, `preconditions`, `steps`, `observations` et `playbook_coverage` doivent toujours exister, même vides lorsque cela est permis.
+
+          PARAMÈTRES DU RUN (source de vérité) :
+          PROMPT
+          jq -n \
+            --arg target_url "$TARGET_URL" \
+            --arg site_type "$SITE_TYPE" \
+            --arg interactions_mode "$INTERACTIONS_MODE" \
+            --argjson max_depth "$MAX_DEPTH" \
+            --argjson max_pages "$MAX_PAGES" \
+            '{target_url:$target_url,site_type:$site_type,interactions_mode:$interactions_mode,
+              budget:{max_depth:$max_depth,max_pages:$max_pages}}' >> qa_prompt.txt
+          printf '\nRemplace les exemples de valeurs du schéma par les paramètres ci-dessus et produis qa_plan.json.\n' >> qa_prompt.txt
 
       - name: Generate QA plan
         id: generate
@@ -155,6 +219,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          cleanup_chrome() {
+            if [ -s chrome.pid ]; then
+              CHROME_PID="$(cat chrome.pid)"
+              if [[ "$CHROME_PID" =~ ^[0-9]+$ ]]; then
+                kill "$CHROME_PID" 2>/dev/null || true
+              fi
+            fi
+          }
+          trap cleanup_chrome EXIT
           rm -f qa_plan.json
           opencode mcp list 2>&1 | tee mcp.log
           opencode run -m opencode/big-pickle "$(cat qa_prompt.txt)" 2>&1 | tee qa_agent.log
