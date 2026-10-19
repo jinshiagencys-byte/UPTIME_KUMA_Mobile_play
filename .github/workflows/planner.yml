@@ -1,0 +1,291 @@
+name: Planner de test
+
+on:
+  workflow_dispatch:
+    inputs:
+      site_id:
+        description: "ID du site SentinelSite"
+        required: true
+        type: string
+      site_type:
+        description: "Type de site"
+        required: true
+        type: string
+      interactions_mode:
+        description: "Mode d'interaction demandé"
+        required: true
+        default: read_only
+        type: choice
+        options:
+          - read_only
+          - full
+      max_depth:
+        description: "Profondeur maximale"
+        required: true
+        default: "2"
+        type: string
+      max_pages:
+        description: "Nombre maximal de pages"
+        required: true
+        default: "10"
+        type: string
+
+concurrency:
+  group: planner-${{ inputs.site_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: "22"
+  GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+  OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
+  OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+  CLOUDFLARE_AUTH_TOKEN: ${{ secrets.CLOUDFLARE_AUTH_TOKEN }}
+
+jobs:
+  planner:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install Chromium and dependencies
+        run: npx playwright install --with-deps chromium
+
+      - name: Install OpenCode CLI
+        run: npm install -g opencode-ai
+
+      - name: Resolve site and effective settings
+        id: site
+        env:
+          SITE_ID: ${{ inputs.site_id }}
+          SITE_TYPE_INPUT: ${{ inputs.site_type }}
+          INTERACTIONS_MODE_INPUT: ${{ inputs.interactions_mode }}
+          MAX_DEPTH: ${{ inputs.max_depth }}
+          MAX_PAGES: ${{ inputs.max_pages }}
+          RELAY_URL: ${{ secrets.RELAY_URL }}
+          RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$MAX_DEPTH" =~ ^[1-9][0-9]*$ ]] || [[ ! "$MAX_PAGES" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::max_depth et max_pages doivent être des entiers positifs"
+            exit 1
+          fi
+          if [ -z "${RELAY_URL:-}" ] || [ -z "${RELAY_SECRET:-}" ]; then
+            echo "::error::RELAY_URL et RELAY_SECRET sont requis"
+            exit 1
+          fi
+
+          SITE_JSON=$(curl -fsS --retry 2 \
+            -H "x-relay-secret: $RELAY_SECRET" \
+            "$RELAY_URL/sites/$SITE_ID")
+          echo "$SITE_JSON" | jq -e '.success == true and .id != null and .site_url != null' >/dev/null
+          TARGET_URL=$(echo "$SITE_JSON" | jq -r '.site_url')
+          DB_SITE_TYPE=$(echo "$SITE_JSON" | jq -r '.site_type // empty')
+          if [ -z "$DB_SITE_TYPE" ]; then
+            DB_SITE_TYPE="$SITE_TYPE_INPUT"
+          fi
+          if [ -z "$DB_SITE_TYPE" ]; then
+            echo "::error::site_type absent de /sites/:id et des inputs"
+            exit 1
+          fi
+          SITE_NAME=$(echo "$SITE_JSON" | jq -r '.client_name // .id')
+          ALLOWED=$(echo "$SITE_JSON" | jq -r '.qa_interactions_allowed // false')
+          EFFECTIVE_MODE=read_only
+          if [ "$ALLOWED" = "true" ] && [ "$INTERACTIONS_MODE_INPUT" = "full" ]; then
+            EFFECTIVE_MODE=full
+          fi
+
+          printf 'target_url=%s\n' "$TARGET_URL" >> "$GITHUB_OUTPUT"
+          printf 'site_type=%s\n' "$DB_SITE_TYPE" >> "$GITHUB_OUTPUT"
+          printf 'site_name=%s\n' "$SITE_NAME" >> "$GITHUB_OUTPUT"
+          printf 'interactions_mode=%s\n' "$EFFECTIVE_MODE" >> "$GITHUB_OUTPUT"
+          printf 'max_depth=%s\n' "$MAX_DEPTH" >> "$GITHUB_OUTPUT"
+          printf 'max_pages=%s\n' "$MAX_PAGES" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare browser and prompt
+        id: prompt
+        env:
+          TARGET_URL: ${{ steps.site.outputs.target_url }}
+          SITE_TYPE: ${{ steps.site.outputs.site_type }}
+          SITE_NAME: ${{ steps.site.outputs.site_name }}
+          INTERACTIONS_MODE: ${{ steps.site.outputs.interactions_mode }}
+          MAX_DEPTH: ${{ steps.site.outputs.max_depth }}
+          MAX_PAGES: ${{ steps.site.outputs.max_pages }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p screenshots
+          google-chrome-stable --headless --no-sandbox --disable-gpu \
+            --user-data-dir=/tmp/chrome-planner --remote-debugging-port=9222 "$TARGET_URL" \
+            > chrome.log 2>&1 &
+          CHROME_PID=$!
+          echo "$CHROME_PID" > chrome.pid
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:9222/json/version >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:9222/json/version >/dev/null || {
+            echo "::error::Chrome DevTools n'est pas prêt"
+            exit 1
+          }
+
+          cat > opencode.json <<'EOF'
+          {
+            "$schema": "https://opencode.ai/config.json",
+            "mcp": {
+              "chrome-devtools": {
+                "type": "local",
+                "command": ["npx", "-y", "chrome-devtools-mcp@latest", "--browserUrl", "http://127.0.0.1:9222"],
+                "enabled": true
+              }
+            }
+          }
+          EOF
+
+          {
+            cat .github/agents/web-test-planner.agent.md
+            printf '\n\n'
+            cat .agents/skills/web-test-planner/SKILL.md
+            if [ "$SITE_TYPE" = "ecommerce" ] || [ "$SITE_TYPE" = "marketplace" ]; then
+              printf '\n\n'
+              cat .agents/skills/playbook-ecommerce/SKILL.md
+            fi
+            printf '\n\nPARAMÈTRES DU RUN (JSON, source de vérité):\n'
+            jq -n \
+              --arg target_url "$TARGET_URL" \
+              --arg site_name "$SITE_NAME" \
+              --arg site_type "$SITE_TYPE" \
+              --arg interactions_mode "$INTERACTIONS_MODE" \
+              --argjson max_depth "$MAX_DEPTH" \
+              --argjson max_pages "$MAX_PAGES" \
+              '{target_url:$target_url,site_name:$site_name,site_type:$site_type,
+                interactions_mode:$interactions_mode,
+                budget:{max_depth:$max_depth,max_pages:$max_pages}}'
+            printf '\nÉcris uniquement qa_plan.json à la racine selon ce schéma et ces paramètres.\n'
+          } > qa_prompt.txt
+
+      - name: Generate QA plan
+        id: generate
+        env:
+          TARGET_URL: ${{ steps.site.outputs.target_url }}
+          INTERACTIONS_MODE: ${{ steps.site.outputs.interactions_mode }}
+          OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+          GOOGLE_GENERATIVE_AI_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f qa_plan.json
+          opencode mcp list 2>&1 | tee mcp.log
+          opencode run -m opencode/big-pickle "$(cat qa_prompt.txt)" 2>&1 | tee qa_agent.log
+          test -s qa_plan.json
+
+      - name: Validate and persist draft plan
+        id: persist
+        env:
+          SITE_ID: ${{ inputs.site_id }}
+          SITE_TYPE: ${{ steps.site.outputs.site_type }}
+          INTERACTIONS_MODE: ${{ steps.site.outputs.interactions_mode }}
+          MAX_DEPTH: ${{ steps.site.outputs.max_depth }}
+          MAX_PAGES: ${{ steps.site.outputs.max_pages }}
+          RELAY_URL: ${{ secrets.RELAY_URL }}
+          RELAY_SECRET: ${{ secrets.RELAY_SECRET }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node - qa_plan.json "$SITE_TYPE" "$INTERACTIONS_MODE" "$MAX_DEPTH" "$MAX_PAGES" <<'NODE'
+          const fs = require('node:fs');
+          const [file, siteType, interactionsMode, maxDepth, maxPages] = process.argv.slice(2);
+          const plan = JSON.parse(fs.readFileSync(file, 'utf8'));
+          const statuses = new Set(['found_ok', 'found_ok_with_issues', 'partial', 'found_broken', 'absent', 'not_reached']);
+          const lifecycleStatuses = new Set(['draft', 'active', 'deprecated']);
+          const priorities = new Set(['critical', 'high', 'medium', 'low']);
+          const severities = new Set(['info', 'minor', 'major', 'critical']);
+          if (!plan || typeof plan !== 'object' || !plan.metadata || !Array.isArray(plan.test_cases) || !plan.test_cases.length) {
+            throw new Error('Plan must contain metadata and a non-empty test_cases array.');
+          }
+          const metadata = plan.metadata;
+          if (metadata.site_type !== siteType || metadata.interactions_mode !== interactionsMode) {
+            throw new Error('Plan metadata does not match the resolved site settings.');
+          }
+          if (!metadata.generated_at || Number(metadata.budget?.max_depth) !== Number(maxDepth) ||
+              Number(metadata.budget?.max_pages) !== Number(maxPages) ||
+              !Array.isArray(metadata.playbook_coverage)) {
+            throw new Error('Plan metadata has invalid budget, generated_at, or playbook_coverage.');
+          }
+          const codes = new Set();
+          for (const tc of plan.test_cases) {
+            const code = tc?.id || tc?.code;
+            if (!tc || typeof code !== 'string' || !code.trim() ||
+                typeof tc.title !== 'string' || !tc.title.trim() ||
+                typeof tc.suite !== 'string' || !tc.suite.trim() ||
+                !lifecycleStatuses.has(tc.status) || !priorities.has(tc.priority) ||
+                !statuses.has(tc.coverage_status) ||
+                typeof tc.description !== 'string' || !tc.description.trim() ||
+                !Array.isArray(tc.tags) || !tc.tags.every(tag => typeof tag === 'string') ||
+                !Array.isArray(tc.preconditions) || !tc.preconditions.every(item => typeof item === 'string') ||
+                typeof tc.postconditions !== 'string' || !tc.postconditions.trim() ||
+                !Array.isArray(tc.steps) || tc.steps.length === 0 ||
+                !Array.isArray(tc.observations) || Object.hasOwn(tc, 'actual')) {
+              throw new Error('A test case is missing TestDino fields or uses invalid status, priority, or coverage_status.');
+            }
+            if (codes.has(code)) throw new Error(`Duplicate test case id: ${code}`);
+            codes.add(code);
+            for (const [index, step] of tc.steps.entries()) {
+              if (!step || step.id !== `S${index + 1}` ||
+                  typeof step.action !== 'string' || !step.action.trim() ||
+                  typeof step.expected !== 'string' || !step.expected.trim() ||
+                  Object.hasOwn(step, 'actual') || Object.hasOwn(step, 'status')) {
+                throw new Error(`Invalid stable step IDs or fields in ${code}.`);
+              }
+            }
+            for (const observation of tc.observations) {
+              if (!observation || !severities.has(observation.severity)) {
+                throw new Error(`Invalid observation severity in ${code}.`);
+              }
+            }
+            if (tc.coverage_status === 'found_ok' &&
+                tc.observations.some(o => ['major', 'critical'].includes(o.severity))) {
+              throw new Error(`${code} cannot be found_ok with major/critical observations.`);
+            }
+          }
+          NODE
+
+          jq --arg run_id "$GITHUB_RUN_ID" \
+            '{metadata: .metadata, test_cases: .test_cases, github_run_id: $run_id}' \
+            qa_plan.json > qa_plan_payload.json
+          RESPONSE=$(curl -fsS --retry 2 \
+            -H "x-relay-secret: $RELAY_SECRET" \
+            -H "Content-Type: application/json" \
+            -X POST "$RELAY_URL/sites/$SITE_ID/qa-plans" \
+            --data-binary @qa_plan_payload.json)
+          echo "$RESPONSE" | jq -e '.success == true and .planId != null' >/dev/null
+          echo "$RESPONSE" > qa_plan_persist_response.json
+          echo "Plan draft enregistré : $(echo "$RESPONSE" | jq -r '.planId')"
+
+      - name: Upload plan and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qa-plan-${{ inputs.site_id }}-${{ github.run_id }}
+          path: |
+            qa_plan.json
+            qa_plan_payload.json
+            qa_plan_persist_response.json
+            qa_agent.log
+            qa_prompt.txt
+            mcp.log
+            chrome.log
+          if-no-files-found: warn
+          retention-days: 30
